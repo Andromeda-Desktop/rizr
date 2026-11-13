@@ -129,6 +129,7 @@ pub fn run(stack: &Stack, inputs: Digest, action: Option<Action>) -> Result<Stat
         host: Arc::default(),
         pg: Arc::default(),
         dbs: Arc::default(),
+        pg_env: Arc::default(),
         units: crate::supervisor::Units::of(stack),
         unit_events: None,
         project_lock: Arc::default(),
@@ -166,6 +167,8 @@ struct Provider<'a> {
     pg: Arc<Mutex<BTreeMap<String, crate::postgres::Server>>>,
     /// This instance's databases on shared servers, by compose service name.
     dbs: Arc<Mutex<BTreeMap<String, crate::postgres::Db>>>,
+    /// Per compose service, the env vars that point it at this instance's databases.
+    pg_env: Arc<Mutex<BTreeMap<String, BTreeMap<String, String>>>>,
     units: crate::supervisor::Units,
     unit_events: Option<Child>,
     /// Held while this instance changes a node that all instances share; the OS frees it if rizr dies.
@@ -306,7 +309,9 @@ impl Provider<'_> {
                                         },
                                         spec: db.spec.clone(),
                                         generation: Gen(0),
-                                        status: Status::Running { health: None },
+                                        status: Status::Running {
+                                            health: Some(Health::Healthy),
+                                        },
                                     });
                                 }
                             }
@@ -327,7 +332,12 @@ impl Provider<'_> {
                     st.instance.clone(),
                     self.side.clone(),
                 );
-                let (host, pg, dbs) = (self.host.clone(), self.pg.clone(), self.dbs.clone());
+                let (host, pg, dbs, pg_env) = (
+                    self.host.clone(),
+                    self.pg.clone(),
+                    self.dbs.clone(),
+                    self.pg_env.clone(),
+                );
                 let inputs = match &s.trust {
                     rizr_core::state::Trust::Trusted(d) => d.clone(),
                     _ => Digest(String::new()),
@@ -335,12 +345,15 @@ impl Provider<'_> {
                 std::thread::spawn(move || {
                     done(
                         match import(&root, &files, &name, &dir, &instance, inputs) {
-                            Ok((m, imported, services, (servers, databases))) => {
+                            Ok((m, imported, services, res)) => {
                                 if let Ok(mut r) = pg.lock() {
-                                    *r = servers;
+                                    *r = res.servers;
                                 }
                                 if let Ok(mut r) = dbs.lock() {
-                                    *r = databases;
+                                    *r = res.dbs;
+                                }
+                                if let Ok(mut r) = pg_env.lock() {
+                                    *r = res.env;
                                 }
                                 if let Ok(mut r) = side.lock() {
                                     *r = imported;
@@ -439,13 +452,29 @@ impl Provider<'_> {
                 spec,
                 generation,
             } if self.is_host(&node.name) => {
-                let svc = self
+                let mut svc = self
                     .host
                     .lock()
                     .ok()
                     .and_then(|h| h.get(&node.name.0).cloned());
+                let dbs: BTreeMap<String, crate::postgres::DbInfo> = self
+                    .dbs
+                    .lock()
+                    .map(|d| d.iter().map(|(n, d)| (n.clone(), d.info())).collect())
+                    .unwrap_or_default();
+                let project = self.stack.project.0.clone();
                 let units = self.units.clone();
                 std::thread::spawn(move || {
+                    // Host processes reached the database on its published port; now it is the server's port.
+                    for db in dbs.values() {
+                        let port =
+                            crate::postgres::host_port(&format!("rizr-{project}-{}", db.server));
+                        if let (Some(s), Some(p)) = (svc.as_mut(), port) {
+                            let one = BTreeMap::from([(String::new(), db.clone())]);
+                            let vars = crate::postgres::rewrite(&s.env, &one, Some(p));
+                            s.env.extend(vars);
+                        }
+                    }
                     done(match svc {
                         Some(svc) => exec(crate::supervisor::start(
                             &units,
@@ -471,7 +500,17 @@ impl Provider<'_> {
                         db.attach(&project, &node.name.0)
                     });
                     if r.is_ok() {
-                        let _ = tx.send(Msg::Event(synthetic(node, spec, RuntimeKind::Start)));
+                        // The database exists and the name resolves: that is its health check.
+                        let _ = tx.send(Msg::Event(synthetic(
+                            node.clone(),
+                            spec.clone(),
+                            RuntimeKind::Start,
+                        )));
+                        let _ = tx.send(Msg::Event(synthetic(
+                            node,
+                            spec,
+                            RuntimeKind::Health(Health::Healthy),
+                        )));
                     }
                     done(match r {
                         Ok(()) => Answer::Ok,
@@ -626,6 +665,14 @@ impl Provider<'_> {
             .unwrap_or_default();
         if !side.restart {
             svc["restart"] = json!("on-failure:5");
+        }
+        if let Some(env) = self
+            .pg_env
+            .lock()
+            .ok()
+            .and_then(|e| e.get(&node.name.0).cloned())
+        {
+            svc["environment"] = json!(env);
         }
         let path = st.dir.join(format!("override-{}.yml", node.name.0));
         std::fs::create_dir_all(&st.dir).map_err(|e| e.to_string())?;
@@ -914,6 +961,8 @@ fn exec(mut cmd: Command) -> Answer {
 
 /// The container of a node that all instances of the project share, when it exists.
 pub fn shared_container(stack: &Stack, node: &str) -> Option<String> {
+    let info = crate::postgres::Info::load(&stack.dir);
+    let node = info.databases.get(node).map_or(node, |d| d.server.as_str());
     let out = Command::new("docker")
         .args(["ps", "-aq", "--filter", "label=rizr.scope=project"])
         .arg(format!("--filter=label=rizr.project={}", stack.project.0))
@@ -1018,6 +1067,7 @@ fn import(
         };
     let host = crate::manifest::merge(root, instance, &mut m)?;
     let pg = crate::postgres::add(&mut m, &side, &crate::manifest::unshared(root), instance)?;
+    pg.info.save(dir)?;
     if let Some(n) = compose::cycle(&m) {
         return Err(format!("dependency cycle through `{}`", n.name.0));
     }

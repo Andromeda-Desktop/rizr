@@ -2,6 +2,7 @@
 //! its own database on it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::process::Command;
 
 use rizr_core::model::{
@@ -88,9 +89,177 @@ pub struct Db {
     pub shared: Shared,
     pub database: String,
     pub spec: Digest,
+    /// Host ports the compose service published; host processes used them before the switch.
+    pub published: Vec<u16>,
+}
+
+/// What `context`, `why` and `logs` show of the shared postgres resources; `import` writes it.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct Info {
+    /// By compose service name.
+    pub databases: BTreeMap<String, DbInfo>,
+    /// Compose service env vars that rizr points at this instance's database.
+    pub rewritten: Vec<Rewritten>,
+    /// Postgres services that stay plain compose containers, with the reason.
+    pub plain: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DbInfo {
+    /// The server node, `pg<major>`.
+    pub server: String,
+    pub database: String,
+    /// The database name in the compose file.
+    pub base: String,
+    pub user: String,
+    pub password: String,
+    pub published: Vec<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Rewritten {
+    pub service: String,
+    pub var: String,
+    pub value: String,
+}
+
+impl DbInfo {
+    /// The URL of the database at `host`.
+    pub fn url(&self, host: &str) -> String {
+        let auth = if self.password.is_empty() {
+            self.user.clone()
+        } else {
+            format!("{}:{}", self.user, self.password)
+        };
+        format!("postgresql://{auth}@{host}/{}", self.database)
+    }
+}
+
+impl Info {
+    const FILE: &str = "postgres.json";
+
+    pub fn load(dir: &Path) -> Self {
+        std::fs::read(dir.join(Self::FILE))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, dir: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let json = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join(Self::FILE), json).map_err(|e| e.to_string())
+    }
+}
+
+/// The loopback port of a running server container, for host processes.
+pub fn host_port(container: &str) -> Option<u16> {
+    crate::docker::inspect_one(container).ok()?["NetworkSettings"]["Ports"]["5432/tcp"][0]["HostPort"]
+        .as_str()?
+        .parse()
+        .ok()
+}
+
+/// A postgres URL, split where rizr changes it.
+struct Url<'a> {
+    /// Scheme and user info.
+    head: &'a str,
+    host: &'a str,
+    port: Option<u16>,
+    /// `/db`, `/` or empty.
+    path: &'a str,
+    /// `?query`.
+    tail: &'a str,
+}
+
+fn parse(v: &str) -> Option<Url<'_>> {
+    let scheme = ["postgres://", "postgresql://"]
+        .into_iter()
+        .find(|s| v.starts_with(s))?
+        .len();
+    let rest = &v[scheme..];
+    let (auth, after) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+    let at = auth.rfind('@').map_or(0, |i| i + 1);
+    let (host, port) = match auth[at..].rsplit_once(':') {
+        Some((h, p)) => (h, Some(p.parse().ok()?)),
+        None => (&auth[at..], None),
+    };
+    let (path, tail) = after.split_at(after.find('?').unwrap_or(after.len()));
+    Some(Url {
+        head: &v[..scheme + at],
+        host,
+        port,
+        path,
+        tail,
+    })
+}
+
+/// The env vars that point at a shared database, with their values for this instance. `host_port`: the server's
+/// loopback port, for a host process (which used a published port); None for a compose service (which used the
+/// service name). Other vars change only when the value is exactly the compose database name, and never a
+/// user or password var.
+pub fn rewrite(
+    env: &BTreeMap<String, String>,
+    dbs: &BTreeMap<String, DbInfo>,
+    host_port: Option<u16>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (k, v) in env {
+        for (svc, db) in dbs {
+            let new = if let Some(u) = parse(v) {
+                let ours = match host_port {
+                    None => u.host == svc,
+                    Some(_) => {
+                        matches!(u.host, "localhost" | "127.0.0.1")
+                            && u.port.is_some_and(|p| db.published.contains(&p))
+                    }
+                };
+                if !ours {
+                    continue;
+                }
+                let hostport = match (host_port, u.port) {
+                    (Some(p), _) => format!("127.0.0.1:{p}"),
+                    (None, Some(p)) => format!("{}:{p}", u.host),
+                    (None, None) => u.host.to_owned(),
+                };
+                let path = if u.path.strip_prefix('/') == Some(db.base.as_str()) {
+                    format!("/{}", db.database)
+                } else {
+                    u.path.to_owned()
+                };
+                format!("{}{hostport}{path}{}", u.head, u.tail)
+            } else if *v == db.base && !k.contains("USER") && !k.contains("PASS") {
+                db.database.clone()
+            } else {
+                continue;
+            };
+            if new != *v {
+                out.insert(k.clone(), new);
+            }
+            break;
+        }
+    }
+    out
 }
 
 impl Db {
+    pub fn info(&self) -> DbInfo {
+        DbInfo {
+            server: self.shared.server.node(),
+            database: self.database.clone(),
+            base: self.shared.db.clone(),
+            user: self.shared.server.user().to_owned(),
+            password: self
+                .shared
+                .server
+                .env
+                .get("POSTGRES_PASSWORD")
+                .cloned()
+                .unwrap_or_default(),
+            published: self.published.clone(),
+        }
+    }
+
     /// Creates the database when it is missing, then gives the server the service name on each network of the
     /// service. Creates a missing network with compose's labels, so compose adopts it.
     pub fn attach(&self, project: &str, alias: &str) -> Result<(), String> {
@@ -228,6 +397,40 @@ pub fn shared(svc: &Value, config: &Value) -> Option<Shared> {
     })
 }
 
+/// Why a postgres service stays a plain compose container; None when it is not postgres or can be shared.
+pub fn plain(svc: &Value) -> Option<String> {
+    let image = svc["image"].as_str()?;
+    let name = image
+        .split('@')
+        .next()?
+        .split(':')
+        .next()?
+        .rsplit('/')
+        .next()?;
+    if !matches!(name, "postgres" | "pgvector" | "postgis") {
+        return None;
+    }
+    let init = svc["volumes"].as_array().into_iter().flatten().any(|v| {
+        v["target"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("/docker-entrypoint-initdb.d"))
+    });
+    Some(
+        if major(image).is_none() {
+            "its image has no major version tag, so rizr cannot pick a server"
+        } else if init {
+            "it mounts /docker-entrypoint-initdb.d, and a shared server would skip those scripts"
+        } else if !svc["command"].is_null() {
+            "it sets `command`, and a shared server would not get those flags"
+        } else if !svc["network_mode"].is_null() {
+            "it sets `network_mode`, so it has no network for the service name"
+        } else {
+            return None;
+        }
+        .to_owned(),
+    )
+}
+
 /// The database of `instance`: the compose name for the main worktree, `<db>_<instance>` for the others.
 fn database(db: &str, instance: &InstanceId) -> String {
     if instance.0 == "main" {
@@ -294,8 +497,16 @@ fn major(image: &str) -> Option<u32> {
     }
 }
 
-/// The servers by node name and the databases by compose service name.
-pub type Resources = (BTreeMap<String, Server>, BTreeMap<String, Db>);
+#[derive(Debug, Default)]
+pub struct Resources {
+    /// By node name.
+    pub servers: BTreeMap<String, Server>,
+    /// By compose service name.
+    pub dbs: BTreeMap<String, Db>,
+    /// Per compose service, the env vars that rizr sets in its override.
+    pub env: BTreeMap<String, BTreeMap<String, String>>,
+    pub info: Info,
+}
 
 /// Adds one project node per server the shared services need, and makes each shared service an instance node
 /// of this provider that waits for its server.
@@ -307,7 +518,17 @@ pub fn add(
 ) -> Result<Resources, String> {
     let mut servers: BTreeMap<String, (String, Server)> = BTreeMap::new();
     let mut dbs = BTreeMap::new();
+    let mut plain = BTreeMap::new();
     for (svc, s) in side {
+        if let Some(reason) = &s.pg_plain {
+            plain.insert(svc.clone(), reason.clone());
+        }
+        if s.pg.is_some() && unshared.contains(svc) {
+            plain.insert(
+                svc.clone(),
+                format!("rizr.toml sets `[resource.{svc}] shared = false`"),
+            );
+        }
         let Some(shared) = s.pg.as_ref().filter(|_| !unshared.contains(svc)) else {
             continue;
         };
@@ -331,7 +552,7 @@ pub fn add(
         }
         let spec = digest(&(shared, &database))?;
         node.kind = NodeKind::Service {
-            probe: Probe::AtStart,
+            probe: Probe::HealthEvent,
         };
         node.provider = ProviderName(PROVIDER.into());
         node.spec = spec.clone();
@@ -348,6 +569,11 @@ pub fn add(
                 shared: shared.clone(),
                 database,
                 spec,
+                published: s
+                    .ports
+                    .iter()
+                    .filter_map(|p| p["published"].as_str()?.parse().ok())
+                    .collect(),
             },
         );
         match servers.get(&pg.node()) {
@@ -381,7 +607,39 @@ pub fn add(
             },
         );
     }
-    Ok((servers.into_iter().map(|(n, (_, s))| (n, s)).collect(), dbs))
+    let infos: BTreeMap<String, DbInfo> = dbs.iter().map(|(n, d)| (n.clone(), d.info())).collect();
+    let mut env = BTreeMap::new();
+    let mut rewritten = Vec::new();
+    for (svc, s) in side.iter().filter(|(n, _)| !dbs.contains_key(*n)) {
+        let vars = rewrite(&s.env, &infos, None);
+        if vars.is_empty() {
+            continue;
+        }
+        let id = NodeId {
+            scope: Scope::Instance(instance.clone()),
+            name: NodeName(svc.clone()),
+        };
+        // The override is part of what the container runs: a changed value recreates it.
+        if let Some(n) = m.nodes.get_mut(&id) {
+            n.spec = digest(&(&n.spec.0, &vars))?;
+        }
+        rewritten.extend(vars.iter().map(|(k, v)| Rewritten {
+            service: svc.clone(),
+            var: k.clone(),
+            value: v.clone(),
+        }));
+        env.insert(svc.clone(), vars);
+    }
+    Ok(Resources {
+        servers: servers.into_iter().map(|(n, (_, s))| (n, s)).collect(),
+        dbs,
+        env,
+        info: Info {
+            databases: infos,
+            rewritten,
+            plain,
+        },
+    })
 }
 
 fn digest(v: &impl serde::Serialize) -> Result<Digest, String> {
@@ -439,10 +697,11 @@ mod tests {
         let model = || crate::compose::model(&config, &wt, Digest(String::new())).unwrap();
         assert!(add(&mut model(), &side, &BTreeSet::new(), &wt).is_err());
         let mut m = model();
-        let (servers, dbs) = add(&mut m, &side, &BTreeSet::from(["b".to_string()]), &wt).unwrap();
-        assert_eq!(servers["pg17"].image, "postgres:17");
-        assert_eq!(dbs["a"].database, "app_wt_2");
-        assert!(!dbs.contains_key("b"));
+        let r = add(&mut m, &side, &BTreeSet::from(["b".to_string()]), &wt).unwrap();
+        assert_eq!(r.servers["pg17"].image, "postgres:17");
+        assert_eq!(r.dbs["a"].database, "app_wt_2");
+        assert!(!r.dbs.contains_key("b"));
+        assert!(r.info.plain["b"].contains("shared = false"));
         let a = &m.nodes[&NodeId {
             scope: Scope::Instance(wt.clone()),
             name: NodeName("a".into()),
@@ -454,5 +713,51 @@ mod tests {
                 .any(|d| d.node.scope == Scope::Project && d.node.name.0 == "pg17")
         );
         assert_eq!(m.nodes.len(), 3);
+    }
+
+    #[test]
+    fn rewrites_urls_and_exact_names_but_not_users_or_other_hosts() {
+        let db = DbInfo {
+            server: "pg17".into(),
+            database: "app_wt".into(),
+            base: "app".into(),
+            user: "app".into(),
+            password: "dev".into(),
+            published: vec![15498],
+        };
+        let dbs = BTreeMap::from([("db".to_string(), db)]);
+        let env = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let compose = env(&[
+            (
+                "DATABASE_URL",
+                "postgresql://app:dev@db:5432/app?sslmode=disable",
+            ),
+            ("DB_NAME", "app"),
+            ("POSTGRES_USER", "app"),
+            ("OTHER_URL", "postgres://app:dev@cache:5432/app"),
+        ]);
+        assert_eq!(
+            rewrite(&compose, &dbs, None),
+            env(&[
+                (
+                    "DATABASE_URL",
+                    "postgresql://app:dev@db:5432/app_wt?sslmode=disable"
+                ),
+                ("DB_NAME", "app_wt"),
+            ])
+        );
+        let host = env(&[
+            ("DATABASE_URL", "postgres://app:dev@localhost:15498/app"),
+            ("REMOTE", "postgres://app:dev@localhost:5999/app"),
+        ]);
+        assert_eq!(
+            rewrite(&host, &dbs, Some(32768)),
+            env(&[("DATABASE_URL", "postgres://app:dev@127.0.0.1:32768/app_wt")])
+        );
     }
 }

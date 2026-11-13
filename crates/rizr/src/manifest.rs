@@ -189,6 +189,15 @@ pub fn unshared(root: &Path) -> std::collections::BTreeSet<String> {
         .unwrap_or_default()
 }
 
+/// The host services of `<root>/rizr.toml`; empty when it is absent or does not parse.
+pub fn host_services(root: &Path) -> BTreeMap<String, HostService> {
+    std::fs::read_to_string(root.join("rizr.toml"))
+        .ok()
+        .and_then(|t| toml::from_str::<Manifest>(&t).ok())
+        .map(|m| m.service)
+        .unwrap_or_default()
+}
+
 /// Names of the host services in `<root>/rizr.toml`; empty when it is absent or does not parse.
 pub fn host_names(root: &Path) -> std::collections::BTreeSet<String> {
     std::fs::read_to_string(root.join("rizr.toml"))

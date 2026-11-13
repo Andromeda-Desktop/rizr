@@ -124,6 +124,13 @@ pub fn import(
                 restart: !s["restart"].is_null(),
                 ports: s["ports"].as_array().cloned().unwrap_or_default(),
                 pg: crate::postgres::shared(s, &config),
+                pg_plain: crate::postgres::plain(s),
+                env: s["environment"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+                    .collect(),
             };
             (n.clone(), side)
         })
@@ -140,6 +147,10 @@ pub struct Side {
     pub ports: Vec<Value>,
     /// The shared server this service can move to, before `rizr.toml` opts it out.
     pub pg: Option<crate::postgres::Shared>,
+    /// Why a postgres service stays a plain compose container.
+    pub pg_plain: Option<String>,
+    /// The resolved `environment`.
+    pub env: BTreeMap<String, String>,
 }
 
 /// A dependency that is not a finished job must share a network with its dependent, or its name never resolves.
