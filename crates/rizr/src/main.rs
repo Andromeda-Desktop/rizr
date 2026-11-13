@@ -139,6 +139,18 @@ fn run(cli: Cli) -> Result<(), Error> {
                     format!("ls -l {}", stack.dir.display()),
                 )
             })?;
+            let others = compose::others(&stack.root, &stack.files);
+            if up && !others.is_empty() {
+                eprintln!(
+                    "note: rizr uses {}; other compose files here: {} (pick one with `rizr -f <file> up`)",
+                    compose::resolve(&stack.root, &stack.files)
+                        .iter()
+                        .filter_map(|p| p.file_name()?.to_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    others.join(", ")
+                );
+            }
             let since = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
@@ -293,6 +305,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                     "databases": databases,
                     "root": stack.root, "project": stack.compose_name(), "data_dir": stack.dir,
                     "compose_files": compose::resolve(&stack.root, &stack.files), "status": status,
+                    "other_compose_files": compose::others(&stack.root, &stack.files),
                     "findings": findings(&s), "unverified": unverified, "moved_ports": ports::lines(&stack.dir), "outside_rizr": strays,
                     "generation": s.intents.generation.0, "graph": graph, "nodes": view::nodes(&s),
                     "drift": view::drift(&s), "failed": failed, "next": next, "verbs": verbs(),

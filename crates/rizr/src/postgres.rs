@@ -230,7 +230,10 @@ pub fn rewrite(
                     u.path.to_owned()
                 };
                 format!("{}{hostport}{path}{}", u.head, u.tail)
-            } else if *v == db.base && !k.contains("USER") && !k.contains("PASS") {
+            } else if *v == db.base
+                && !k.to_uppercase().contains("USER")
+                && !k.to_uppercase().contains("PASS")
+            {
                 db.database.clone()
             } else {
                 continue;
@@ -264,7 +267,8 @@ impl Db {
 
     /// Creates the database when it is missing, then gives the server the service name on each network of the
     /// service. Creates a missing network with compose's labels, so compose adopts it.
-    pub fn attach(&self, project: &str, alias: &str) -> Result<(), String> {
+    /// Returns true when it created the database.
+    pub fn attach(&self, project: &str, alias: &str) -> Result<bool, String> {
         let server = self.shared.server.container(project);
         for (key, net) in &self.shared.networks {
             if !ok(Command::new("docker").args(["network", "inspect", net])) {
@@ -292,7 +296,8 @@ impl Db {
         if !exists.status.success() {
             return Err(crate::compose::tail(&exists.stderr));
         }
-        if String::from_utf8_lossy(&exists.stdout).trim() != "1" {
+        let created = String::from_utf8_lossy(&exists.stdout).trim() != "1";
+        if created {
             run(Command::new("docker").args([
                 "exec",
                 &server,
@@ -315,12 +320,108 @@ impl Db {
                 Command::new("docker").args(["network", "connect", "--alias", alias, net, &server])
             )?;
         }
-        Ok(())
+        Ok(created)
     }
 
     /// Copies the old compose data of the service into its database once: roles first, then the database. It
     /// runs only while the database has no tables and no import mark. The old data is read, never changed.
     /// On a failure it drops the database, so the next start tries again. Returns true when it copied data.
+    /// Fill a new instance database from main's data: main's database on this server, else main's running
+    /// compose container, else main's compose volume. With none of them it stays empty.
+    pub fn seed(
+        &self,
+        project: &str,
+        svc: &str,
+        main_compose: &str,
+        compose: &str,
+    ) -> Result<(), String> {
+        let server = self.shared.server.container(project);
+        let user = self.shared.server.user();
+        let main = &self.shared.db;
+        let on_server = Command::new("docker")
+            .args(["exec", &server, "psql", "-U", user, "-d", main, "-tAc"])
+            .arg("select count(*) from pg_tables where schemaname not in ('pg_catalog', 'information_schema')")
+            .output()
+            .map_err(|e| e.to_string())?;
+        // The image creates an empty POSTGRES_DB at init: only a database with tables holds main's data.
+        let tables: u64 = String::from_utf8_lossy(&on_server.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        if tables > 0 {
+            run(Command::new("docker").args([
+                "exec",
+                &server,
+                "dropdb",
+                "-U",
+                user,
+                "--maintenance-db=template1",
+                &self.database,
+            ]))?;
+            return clone(&server, user, main, &self.database);
+        }
+        let running = Command::new("docker")
+            .args(["ps", "-q"])
+            .arg(format!(
+                "--filter=label=com.docker.compose.project={main_compose}"
+            ))
+            .arg(format!("--filter=label=com.docker.compose.service={svc}"))
+            .output()
+            .map_err(|e| e.to_string())?;
+        if let Some(id) = String::from_utf8_lossy(&running.stdout).lines().next() {
+            let mut dump = Command::new("docker")
+                .args([
+                    "exec",
+                    id,
+                    "pg_dump",
+                    "-U",
+                    user,
+                    "--no-owner",
+                    "--no-acl",
+                    main,
+                ])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            let out = dump.stdout.take().ok_or("pg_dump gave no output")?;
+            let load = Command::new("docker")
+                .args([
+                    "exec",
+                    "-i",
+                    &server,
+                    "psql",
+                    "-q",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-U",
+                    user,
+                    "-d",
+                ])
+                .arg(&self.database)
+                .stdin(out)
+                .stdout(std::process::Stdio::null())
+                .output()
+                .map_err(|e| e.to_string())?;
+            let dumped = dump.wait().map_err(|e| e.to_string())?;
+            if !dumped.success() || !load.status.success() {
+                return Err(format!(
+                    "copy of {main} from {main_compose} failed: {}",
+                    crate::compose::tail(&load.stderr)
+                ));
+            }
+            return Ok(());
+        }
+        // A named volume of this instance is `<compose>_<name>`; main's is `<main_compose>_<name>`.
+        let main_volume = self.shared.old_data.as_ref().and_then(|(source, target)| {
+            let name = source.strip_prefix(&format!("{compose}_"))?;
+            Some((format!("{main_compose}_{name}"), target.clone()))
+        });
+        match main_volume {
+            Some(old) => self.import(project, svc, &old).map(|_| ()),
+            None => Ok(()),
+        }
+    }
+
     pub fn import(
         &self,
         project: &str,
@@ -538,6 +639,31 @@ fn pipe(from: &mut Command, to: &mut Command) -> Result<(), String> {
         return Err(crate::compose::tail(&b.stderr));
     }
     Ok(())
+}
+
+/// Copy database `from` to `to` on one server. A template needs no other session, so `from` refuses new ones and
+/// loses its open ones for the copy; it takes connections again afterwards, also on error.
+fn clone(server: &str, user: &str, from: &str, to: &str) -> Result<(), String> {
+    let sql = |s: String| {
+        run(Command::new("docker").args([
+            "exec",
+            server,
+            "psql",
+            "-U",
+            user,
+            "-d",
+            "template1",
+            "-qtAc",
+            &s,
+        ]))
+    };
+    sql(format!("ALTER DATABASE \"{from}\" ALLOW_CONNECTIONS false"))?;
+    let r = sql(format!(
+        "select pg_terminate_backend(pid) from pg_stat_activity where datname = '{from}' and pid <> pg_backend_pid()"
+    ))
+    .and_then(|()| sql(format!("CREATE DATABASE \"{to}\" TEMPLATE \"{from}\"")));
+    let allowed = sql(format!("ALTER DATABASE \"{from}\" ALLOW_CONNECTIONS true"));
+    r.and(allowed)
 }
 
 fn ok(c: &mut Command) -> bool {

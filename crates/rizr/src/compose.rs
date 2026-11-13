@@ -41,6 +41,24 @@ pub fn resolve(root: &Path, chosen: &[PathBuf]) -> Vec<PathBuf> {
     }
 }
 
+/// Other compose files in `root` (a top-level `services:`) that the resolved set leaves out, such as `pwd.yml`.
+pub fn others(root: &Path, chosen: &[PathBuf]) -> Vec<String> {
+    let used = resolve(root, chosen);
+    let mut v: Vec<String> = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| matches!(p.extension().and_then(|x| x.to_str()), Some("yml" | "yaml")))
+        .filter(|p| !used.contains(p))
+        .filter(|p| {
+            std::fs::read_to_string(p).is_ok_and(|t| t.lines().any(|l| l.starts_with("services:")))
+        })
+        .filter_map(|p| Some(p.file_name()?.to_str()?.to_owned()))
+        .collect();
+    v.sort();
+    v
+}
+
 /// The project name plain `docker compose` picks: `COMPOSE_PROJECT_NAME`, else the last top-level `name:`,
 /// else the directory name; normalized as compose does.
 pub fn default_name(root: &Path, chosen: &[PathBuf]) -> String {
@@ -122,6 +140,7 @@ pub fn import(
         .map(|(n, s)| {
             let side = Side {
                 restart: !s["restart"].is_null(),
+                container_name: s["container_name"].as_str().map(str::to_owned),
                 ports: s["ports"].as_array().cloned().unwrap_or_default(),
                 pg: crate::postgres::shared(s, &config),
                 pg_plain: crate::postgres::plain(s),
@@ -151,6 +170,8 @@ pub struct Side {
     pub pg_plain: Option<String>,
     /// The resolved `environment`.
     pub env: BTreeMap<String, String>,
+    /// A fixed `container_name`; other instances get `<name>-<instance>` so they do not collide.
+    pub container_name: Option<String>,
 }
 
 /// A dependency that is not a finished job must share a network with its dependent, or its name never resolves.

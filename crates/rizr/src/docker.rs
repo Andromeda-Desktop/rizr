@@ -18,6 +18,7 @@ use rizr_core::model::{
 };
 use rizr_core::{Action, Answer, Event, Op, State, plan, reduce};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 
 use crate::compose;
 
@@ -39,6 +40,8 @@ pub struct Stack {
     /// rizr's data directory for this instance: generation and override files. Never inside the repo.
     pub dir: PathBuf,
     compose_name: String,
+    /// The compose project name of the main worktree, whose data a new instance starts from.
+    main_compose_name: String,
 }
 
 impl Stack {
@@ -62,9 +65,13 @@ impl Stack {
             if s.is_empty() { "root".into() } else { s }
         };
         let main = main_worktree(&root);
-        let project = ProjectId(slug(main.as_deref().unwrap_or(&root)));
+        let main_root = main.as_deref().unwrap_or(&root);
+        // The path hash keeps two repos with one directory name apart: their servers and data never mix.
+        let path_hash = compose::hex(&Sha256::digest(main_root.as_os_str().as_encoded_bytes()));
+        let project = ProjectId(format!("{}-{}", slug(main_root), &path_hash[..6]));
         let instance = InstanceId(main.as_ref().map_or("main".into(), |_| slug(&root)));
         let dir = data.join(format!("{}-{}", project.0, instance.0));
+        let main_compose_name = compose::default_name(main_root, &files);
         let compose_name = match &main {
             None => compose::default_name(&root, &files),
             Some(m) => format!("{}-{}", compose::default_name(m, &files), instance.0),
@@ -76,6 +83,7 @@ impl Stack {
             instance,
             dir,
             compose_name,
+            main_compose_name,
         }
     }
 
@@ -84,7 +92,13 @@ impl Stack {
     pub fn lock(&self) -> std::io::Result<std::fs::File> {
         std::fs::create_dir_all(&self.dir)?;
         let f = std::fs::File::create(self.dir.join("lock"))?;
-        f.lock()?;
+        if f.try_lock().is_err() {
+            eprintln!(
+                "waiting: another rizr call (up, down or restart) still runs on {}; stop it to go on now",
+                self.compose_name
+            );
+            f.lock()?;
+        }
         Ok(f)
     }
 
@@ -133,6 +147,7 @@ pub fn run(stack: &Stack, inputs: Digest, action: Option<Action>) -> Result<Stat
         units: crate::supervisor::Units::of(stack),
         unit_events: None,
         project_lock: Arc::default(),
+        progress: action.is_some().then(|| (Instant::now(), BTreeMap::new())),
     };
     let mut s = State::new(stack.project.clone(), stack.instance.clone(), generation);
     s = reduce(
@@ -173,6 +188,8 @@ struct Provider<'a> {
     unit_events: Option<Child>,
     /// Held while this instance changes a node that all instances share; the OS frees it if rizr dies.
     project_lock: Arc<Mutex<Option<std::fs::File>>>,
+    /// For a verb that changes the stack: its start and the last state printed per node.
+    progress: Option<(Instant, BTreeMap<String, String>)>,
 }
 
 impl Drop for Provider<'_> {
@@ -229,6 +246,25 @@ impl Provider<'_> {
                 Some(Msg::Done(id, answer)) => s = reduce(s, Event::Done { id, answer }),
                 Some(Msg::Event(e)) => s = reduce(s, e),
                 None => unreachable!("the provider holds a sender"),
+            }
+            self.print_progress(&s);
+        }
+    }
+
+    /// One stderr line per node state change, so a caller with a short timeout sees how far `up` got.
+    fn print_progress(&mut self, s: &State) {
+        let Some((start, last)) = &mut self.progress else {
+            return;
+        };
+        for n in rizr_core::view::nodes(s) {
+            let state = n.state.to_string();
+            if last.get(&n.node.name.0) != Some(&state) {
+                eprintln!(
+                    "[{:>3}s] {} {state}",
+                    start.elapsed().as_secs(),
+                    n.node.name.0
+                );
+                last.insert(n.node.name.0, state);
             }
         }
     }
@@ -493,6 +529,10 @@ impl Provider<'_> {
                 let db = self.db(&node);
                 let (project, tx) = (self.stack.project.0.clone(), self.tx.clone());
                 let instance = self.stack.instance.0.clone();
+                let names = (
+                    self.stack.main_compose_name.clone(),
+                    self.stack.compose_name(),
+                );
                 let mut old = self.stack.compose();
                 old.args(["rm", "--stop", "--force"]).arg(&node.name.0);
                 let mut ps = self.stack.compose();
@@ -523,7 +563,9 @@ impl Provider<'_> {
                             })
                             .or_else(|| db.shared.old_data.clone());
                         let _ = old.output();
-                        db.attach(&project, &node.name.0)?;
+                        if db.attach(&project, &node.name.0)? && instance != "main" {
+                            db.seed(&project, &node.name.0, &names.0, &names.1)?;
+                        }
                         match mount {
                             Some(m) => db.import(&project, &instance, &m).map(|_| ()),
                             None => Ok(()),
@@ -716,6 +758,13 @@ impl Provider<'_> {
             .unwrap_or_default();
         if !side.restart {
             svc["restart"] = json!("on-failure:5");
+        }
+        if let Some(name) = side
+            .container_name
+            .as_ref()
+            .filter(|_| st.instance.0 != "main")
+        {
+            svc["container_name"] = json!(format!("{name}-{}", st.instance.0));
         }
         if let Some(env) = self
             .pg_env
