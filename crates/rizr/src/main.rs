@@ -7,6 +7,7 @@ use rizr_core::error::{Error, ErrorCode};
 use rizr_core::view::{Drift, Receipt};
 
 mod compose;
+mod devenv;
 mod docker;
 mod trust;
 

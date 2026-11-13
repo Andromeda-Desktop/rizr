@@ -33,7 +33,8 @@ pub fn files(root: &Path) -> Vec<PathBuf> {
 }
 
 /// The command prefix every compose call of this stack uses.
-pub fn command(root: &Path, project: &str) -> Command {
+/// `dir` is rizr's data directory for the instance: the dev env files live there.
+pub fn command(root: &Path, project: &str, dir: &Path) -> Command {
     let mut c = Command::new("docker");
     c.arg("compose")
         .arg("-p")
@@ -43,6 +44,7 @@ pub fn command(root: &Path, project: &str) -> Command {
     for f in files(root) {
         c.arg("-f").arg(f);
     }
+    c.args(crate::devenv::args(root, dir));
     c
 }
 
@@ -50,19 +52,28 @@ pub fn command(root: &Path, project: &str) -> Command {
 pub fn import(
     root: &Path,
     project: &str,
+    dir: &Path,
     instance: &InstanceId,
     inputs: Digest,
 ) -> Result<(Model, BTreeMap<String, bool>), String> {
-    if files(root).is_empty() {
+    let compose_files = files(root);
+    if compose_files.is_empty() {
         return Err(format!("no compose file in {}", root.display()));
     }
-    let out = command(root, project)
-        .args(["config", "--format", "json"])
-        .output()
-        .map_err(|e| format!("cannot run docker compose: {e}"))?;
-    if !out.status.success() {
-        return Err(tail(&out.stderr));
-    }
+    crate::devenv::prepare(root, dir, &compose_files)?;
+    // Compose names one unset required variable per run; each round fills one.
+    let out = loop {
+        let out = command(root, project, dir)
+            .args(["config", "--format", "json"])
+            .output()
+            .map_err(|e| format!("cannot run docker compose: {e}"))?;
+        if out.status.success() {
+            break out;
+        }
+        if !crate::devenv::fill(dir, &String::from_utf8_lossy(&out.stderr))? {
+            return Err(tail(&out.stderr));
+        }
+    };
     let config: Value =
         serde_json::from_slice(&out.stdout).map_err(|e| format!("compose config: {e}"))?;
     let restart = config["services"]

@@ -1,0 +1,13 @@
+# rizr sample: a repo that does not start on a fresh clone. It has no .env, one env_file has only an example,
+# and one required variable is unset. rizr fills these in its data directory.
+services:
+  app:
+    image: busybox:latest
+    command: ["sh", "-c", "env | grep -E '^(FROM_|APP_SECRET|PUBLIC_URL)' | sed 's/=.*//' | sort; exec sleep infinity"]
+    env_file:
+      - .env
+      - backend.env
+    environment:
+      APP_SECRET: ${APP_SECRET:?set APP_SECRET in .env}
+      PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL}
+      FROM_DOTENV: ${FROM_DOTENV}

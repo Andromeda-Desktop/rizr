@@ -70,7 +70,7 @@ impl Stack {
     }
 
     fn compose(&self) -> Command {
-        compose::command(&self.root, &self.compose_name())
+        compose::command(&self.root, &self.compose_name(), &self.dir)
     }
 }
 
@@ -205,9 +205,10 @@ impl Provider<'_> {
                 });
             }
             Op::Import => {
-                let (root, name, instance, restart_set) = (
+                let (root, name, dir, instance, restart_set) = (
                     st.root.clone(),
                     st.compose_name(),
+                    st.dir.clone(),
                     st.instance.clone(),
                     self.restart_set.clone(),
                 );
@@ -216,15 +217,17 @@ impl Provider<'_> {
                     _ => Digest(String::new()),
                 };
                 std::thread::spawn(move || {
-                    done(match compose::import(&root, &name, &instance, inputs) {
-                        Ok((m, restart)) => {
-                            if let Ok(mut r) = restart_set.lock() {
-                                *r = restart;
+                    done(
+                        match compose::import(&root, &name, &dir, &instance, inputs) {
+                            Ok((m, restart)) => {
+                                if let Ok(mut r) = restart_set.lock() {
+                                    *r = restart;
+                                }
+                                Answer::Imported(m)
                             }
-                            Answer::Imported(m)
-                        }
-                        Err(tail) => Answer::Err { tail },
-                    });
+                            Err(tail) => Answer::Err { tail },
+                        },
+                    );
                 });
             }
             Op::Inspect(node) => {
