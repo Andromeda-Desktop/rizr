@@ -267,6 +267,14 @@ impl Db {
 
     /// Creates the database when it is missing, then gives the server the service name on each network of the
     /// service. Creates a missing network with compose's labels, so compose adopts it.
+    pub fn rewind_target(&self, project: &str) -> crate::rewind::Target {
+        crate::rewind::Target {
+            server: self.shared.server.container(project),
+            user: self.shared.server.user().to_owned(),
+            database: self.database.clone(),
+        }
+    }
+
     /// Returns true when it created the database.
     pub fn attach(&self, project: &str, alias: &str) -> Result<bool, String> {
         let server = self.shared.server.container(project);
@@ -358,7 +366,7 @@ impl Db {
                 "--maintenance-db=template1",
                 &self.database,
             ]))?;
-            return clone(&server, user, main, &self.database);
+            return clone(&server, user, main, &self.database, None);
         }
         let running = Command::new("docker")
             .args(["ps", "-q"])
@@ -641,29 +649,71 @@ fn pipe(from: &mut Command, to: &mut Command) -> Result<(), String> {
     Ok(())
 }
 
-/// Copy database `from` to `to` on one server. A template needs no other session, so `from` refuses new ones and
-/// loses its open ones for the copy; it takes connections again afterwards, also on error.
-fn clone(server: &str, user: &str, from: &str, to: &str) -> Result<(), String> {
-    let sql = |s: String| {
-        run(Command::new("docker").args([
-            "exec",
+/// Run one admin statement on `template1`; with a budget, the server cancels it after that many ms.
+pub fn admin(
+    server: &str,
+    user: &str,
+    sql: &str,
+    budget_ms: Option<u64>,
+) -> Result<String, String> {
+    let mut c = Command::new("docker");
+    c.arg("exec");
+    if let Some(ms) = budget_ms {
+        c.args(["-e", &format!("PGOPTIONS=-c statement_timeout={ms}")]);
+    }
+    let o = c
+        .args([server, "psql", "-U", user, "-d", "template1", "-qtAc", sql])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if o.status.success() {
+        Ok(String::from_utf8_lossy(&o.stdout).trim().to_owned())
+    } else {
+        Err(crate::compose::tail(&o.stderr))
+    }
+}
+
+/// Close `db` to new sessions and end its open ones: a template, a drop or a rename needs it alone.
+pub fn close(server: &str, user: &str, db: &str) -> Result<(), String> {
+    admin(
+        server,
+        user,
+        &format!("ALTER DATABASE \"{db}\" ALLOW_CONNECTIONS false"),
+        None,
+    )?;
+    admin(
+        server,
+        user,
+        &format!("select pg_terminate_backend(pid) from pg_stat_activity where datname = '{db}' and pid <> pg_backend_pid()"),
+        None,
+    )
+    .map(|_| ())
+}
+
+/// Copy database `from` to `to` on one server. `from` loses its sessions for the copy and takes connections
+/// again afterwards, also on error.
+pub fn clone(
+    server: &str,
+    user: &str,
+    from: &str,
+    to: &str,
+    budget_ms: Option<u64>,
+) -> Result<(), String> {
+    let r = close(server, user, from).and_then(|()| {
+        admin(
             server,
-            "psql",
-            "-U",
             user,
-            "-d",
-            "template1",
-            "-qtAc",
-            &s,
-        ]))
-    };
-    sql(format!("ALTER DATABASE \"{from}\" ALLOW_CONNECTIONS false"))?;
-    let r = sql(format!(
-        "select pg_terminate_backend(pid) from pg_stat_activity where datname = '{from}' and pid <> pg_backend_pid()"
-    ))
-    .and_then(|()| sql(format!("CREATE DATABASE \"{to}\" TEMPLATE \"{from}\"")));
-    let allowed = sql(format!("ALTER DATABASE \"{from}\" ALLOW_CONNECTIONS true"));
-    r.and(allowed)
+            &format!("CREATE DATABASE \"{to}\" TEMPLATE \"{from}\""),
+            budget_ms,
+        )
+        .map(|_| ())
+    });
+    let allowed = admin(
+        server,
+        user,
+        &format!("ALTER DATABASE \"{from}\" ALLOW_CONNECTIONS true"),
+        None,
+    );
+    r.and(allowed.map(|_| ()))
 }
 
 fn ok(c: &mut Command) -> bool {

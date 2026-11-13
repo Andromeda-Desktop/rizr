@@ -663,6 +663,24 @@ impl Provider<'_> {
                 if let Ok(mut c) = self.current.lock() {
                     c.remove(&node.name.0);
                 }
+                // A data job may break the data: each of this instance's databases gets a rewind point first.
+                let is_job = matches!(
+                    s.loaded().and_then(|m| m.nodes.get(&node)).map(|n| &n.kind),
+                    Some(NodeKind::Job { .. })
+                );
+                let points: Vec<_> = if is_job {
+                    self.dbs
+                        .lock()
+                        .map(|d| {
+                            d.values()
+                                .map(|db| db.rewind_target(&self.stack.project.0))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let (dir, job) = (self.stack.dir.clone(), node.name.0.clone());
                 let mut cmd = self.stack.compose();
                 let r = self.write_override(&node, &spec, generation).map(|files| {
                     for f in files {
@@ -671,6 +689,9 @@ impl Provider<'_> {
                     cmd.args(["up", "-d", "--no-deps"]).arg(&node.name.0);
                 });
                 std::thread::spawn(move || {
+                    for t in &points {
+                        crate::rewind::take(t, &dir, &job, true);
+                    }
                     done(match r {
                         Ok(()) => exec(cmd),
                         Err(tail) => Answer::Err { tail },

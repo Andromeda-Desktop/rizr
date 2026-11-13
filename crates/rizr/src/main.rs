@@ -15,6 +15,7 @@ mod exec;
 mod manifest;
 mod ports;
 mod postgres;
+mod rewind;
 mod supervisor;
 mod trust;
 
@@ -67,6 +68,19 @@ enum Command {
     },
     /// Wait up to 100 s more for the last `exec` (or the named job), then print its last output and exit code.
     Wait { job: Option<String> },
+    /// Take a rewind point of each shared database now (or of the named one). rizr also takes one before each
+    /// migrate or seed job and keeps the newest 3.
+    Snapshot { db: Option<String> },
+    /// Restore each shared database (or the named one) to its newest rewind point; `--back 2` takes the one
+    /// before. The current data becomes a rewind point first.
+    Rewind {
+        db: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        back: usize,
+    },
+    /// Empty each shared database (or the named one), so the next `up` reruns migrate and seed jobs. The current
+    /// data becomes a rewind point first.
+    Reset { db: Option<String> },
     /// Print the JSON Schema of the API: actions, errors, receipt and drift.
     Schema,
 }
@@ -154,8 +168,13 @@ fn run(cli: Cli) -> Result<(), Error> {
             let since = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            let s = docker::run(&stack, i.digest, Some(action))
-                .map_err(|e| with_output(&stack, e, since))?;
+            let s = docker::run(&stack, i.digest, Some(action));
+            for e in rewind::entries(&stack.dir) {
+                if e.at >= since && !e.ok {
+                    eprintln!("{}", rewind::warning(&e));
+                }
+            }
+            let s = s.map_err(|e| with_output(&stack, e, since))?;
             if down {
                 exec::remove(&stack, true);
             }
@@ -205,6 +224,9 @@ fn run(cli: Cli) -> Result<(), Error> {
         }
         Command::Exec { node, cmd } => exec::start(&stack, &node, &cmd),
         Command::Wait { job } => exec::wait(&stack, job.as_deref()),
+        Command::Snapshot { db } => rewind::snapshot(&stack, db.as_deref()),
+        Command::Rewind { db, back } => rewind::rewind(&stack, db.as_deref(), back),
+        Command::Reset { db } => rewind::reset(&stack, db.as_deref()),
         Command::Plan => {
             let s = docker::run(&stack, i.digest, None)?;
             let s = reduce(
@@ -306,6 +328,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                     "root": stack.root, "project": stack.compose_name(), "data_dir": stack.dir,
                     "compose_files": compose::resolve(&stack.root, &stack.files), "status": status,
                     "other_compose_files": compose::others(&stack.root, &stack.files),
+                    "rewind": rewind::entries(&stack.dir).iter().rev().take(10).collect::<Vec<_>>(),
                     "findings": findings(&s), "unverified": unverified, "moved_ports": ports::lines(&stack.dir), "outside_rizr": strays,
                     "generation": s.intents.generation.0, "graph": graph, "nodes": view::nodes(&s),
                     "drift": view::drift(&s), "failed": failed, "next": next, "verbs": verbs(),
