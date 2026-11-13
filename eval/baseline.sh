@@ -74,6 +74,11 @@ prep() { # task: pull and build images, so the run measures the agent, not the n
   local t=$1 d=$ROOT/$1/repo
   : >"$OUT/$t/prep.log"
   # Package downloads inside image builds time out now and then (task 2: PyPI); the cache keeps finished layers.
+  # bun.sh installs from GitHub releases (~30 KB/s here); the npm registry serves the same binary fast.
+  if [[ $t == 2 ]]; then
+    sed -i 's#^RUN curl -fsSL https://bun.sh/install | bash$#RUN npm install -g bun#' "$d/frontend/Dockerfile.playwright"
+    git -C "$d" commit -qam "bun from npm" --no-gpg-sign
+  fi
   local try
   for try in 1 2 3; do
     (cd "$d" && docker compose ${COMPOSE[$t]:-} pull -q --ignore-buildable && docker compose ${COMPOSE[$t]:-} build --progress plain) >>"$OUT/$t/prep.log" 2>&1 && break
