@@ -92,7 +92,7 @@ pub fn run(stack: &Stack, inputs: Digest, action: Option<Action>) -> Result<Stat
         current: Current::default(),
         events: None,
         deadlines: BTreeMap::new(),
-        restart_set: Arc::default(),
+        side: Arc::default(),
     };
     let mut s = State::new(stack.project.clone(), stack.instance.clone(), generation);
     s = reduce(
@@ -119,8 +119,8 @@ struct Provider<'a> {
     current: Current,
     events: Option<Child>,
     deadlines: BTreeMap<EffectId, Instant>,
-    /// Services whose compose file sets `restart:`; the others get `on-failure:5` in the override.
-    restart_set: Arc<Mutex<BTreeMap<String, bool>>>,
+    /// Per service data from the import that the model does not carry.
+    side: Arc<Mutex<BTreeMap<String, compose::Side>>>,
 }
 
 impl Drop for Provider<'_> {
@@ -211,13 +211,13 @@ impl Provider<'_> {
                 });
             }
             Op::Import => {
-                let (root, files, name, dir, instance, restart_set) = (
+                let (root, files, name, dir, instance, side) = (
                     st.root.clone(),
                     st.files.clone(),
                     st.compose_name(),
                     st.dir.clone(),
                     st.instance.clone(),
-                    self.restart_set.clone(),
+                    self.side.clone(),
                 );
                 let inputs = match &s.trust {
                     rizr_core::state::Trust::Trusted(d) => d.clone(),
@@ -226,9 +226,9 @@ impl Provider<'_> {
                 std::thread::spawn(move || {
                     done(
                         match compose::import(&root, &files, &name, &dir, &instance, inputs) {
-                            Ok((m, restart)) => {
-                                if let Ok(mut r) = restart_set.lock() {
-                                    *r = restart;
+                            Ok((m, imported)) => {
+                                if let Ok(mut r) = side.lock() {
+                                    *r = imported;
                                 }
                                 Answer::Imported(m)
                             }
@@ -270,11 +270,11 @@ impl Provider<'_> {
                     c.remove(&node.name.0);
                 }
                 let mut cmd = self.stack.compose();
-                let r = self.write_override(&node, &spec, generation).map(|f| {
-                    cmd.arg("-f")
-                        .arg(f)
-                        .args(["up", "-d", "--no-deps"])
-                        .arg(&node.name.0);
+                let r = self.write_override(&node, &spec, generation).map(|files| {
+                    for f in files {
+                        cmd.arg("-f").arg(f);
+                    }
+                    cmd.args(["up", "-d", "--no-deps"]).arg(&node.name.0);
                 });
                 std::thread::spawn(move || {
                     done(match r {
@@ -308,18 +308,18 @@ impl Provider<'_> {
         node: &NodeId,
         spec: &Digest,
         generation: Gen,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<Vec<PathBuf>, String> {
         let st = self.stack;
         let mut svc = json!({"labels": {
             "rizr.project": st.project.0, "rizr.instance": st.instance.0, "rizr.node": node.name.0,
             "rizr.spec": spec.0, "rizr.gen": generation.0.to_string()}});
-        let restart_set = self
-            .restart_set
+        let side = self
+            .side
             .lock()
             .ok()
-            .and_then(|r| r.get(&node.name.0).copied())
-            .unwrap_or(true);
-        if !restart_set {
+            .and_then(|r| r.get(&node.name.0).cloned())
+            .unwrap_or_default();
+        if !side.restart {
             svc["restart"] = json!("on-failure:5");
         }
         let path = st.dir.join(format!("override-{}.yml", node.name.0));
@@ -327,7 +327,8 @@ impl Provider<'_> {
         // JSON is YAML: compose reads it, and no value needs YAML quoting.
         std::fs::write(&path, json!({"services": {&node.name.0: svc}}).to_string())
             .map_err(|e| e.to_string())?;
-        Ok(path)
+        let ports = crate::ports::prepare(&st.dir, &st.compose_name(), &node.name.0, &side.ports)?;
+        Ok([Some(path), ports].into_iter().flatten().collect())
     }
 
     fn subscribe(&mut self) -> Result<(), String> {

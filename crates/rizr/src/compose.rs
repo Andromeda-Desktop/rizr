@@ -65,7 +65,7 @@ pub fn import(
     dir: &Path,
     instance: &InstanceId,
     inputs: Digest,
-) -> Result<(Model, BTreeMap<String, bool>), String> {
+) -> Result<(Model, BTreeMap<String, Side>), String> {
     let compose_files = resolve(root, chosen);
     if compose_files.is_empty() {
         return Err(format!("no compose file in {}", root.display()));
@@ -86,13 +86,28 @@ pub fn import(
     };
     let config: Value =
         serde_json::from_slice(&out.stdout).map_err(|e| format!("compose config: {e}"))?;
-    let restart = config["services"]
+    let side = config["services"]
         .as_object()
         .into_iter()
         .flatten()
-        .map(|(n, s)| (n.clone(), !s["restart"].is_null()))
+        .map(|(n, s)| {
+            let side = Side {
+                restart: !s["restart"].is_null(),
+                ports: s["ports"].as_array().cloned().unwrap_or_default(),
+            };
+            (n.clone(), side)
+        })
         .collect();
-    Ok((model(&config, instance, inputs)?, restart))
+    Ok((model(&config, instance, inputs)?, side))
+}
+
+/// What the provider needs per service beside the model.
+#[derive(Clone, Debug, Default)]
+pub struct Side {
+    /// The compose file sets `restart:`; otherwise the override sets `on-failure:5`.
+    pub restart: bool,
+    /// The resolved `ports` list, for taken-port remaps.
+    pub ports: Vec<Value>,
 }
 
 /// A dependency that is not a finished job must share a network with its dependent, or its name never resolves.

@@ -11,6 +11,7 @@ use serde_json::json;
 mod compose;
 mod devenv;
 mod docker;
+mod ports;
 mod trust;
 
 /// One control plane for any project: run a repo's stack with one command and see why it works.
@@ -213,7 +214,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                 json!({
                     "root": stack.root, "project": stack.compose_name(), "data_dir": stack.dir,
                     "compose_files": compose::resolve(&stack.root, &stack.files), "status": status,
-                    "findings": findings(&s), "unverified": unverified,
+                    "findings": findings(&s), "unverified": unverified, "moved_ports": ports::lines(&stack.dir),
                     "generation": s.intents.generation.0, "graph": graph, "nodes": view::nodes(&s),
                     "drift": view::drift(&s), "failed": failed, "next": next,
                 })
@@ -273,6 +274,9 @@ fn print_status(stack: &docker::Stack, s: &State) {
             .map(|x| format!("  next: {x}"))
             .unwrap_or_default();
         println!("  {:<20} {:<16} {}{next}", n.node.name.0, n.state, n.signal);
+    }
+    for l in ports::lines(&stack.dir) {
+        println!("{l}");
     }
     let unverified: Vec<String> = view::unverified(s).into_iter().map(|n| n.0).collect();
     if !unverified.is_empty() {
