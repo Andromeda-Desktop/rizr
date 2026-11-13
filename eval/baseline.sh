@@ -77,7 +77,9 @@ prep() { # task: pull and build images, so the run measures the agent, not the n
   # bun.sh installs from GitHub releases (~30 KB/s here); the npm registry serves the same binary fast.
   if [[ $t == 2 ]]; then
     sed -i 's#^RUN curl -fsSL https://bun.sh/install | bash$#RUN npm install -g bun#' "$d/frontend/Dockerfile.playwright"
-    git -C "$d" commit -qam "bun from npm" --no-gpg-sign
+    # PyPI downloads stall here now and then; uv's default 30 s timeout then fails the whole image build.
+    sed -i '/^FROM /a ENV UV_HTTP_TIMEOUT=300' "$d/backend/Dockerfile"
+    git -C "$d" commit -qam "bun from npm, longer uv timeout" --no-gpg-sign
   fi
   local try
   for try in 1 2 3; do
