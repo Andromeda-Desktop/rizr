@@ -139,7 +139,7 @@ pub fn import(
         .flatten()
         .map(|(n, s)| {
             let side = Side {
-                restart: !s["restart"].is_null(),
+                restart: !s["restart"].is_null() || !s["deploy"]["restart_policy"].is_null(),
                 container_name: s["container_name"].as_str().map(str::to_owned),
                 ports: s["ports"].as_array().cloned().unwrap_or_default(),
                 pg: crate::postgres::shared(s, &config),
@@ -160,7 +160,7 @@ pub fn import(
 /// What the provider needs per service beside the model.
 #[derive(Clone, Debug, Default)]
 pub struct Side {
-    /// The compose file sets `restart:`; otherwise the override sets `on-failure:5`.
+    /// The compose file sets `restart:` or `deploy.restart_policy`; otherwise the override sets `on-failure:5`.
     pub restart: bool,
     /// The resolved `ports` list, for taken-port remaps.
     pub ports: Vec<Value>,

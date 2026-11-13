@@ -286,6 +286,13 @@ fn untrusted(i: &Inputs, chosen: &[PathBuf], known: bool) -> Error {
         .chain([if known { "trust --yes" } else { "trust" }.into()])
         .collect();
     let files: Vec<_> = i.files.iter().map(|f| f.display().to_string()).collect();
+    let again = format!(
+        "rizr {trust} && {}",
+        std::iter::once("rizr".to_owned())
+            .chain(std::env::args().skip(1))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     Error::new(
         ErrorCode::Untrusted,
         format!(
@@ -299,12 +306,16 @@ fn untrusted(i: &Inputs, chosen: &[PathBuf], known: bool) -> Error {
         ),
         if known {
             format!(
-                "the files changed since a person trusted this repo; whoever made the change (an agent too) re-trusts it and goes on in one call: `rizr {trust} && <your command>`; review a change you did not make first (`git diff`)"
+                "these files are new or changed since this repo was trusted. If you or your task chose or changed them, run this one command: `{again}`. Read `git diff` first only if you did not"
             )
         } else {
             format!("a human reviews the files, then runs `rizr {trust}` in a terminal")
         },
-        format!("rizr {trust}"),
+        if known {
+            again
+        } else {
+            format!("rizr {trust}")
+        },
     )
 }
 
