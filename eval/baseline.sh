@@ -54,7 +54,14 @@ clone() { # task -> $ROOT/<task>/repo at the pinned commit
 
 prep() { # task: pull and build images, so the run measures the agent, not the network
   local t=$1 d=$ROOT/$1/repo
-  (cd "$d" && docker compose ${COMPOSE[$t]:-} pull -q --ignore-buildable && docker compose ${COMPOSE[$t]:-} build --progress plain) >"$OUT/$t/prep.log" 2>&1 || return 1
+  : >"$OUT/$t/prep.log"
+  # Package downloads inside image builds time out now and then (task 2: PyPI); the cache keeps finished layers.
+  local try
+  for try in 1 2 3; do
+    (cd "$d" && docker compose ${COMPOSE[$t]:-} pull -q --ignore-buildable && docker compose ${COMPOSE[$t]:-} build --progress plain) >>"$OUT/$t/prep.log" 2>&1 && break
+    [ "$try" = 3 ] && return 1
+    log "task $t: prep try $try failed, retrying"
+  done
   case $t in
     3) # first copy runs before the agent starts; the agent must add a second one
       git -C "$d" worktree add -q --detach "$ROOT/3/wt2" HEAD
