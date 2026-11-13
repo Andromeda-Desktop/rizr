@@ -734,6 +734,8 @@ fn print_findings(s: &State) {
     }
 }
 
+const OUTDATED: &str = "its compose definition changed since it started; `rizr up` recreates it";
+
 /// `Up` from the containers alone, `Degraded` when a published URL answers 5xx.
 fn status_of(s: &State, url_failed: bool) -> InstanceStatus {
     match view::instance_status(s) {
@@ -791,6 +793,7 @@ fn print_status(stack: &docker::Stack, s: &State, status: InstanceStatus) {
             .iter()
             .find(|d| d.node == n.node)
             .and_then(|d| d.next.clone())
+            .or_else(|| (n.state == "outdated").then(|| OUTDATED.into()))
             .map(|x| format!("  next: {x}"))
             .unwrap_or_default();
         println!("  {:<20} {:<16} {}{next}", n.node.name.0, n.state, n.signal);
@@ -902,6 +905,7 @@ fn why(stack: &docker::Stack, s: &State, name: &str, json: bool) -> Result<(), E
     // An unexplained node: its recent log is the evidence, never "nothing".
     let next = next
         .or_else(|| url_error.as_ref().map(|e| e.example.clone()))
+        .or_else(|| (v.state == "outdated").then(|| OUTDATED.into()))
         .or_else(|| (!v.state.starts_with("ready")).then(|| format!("rizr logs {name}")));
     let recent = if (v.state.starts_with("ready") && url_error.is_none())
         || urls.iter().any(|u| u["log_tail"].is_string())
