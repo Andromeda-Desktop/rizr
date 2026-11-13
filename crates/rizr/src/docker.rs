@@ -31,6 +31,13 @@ enum Msg {
 /// belongs to a container that a later `Start` replaced (DECISIONS 2026-11-13, step 2 spike).
 type Current = Arc<Mutex<BTreeMap<String, String>>>;
 
+pub struct Attach {
+    pub instance: String,
+    pub compose_name: String,
+    /// Its data dir: its `postgres.json` names the databases its containers serve.
+    pub dir: PathBuf,
+}
+
 pub struct Stack {
     pub root: PathBuf,
     /// Compose files given with `-f`; empty means the default names.
@@ -40,6 +47,8 @@ pub struct Stack {
     /// rizr's data directory for this instance: generation and override files. Never inside the repo.
     pub dir: PathBuf,
     compose_name: String,
+    /// From `rizr.toml` `attach`: the instance whose containers this one uses; it then runs only host services.
+    pub attach: Option<Attach>,
     /// The compose project name of the main worktree, whose data a new instance starts from.
     main_compose_name: String,
 }
@@ -72,6 +81,17 @@ impl Stack {
         let instance = InstanceId(main.as_ref().map_or("main".into(), |_| slug(&root)));
         let dir = data.join(format!("{}-{}", project.0, instance.0));
         let main_compose_name = compose::default_name(main_root, &files);
+        let attach = crate::manifest::attach(&root)
+            .filter(|a| *a != instance.0)
+            .map(|a| Attach {
+                compose_name: if a == "main" {
+                    main_compose_name.clone()
+                } else {
+                    format!("{main_compose_name}-{a}")
+                },
+                dir: data.join(format!("{}-{a}", project.0)),
+                instance: a,
+            });
         let compose_name = match &main {
             None => compose::default_name(&root, &files),
             Some(m) => format!("{}-{}", compose::default_name(m, &files), instance.0),
@@ -84,6 +104,7 @@ impl Stack {
             dir,
             compose_name,
             main_compose_name,
+            attach,
         }
     }
 
@@ -360,6 +381,10 @@ impl Provider<'_> {
                 });
             }
             Op::Import => {
+                let attach = st
+                    .attach
+                    .as_ref()
+                    .map(|a| (a.instance.clone(), running_services(&st.project.0, a)));
                 let (root, files, name, dir, instance, side) = (
                     st.root.clone(),
                     st.files.clone(),
@@ -380,7 +405,15 @@ impl Provider<'_> {
                 };
                 std::thread::spawn(move || {
                     done(
-                        match import(&root, &files, &name, &dir, &instance, inputs) {
+                        match import(
+                            &root,
+                            &files,
+                            &name,
+                            &dir,
+                            &instance,
+                            attach.as_ref(),
+                            inputs,
+                        ) {
                             Ok((m, imported, services, res)) => {
                                 if let Ok(mut r) = pg.lock() {
                                     *r = res.servers;
@@ -493,11 +526,15 @@ impl Provider<'_> {
                     .lock()
                     .ok()
                     .and_then(|h| h.get(&node.name.0).cloned());
-                let dbs: BTreeMap<String, crate::postgres::DbInfo> = self
-                    .dbs
-                    .lock()
-                    .map(|d| d.iter().map(|(n, d)| (n.clone(), d.info())).collect())
-                    .unwrap_or_default();
+                // An attached instance uses the databases of the instance it attaches to.
+                let dbs: BTreeMap<String, crate::postgres::DbInfo> = match &self.stack.attach {
+                    Some(a) => crate::postgres::Info::load(&a.dir).databases,
+                    None => self
+                        .dbs
+                        .lock()
+                        .map(|d| d.iter().map(|(n, d)| (n.clone(), d.info())).collect())
+                        .unwrap_or_default(),
+                };
                 let project = self.stack.project.0.clone();
                 let units = self.units.clone();
                 std::thread::spawn(move || {
@@ -1155,7 +1192,39 @@ pub fn render(stack: &Stack, s: &State, op: &Op) -> Option<String> {
     })
 }
 
-/// The compose import (or an empty model for a repo with only `rizr.toml`), with the host services merged in.
+/// The services that instance `a` runs now: its compose containers, and its databases on a running shared server.
+fn running_services(project: &str, a: &Attach) -> std::collections::BTreeSet<String> {
+    let ps = |filter: String, format: &str| -> Vec<String> {
+        Command::new("docker")
+            .args(["ps", "--format", format, "--filter", &filter])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let servers = ps(format!("name=^rizr-{project}-"), "{{.Names}}");
+    let mut v: std::collections::BTreeSet<String> = ps(
+        format!("label=com.docker.compose.project={}", a.compose_name),
+        "{{.Label \"com.docker.compose.service\"}}",
+    )
+    .into_iter()
+    .collect();
+    v.extend(
+        crate::postgres::Info::load(&a.dir)
+            .databases
+            .into_iter()
+            .filter(|(_, d)| servers.contains(&format!("rizr-{project}-{}", d.server)))
+            .map(|(n, _)| n),
+    );
+    v
+}
+
+/// The compose import (or an empty model for a repo with only `rizr.toml` or an attached instance), with the
+/// host services merged in.
 #[allow(clippy::type_complexity, reason = "one call site")]
 fn import(
     root: &Path,
@@ -1163,6 +1232,7 @@ fn import(
     name: &str,
     dir: &Path,
     instance: &InstanceId,
+    attach: Option<&(String, std::collections::BTreeSet<String>)>,
     inputs: Digest,
 ) -> Result<
     (
@@ -1173,20 +1243,22 @@ fn import(
     ),
     String,
 > {
-    let (mut m, side) =
-        if compose::resolve(root, files).is_empty() && root.join("rizr.toml").is_file() {
-            (
-                rizr_core::model::Model {
-                    inputs,
-                    nodes: BTreeMap::new(),
-                    findings: Vec::new(),
-                },
-                BTreeMap::new(),
-            )
-        } else {
-            compose::import(root, files, name, dir, instance, inputs)?
-        };
-    let host = crate::manifest::merge(root, instance, &mut m)?;
+    let (mut m, side) = if attach.is_some()
+        || (compose::resolve(root, files).is_empty() && root.join("rizr.toml").is_file())
+    {
+        (
+            rizr_core::model::Model {
+                inputs,
+                nodes: BTreeMap::new(),
+                findings: Vec::new(),
+            },
+            BTreeMap::new(),
+        )
+    } else {
+        compose::import(root, files, name, dir, instance, inputs)?
+    };
+    let external = attach.map(|(target, r)| (target.as_str(), r));
+    let host = crate::manifest::merge(root, instance, external, &mut m)?;
     let pg = crate::postgres::add(&mut m, &side, &crate::manifest::unshared(root), instance)?;
     pg.info.save(dir)?;
     if let Some(n) = compose::cycle(&m) {

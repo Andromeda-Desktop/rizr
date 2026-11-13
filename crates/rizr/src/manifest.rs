@@ -25,6 +25,23 @@ struct Manifest {
     /// Shared resources: `[resource.db] shared = false` keeps a compose postgres service its own container.
     #[serde(default)]
     resource: BTreeMap<String, Resource>,
+    /// `attach = "main"`: this worktree runs only its host services, against that instance's containers.
+    attach: Option<String>,
+}
+
+/// The instance this worktree attaches to, if `rizr.toml` names a valid one.
+pub fn attach(root: &Path) -> Option<String> {
+    std::fs::read_to_string(root.join("rizr.toml"))
+        .ok()
+        .and_then(|t| toml::from_str::<Manifest>(&t).ok())?
+        .attach
+        .filter(|a| valid_instance(a))
+}
+
+fn valid_instance(a: &str) -> bool {
+    !a.is_empty()
+        && a.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
 #[derive(Deserialize)]
@@ -72,10 +89,12 @@ pub struct Ready {
     pub log: Option<String>,
 }
 
-/// Adds the host services of `<root>/rizr.toml` to `m`. Returns them by name for the supervisor.
+/// Adds the host services of `<root>/rizr.toml` to `m`. Returns them by name for the supervisor. `external`: compose
+/// services that an attached-to instance runs; a dependency on one is met outside this model.
 pub fn merge(
     root: &Path,
     instance: &InstanceId,
+    external: Option<(&str, &std::collections::BTreeSet<String>)>,
     m: &mut Model,
 ) -> Result<BTreeMap<String, HostService>, String> {
     let path = root.join("rizr.toml");
@@ -89,6 +108,11 @@ pub fn merge(
             man.version
         ));
     }
+    if let Some(a) = man.attach.as_deref().filter(|a| !valid_instance(a)) {
+        return Err(format!(
+            "rizr.toml: attach = \"{a}\" is not an instance name (main, or a worktree name in lowercase)"
+        ));
+    }
     let id = |n: &str| NodeId {
         scope: Scope::Instance(instance.clone()),
         name: NodeName(n.into()),
@@ -100,7 +124,13 @@ pub fn merge(
             ));
         }
         for d in &svc.depends_on {
-            if !m.nodes.contains_key(&id(d)) && !man.service.contains_key(d) {
+            if let Some((target, running)) = external.filter(|_| !man.service.contains_key(d)) {
+                if !running.contains(d) {
+                    return Err(format!(
+                        "rizr.toml: `{name}` depends on `{d}`, which instance {target} does not run; run `rizr up` in that worktree"
+                    ));
+                }
+            } else if !m.nodes.contains_key(&id(d)) && !man.service.contains_key(d) {
                 return Err(format!(
                     "rizr.toml: `{name}` depends on `{d}`, which is neither a compose nor a host service"
                 ));
@@ -161,6 +191,7 @@ pub fn merge(
                 deps: svc
                     .depends_on
                     .iter()
+                    .filter(|d| external.is_none() || man.service.contains_key(*d))
                     .map(|d| Dep {
                         node: id(d),
                         gate: Gate::Ready,

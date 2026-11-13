@@ -101,6 +101,16 @@ pub fn outcome(s: &State) -> Option<Result<(), Error>> {
             "systemctl start docker",
         )));
     }
+    if let ModelState::Failed(tail) = &s.model
+        && tail.starts_with("rizr.toml")
+    {
+        return Some(Err(Error::new(
+            ErrorCode::ImportFailed,
+            tail.clone(),
+            "change rizr.toml or the stack as the message says, then run up again",
+            "rizr up",
+        )));
+    }
     if let ModelState::Failed(tail) = &s.model {
         return Some(Err(Error::new(
             ErrorCode::ImportFailed,
