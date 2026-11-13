@@ -462,6 +462,12 @@ fn eject(stack: &docker::Stack, s: &State, out: &Path) -> Result<(), Error> {
             args.push(format!("{} '{}'", flag.to_string_lossy(), src.display()));
         }
     }
+    // Moved host ports (ports.rs) stay moved without rizr.
+    for svc in ports::load(&stack.dir).keys() {
+        let name = format!("ports-{svc}.yml");
+        std::fs::copy(stack.dir.join(&name), out.join(&name)).map_err(io)?;
+        args.push(format!("-f \"$here/{name}\""));
+    }
     let mut sh = format!(
         "#!/bin/sh\n# Written by `rizr eject`: starts the stack in dependency order without rizr.\nset -eu\nhere=$(cd \"$(dirname \"$0\")\" && pwd)\nc() {{ docker compose -p {} --project-directory '{}' {} \"$@\"; }}\n",
         stack.compose_name(),
