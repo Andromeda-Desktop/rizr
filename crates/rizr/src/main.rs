@@ -177,6 +177,9 @@ fn run(cli: Cli) -> Result<(), Error> {
                     format!("ls -l {}", stack.dir.display()),
                 )
             })?;
+            if up {
+                gc::make_room(&stack);
+            }
             let others = compose::others(&stack.root, &stack.files);
             if up && !others.is_empty() {
                 eprintln!(

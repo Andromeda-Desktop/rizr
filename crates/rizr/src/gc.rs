@@ -301,3 +301,58 @@ fn release_ports(stack: &Stack, instance: &str) {
         let _ = serde_json::to_vec(&held).map(|b| std::fs::write(&claims, b));
     }
 }
+
+/// Before `up`: with `max_instances` set and reached, stop the other instance that rizr used least recently.
+/// Its containers and units stop; its data stays, and `rizr up` there starts it again.
+pub fn make_room(stack: &Stack) {
+    let Some(max) = crate::manifest::max_instances(&stack.main_root) else {
+        return;
+    };
+    let p = &stack.project.0;
+    let project = label("rizr.project", p);
+    let running: BTreeSet<String> = docker(&[
+        "ps",
+        "--filter",
+        &project,
+        "--format",
+        "{{.Label \"rizr.instance\"}}",
+    ])
+    .into_iter()
+    .filter(|i| !i.is_empty() && *i != stack.instance.0)
+    .collect();
+    if running.len() < max {
+        return;
+    }
+    // Every rizr call rewrites the instance's generation file: its age is the time since last use.
+    let used = |dir: &Path| {
+        std::fs::metadata(dir.join("generation"))
+            .and_then(|m| m.modified())
+            .ok()
+    };
+    let mut by_age: Vec<_> = instances(stack)
+        .into_iter()
+        .filter(|(i, _)| running.contains(i))
+        .map(|(i, d)| (used(&d), i))
+        .collect();
+    by_age.sort();
+    for (_, inst) in by_age.iter().take(running.len() + 1 - max) {
+        let ids = docker(&[
+            "ps",
+            "-q",
+            "--filter",
+            &project,
+            "--filter",
+            &label("rizr.instance", inst),
+        ]);
+        if !ids.is_empty() {
+            let _ = Command::new("docker").arg("stop").args(&ids).output();
+        }
+        let _ = Command::new("systemctl")
+            .args(["--user", "stop", &format!("rizr-{p}-{inst}-*")])
+            .output();
+        eprintln!(
+            "stopped instance {inst} (least recently used) to stay within max_instances = {max}; its data stays, \
+             `rizr up` there starts it again"
+        );
+    }
+}

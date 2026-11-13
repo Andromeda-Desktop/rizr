@@ -27,6 +27,16 @@ struct Manifest {
     resource: BTreeMap<String, Resource>,
     /// `attach = "main"`: this worktree runs only its host services, against that instance's containers.
     attach: Option<String>,
+    /// Instances of this project that may run at once; `up` of one more stops the least recently used.
+    max_instances: Option<usize>,
+}
+
+pub fn max_instances(root: &Path) -> Option<usize> {
+    std::fs::read_to_string(root.join("rizr.toml"))
+        .ok()
+        .and_then(|t| toml::from_str::<Manifest>(&t).ok())?
+        .max_instances
+        .filter(|n| *n > 0)
 }
 
 /// The instance this worktree attaches to, if `rizr.toml` names a valid one.
