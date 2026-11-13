@@ -15,7 +15,12 @@ declare -A REPO=(
   [3]="knadh/listmonk 32078ede6d87c83f4948cc592c76bee91d629f0b"
   [4]="saleor/saleor-platform ab6315bd59c58b4815175df4c679107ff9695be4"
   [5]="frappe/frappe_docker 85ad653360e4670c2e885c4283d293e7b9efeda9"
+  [6]="dockersamples/example-voting-app 63e9150ca17af4ed05880d4245e486481f73fcb4"
+  [7]="knadh/listmonk 32078ede6d87c83f4948cc592c76bee91d629f0b"
+  [8]="dockersamples/example-voting-app 63e9150ca17af4ed05880d4245e486481f73fcb4"
+  [9]="saleor/saleor-platform ab6315bd59c58b4815175df4c679107ff9695be4"
 )
+OTHER=rizr-eval-other # task 7: a server outside the stack that holds the stack's port
 declare -A COMPOSE=([5]="-f pwd.yml")
 
 log() { printf '%s %s\n' "$(date +%T)" "$*"; }
@@ -40,6 +45,15 @@ cleanup() { # remove every compose project started from $ROOT
   docker compose ls -a --format json 2>/dev/null |
     jq -r --arg r "$ROOT" '.[] | select(.ConfigFiles | contains($r)) | .Name' |
     while read -r p; do docker compose -p "$p" down -v --remove-orphans >/dev/null 2>&1; done
+  docker rm -f "$OTHER" >/dev/null 2>&1
+}
+
+seal() { # fold a prepared change into the only commit, so `git log` does not show it
+  git -C "$1" commit -qa --amend --no-edit --no-gpg-sign
+}
+
+final() { # the agent's last message
+  jq -rs 'map(select(.type=="result")) | last | .result // ""' "$OUT/$1/transcript.jsonl"
 }
 
 clone() { # task -> $ROOT/<task>/repo at the pinned commit
@@ -73,6 +87,17 @@ prep() { # task: pull and build images, so the run measures the agent, not the n
       (cd "$d" && docker compose run --rm api python3 manage.py migrate && docker compose down) >>"$OUT/$t/prep.log" 2>&1
       sed -i 's|^DATABASE_URL=postgres://saleor:saleor@db/saleor$|DATABASE_URL=postgres://saleor:saleor@database/saleor|' "$d/backend.env"
       git -C "$d" commit -qam "env" --no-gpg-sign ;;
+    6) # a stack left behind by older work: an old result port, a removed service still running, a stopped worker
+      printf 'services:\n  adminer:\n    image: adminer:latest\n    networks: [back-tier]\n' >"$ROOT/6/old.yml"
+      (cd "$d" && docker compose -f docker-compose.yml -f "$ROOT/6/old.yml" up -d --wait && docker compose stop worker) >>"$OUT/$t/prep.log" 2>&1
+      sed -i 's|"8081:80"|"8091:80"|' "$d/docker-compose.yml"
+      seal "$d" ;;
+    7) # another server on the host already listens on the stack's port 9000
+      docker run -d --name "$OTHER" -p 9000:80 nginx:1.30-alpine >>"$OUT/$t/prep.log" 2>&1
+      docker inspect -f '{{.State.StartedAt}}' "$OTHER" >"$OUT/7/other-start" ;;
+    8) # the worker joins the wrong network: it waits for redis and db forever, and every container looks fine
+      sed -i '/^  worker:/,/^  redis:/s/- back-tier/- front-tier/' "$d/docker-compose.yml"
+      seal "$d" ;;
   esac
 }
 
@@ -84,6 +109,9 @@ prompt() {
     3) echo "A copy of this docker compose stack already runs from $d. Run a second copy of the stack from the git worktree at $ROOT/3/wt2, while the first copy keeps running unchanged. Tell me the URL of the second copy." ;;
     4) echo "You are in a repository with a docker compose stack ($d). The API returns errors. Find the cause and fix it, so that the GraphQL API at http://localhost:8000/graphql/ answers." ;;
     5) echo "You are in a repository with a docker compose stack ($d; use pwd.yml). Start the stack. Tell me when the login page answers in the browser." ;;
+    6) echo "You are in a repository with a docker compose stack ($d). Someone worked on it before you. Make the running stack match the current compose file. Tell me the URLs of the vote page and the result page." ;;
+    7|9) echo "You are in a repository with a docker compose stack ($d). Start the stack. Tell me the URL where $([[ $1 == 7 ]] && echo 'the listmonk admin page answers' || echo 'the GraphQL API answers a shop query') when it is ready." ;;
+    8) echo "You are in a repository with a docker compose stack ($d). Start the stack. Votes cast on the vote page never show up on the result page. Find the cause and fix it." ;;
   esac
 }
 
@@ -105,6 +133,30 @@ check() { # task -> exit 0 on pass; prints the reason
        [[ $(git -C "$d" diff --name-only HEAD | tr '\n' ' ') == "backend.env " ]] || { echo "diff touches: $(git -C "$d" diff --name-only HEAD | tr '\n' ' ')"; return 1; }
        echo "graphql ok, fix in backend.env only" ;;
     5) http_ok http://localhost:8080/login && echo "login page 200" ;;
+    6) http_ok http://localhost:8080/ || { echo "vote page fails"; return 1; }
+       http_ok http://localhost:8091/ || { echo "result page not on 8091"; return 1; }
+       local want got
+       want=$(cd "$d" && docker compose config --hash '*' | sort)
+       got=$(docker ps --filter label=com.docker.compose.project=repo --format '{{.Label "com.docker.compose.service"}} {{.Label "com.docker.compose.config-hash"}}' | sort)
+       [[ $want == "$got" ]] || { echo "running containers differ from the compose file: $(diff <(echo "$want") <(echo "$got") | grep '^[<>]' | cut -c1-40 | tr '\n' ';')"; return 1; }
+       echo "stack matches the compose file" ;;
+    7) [[ $(docker inspect -f '{{.State.StartedAt}}' "$OTHER" 2>/dev/null) == "$(cat "$OUT/7/other-start")" ]] && http_ok http://localhost:9000/ && grep -qi nginx /tmp/rizr-eval-body || { echo "the other server on 9000 was touched"; return 1; }
+       local p
+       for p in $(docker ps --filter ancestor=listmonk/listmonk:latest --format '{{.Ports}}' | grep -oE '0\.0\.0\.0:[0-9]+' | cut -d: -f2 | sort -u); do
+         http_ok "http://localhost:$p/admin/login" && final 7 | grep -q ":$p" && { echo "listmonk on $p, named in the reply"; return 0; }
+       done
+       echo "no listmonk answers on the port the reply names"; return 1 ;;
+    8) local i n=0
+       for i in 1 2 3; do curl -s -m 10 -o /dev/null -b "voter_id=eval$i" -d "vote=a" http://localhost:8080/; done
+       for i in $(seq 10); do
+         n=$(cd "$d" && docker compose exec -T db psql -U postgres -tAc 'select count(*) from votes' 2>/dev/null | tr -dc 0-9)
+         ((${n:-0} > 0)) && break; sleep 3
+       done
+       ((${n:-0} > 0)) || { echo "votes do not reach the database"; return 1; }
+       [[ $(git -C "$d" diff --name-only HEAD | tr '\n' ' ') == "docker-compose.yml " ]] || { echo "diff touches: $(git -C "$d" diff --name-only HEAD | tr '\n' ' ')"; return 1; }
+       echo "votes counted, fix in docker-compose.yml only" ;;
+    9) http_ok http://localhost:8000/graphql/ '{"query":"{ shop { name } }"}' && ! grep -q '"errors"' /tmp/rizr-eval-body || { echo "graphql fails"; return 1; }
+       echo "graphql shop query ok" ;;
   esac
 }
 
@@ -115,6 +167,8 @@ run() {
   cleanup; clone "$t" && prep "$t" || { log "task $t: prep failed"; return; }
   log "task $t: agent ($MODEL, limit ${LIMIT}s)"
   start=$SECONDS
+  # NOAGENT=1 runs prep and check only: each check must fail on the prepared state.
+  [[ -n ${NOAGENT:-} ]] && : >"$OUT/$t/transcript.jsonl" ||
   (cd "$ROOT/$t/repo" && timeout "$LIMIT" claude -p "$(prompt "$t")" --model "$MODEL" \
     --setting-sources project --no-session-persistence --strict-mcp-config \
     --allowedTools "Bash Read Edit Write Glob Grep" \
