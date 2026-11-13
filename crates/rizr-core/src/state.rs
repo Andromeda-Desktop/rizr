@@ -405,7 +405,19 @@ fn done(s: &mut State, id: EffectId, answer: Answer) {
             s.step(&node, Input::Started);
         }
         (Op::Start { node, .. }, Answer::Err { tail }) => s.step(&node, Input::StartFailed(tail)),
-        (Op::Stop(node), Answer::Ok) => s.step(&node, Input::Destroyed),
+        (Op::Stop(node), Answer::Ok) => {
+            s.step(&node, Input::Destroyed);
+            // Only an accepted stop clears `live`: a resync may have moved the node on meanwhile.
+            if let Some(n) = s.nodes.get_mut(&node)
+                && matches!(
+                    n.machine,
+                    Machine::Service(Service::Absent) | Machine::Job(Job::Pending)
+                )
+            {
+                n.live = None;
+                n.running = false;
+            }
+        }
         (Op::Probe(node), Answer::Probe { ok }) => s.step(&node, Input::ProbeResult(ok)),
         (Op::AcquireProjectLock, Answer::Err { tail }) => {
             s.lock = Lock::Free;

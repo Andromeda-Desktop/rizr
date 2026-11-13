@@ -17,7 +17,10 @@ pub fn plan(s: &State) -> Vec<Effect> {
             Op::Subscribe,
             "watch runtime events before reading state".into(),
         )),
-        Sync::Subscribed => ops.push((Op::Observe, "read what the runtime holds now".into())),
+        // A snapshot taken while a start or stop runs can miss its container; wait for it to answer.
+        Sync::Subscribed if !pending(&|op| matches!(op, Op::Start { .. } | Op::Stop(_))) => {
+            ops.push((Op::Observe, "read what the runtime holds now".into()))
+        }
         _ => {}
     }
     if let Trust::Untrusted(inputs) = &s.trust
@@ -145,9 +148,10 @@ pub fn plan(s: &State) -> Vec<Effect> {
                     | Service::Unhealthy
                     | Service::Restarting
                     | Service::Outdated
-                    | Service::Exited { .. },
+                    | Service::Exited { .. }
+                    | Service::Failed(_),
                 )
-                | Machine::Job(Job::Running),
+                | Machine::Job(Job::Running | Job::Done(_) | Job::Failed(_)),
                 false,
             ) if s.intents.target == Target::Down || n.spec.is_none() => {
                 let why = if n.spec.is_none() {
@@ -156,6 +160,16 @@ pub fn plan(s: &State) -> Vec<Effect> {
                     "desired down"
                 };
                 start_stop(Op::Stop(id.clone()), why.into(), &mut node_ops);
+            }
+            // `live` holds the spec of a container that may remain: an exited job of an older generation.
+            (Machine::Service(Service::Absent) | Machine::Job(Job::Pending), false)
+                if n.live.is_some() && (s.intents.target == Target::Down || n.spec.is_none()) =>
+            {
+                start_stop(
+                    Op::Stop(id.clone()),
+                    "a container may remain".into(),
+                    &mut node_ops,
+                );
             }
             _ => {}
         }

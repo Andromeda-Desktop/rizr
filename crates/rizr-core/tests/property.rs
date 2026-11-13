@@ -236,13 +236,13 @@ impl Fake {
                 }
                 Answer::Ok
             }
+            // `rm --stop --force`: the container dies if it runs, then goes away.
             Op::Stop(node) => {
-                if let Some(c) = self.containers.get_mut(node)
-                    && matches!(c.status, Status::Running { .. } | Status::Restarting)
-                {
-                    c.status = Status::Exited { code: 137 };
-                    let spec = c.spec.clone();
-                    self.event(node, &spec, RuntimeKind::Die { code: 137 });
+                if let Some(c) = self.containers.remove(node) {
+                    if matches!(c.status, Status::Running { .. } | Status::Restarting) {
+                        self.event(node, &c.spec, RuntimeKind::Die { code: 137 });
+                    }
+                    self.event(node, &c.spec, RuntimeKind::Destroy);
                 }
                 Answer::Ok
             }
@@ -439,6 +439,12 @@ fn converge(mut s: State, fake: &mut Fake) -> Result<usize, String> {
         {
             if result.is_ok() && s.intents.target == Target::Up {
                 consistent(&s, fake)?;
+            }
+            if result.is_ok() && s.intents.target == Target::Down && !fake.containers.is_empty() {
+                return Err(format!(
+                    "down left containers: {:?}",
+                    fake.containers.keys()
+                ));
             }
             return Ok(step);
         }

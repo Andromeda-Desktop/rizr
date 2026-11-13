@@ -174,7 +174,9 @@ fn service(s: &Service, input: &Input, ctx: Ctx) -> Result<Service, Rejected> {
             | S::Unhealthy
             | S::Restarting
             | S::Outdated
-            | S::Exited { .. },
+            | S::Exited { .. }
+            | S::Failed(_)
+            | S::Absent,
             I::StopSent,
         ) => S::Stopping,
         (S::Stopping, I::Died { .. } | I::Destroyed) => S::Absent,
@@ -196,7 +198,7 @@ fn job(j: &Job, input: &Input, ctx: Ctx) -> Result<Job, Rejected> {
         (J::Running, I::Started | I::Health(_)) => J::Running,
         (J::Running, I::Died { code: 0 }) => J::Done(ctx.generation),
         (J::Running, I::Died { code }) => J::Failed(Failure::Exit { code: *code }),
-        (J::Running, I::StopSent) => J::Stopping,
+        (J::Pending | J::Running | J::Done(_) | J::Failed(_), I::StopSent) => J::Stopping,
         (J::Stopping, I::Died { .. } | I::Destroyed) => J::Pending,
         (J::Failed(_) | J::Done(_), I::Reset | I::SpecChanged) => J::Pending,
         _ => return Err(Rejected),
