@@ -13,6 +13,7 @@ mod devenv;
 mod docker;
 mod doctor;
 mod exec;
+mod gc;
 mod manifest;
 mod ports;
 mod postgres;
@@ -85,6 +86,12 @@ enum Command {
     /// Check the host for problems that break a stack: docker, network pools, disk, stale installs, database
     /// access. Each problem names its fix. Runs no repo tool, so it works before trust.
     Doctor,
+    /// List everything rizr made for this project: instances, containers, networks, volumes, units, databases,
+    /// files. Runs no repo tool.
+    Footprint,
+    /// Release the instances of removed worktrees: their containers, networks, volumes, units, databases, port
+    /// claims and data.
+    Gc,
     /// Print the JSON Schema of the API: actions, errors, receipt and drift.
     Schema,
 }
@@ -142,14 +149,23 @@ fn run(cli: Cli) -> Result<(), Error> {
                 "HOME=/home/me rizr up",
             )
         })?;
-    if let Command::Doctor = cli.command {
+    if let Command::Doctor | Command::Footprint | Command::Gc = cli.command {
         let i = trust::inputs(Path::new("."), &cli.file)?;
-        return doctor::run(&docker::Stack::new(i.root, cli.file.clone(), &data), json);
+        let stack = docker::Stack::new(i.root, cli.file.clone(), &data);
+        return match cli.command {
+            Command::Footprint => gc::footprint(&stack),
+            Command::Gc => gc::gc(&stack),
+            _ => doctor::run(&stack, json),
+        };
     }
     let i = trust::gate(Path::new("."), &cli.file, !json)?;
     let stack = docker::Stack::new(i.root, cli.file.clone(), &data);
     match cli.command {
-        Command::Schema | Command::Doctor | Command::Action(Action::Trust { .. }) => Ok(()),
+        Command::Schema
+        | Command::Doctor
+        | Command::Footprint
+        | Command::Gc
+        | Command::Action(Action::Trust { .. }) => Ok(()),
         Command::Action(action) => {
             let up = matches!(action, Action::Up { .. });
             let down = matches!(action, Action::Down);
@@ -185,6 +201,23 @@ fn run(cli: Cli) -> Result<(), Error> {
             let s = s.map_err(|e| with_output(&stack, e, since))?;
             if down {
                 exec::remove(&stack, true);
+                // compose rm keeps networks; each holds an address pool until removed.
+                let filter = format!("label=com.docker.compose.project={}", stack.compose_name());
+                if let Ok(o) = std::process::Command::new("docker")
+                    .args(["network", "ls", "-q", "--filter", &filter])
+                    .output()
+                {
+                    let ids: Vec<String> = String::from_utf8_lossy(&o.stdout)
+                        .split_whitespace()
+                        .map(str::to_owned)
+                        .collect();
+                    if !ids.is_empty() {
+                        let _ = std::process::Command::new("docker")
+                            .args(["network", "rm"])
+                            .args(&ids)
+                            .output();
+                    }
+                }
             }
             let mut urls = if up {
                 ports::checks(&stack.compose_name())

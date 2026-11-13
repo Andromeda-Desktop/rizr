@@ -50,29 +50,15 @@ pub struct Stack {
     /// From `rizr.toml` `attach`: the instance whose containers this one uses; it then runs only host services.
     pub attach: Option<Attach>,
     /// The compose project name of the main worktree, whose data a new instance starts from.
-    main_compose_name: String,
+    pub main_compose_name: String,
+    /// The main worktree's root.
+    pub main_root: PathBuf,
 }
 
 impl Stack {
     /// The project is the repo, shared by all its git worktrees; the instance is `main` for the main worktree,
     /// else the worktree's directory name.
     pub fn new(root: PathBuf, files: Vec<PathBuf>, data: &Path) -> Self {
-        let slug = |p: &Path| -> String {
-            let s: String = p
-                .file_name()
-                .map(|n| n.to_string_lossy().to_lowercase())
-                .unwrap_or_default()
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '_' {
-                        c
-                    } else {
-                        '-'
-                    }
-                })
-                .collect();
-            if s.is_empty() { "root".into() } else { s }
-        };
         let main = main_worktree(&root);
         let main_root = main.as_deref().unwrap_or(&root);
         // The path hash keeps two repos with one directory name apart: their servers and data never mix.
@@ -81,6 +67,7 @@ impl Stack {
         let instance = InstanceId(main.as_ref().map_or("main".into(), |_| slug(&root)));
         let dir = data.join(format!("{}-{}", project.0, instance.0));
         let main_compose_name = compose::default_name(main_root, &files);
+        let main_root = main_root.to_path_buf();
         let attach = crate::manifest::attach(&root)
             .filter(|a| *a != instance.0)
             .map(|a| Attach {
@@ -104,6 +91,7 @@ impl Stack {
             dir,
             compose_name,
             main_compose_name,
+            main_root,
             attach,
         }
     }
@@ -132,6 +120,24 @@ impl Stack {
     pub fn compose(&self) -> Command {
         compose::command(&self.root, &self.files, &self.compose_name(), &self.dir)
     }
+}
+
+/// An instance name from a directory name: lowercase, other characters as `-`.
+pub fn slug(p: &Path) -> String {
+    let s: String = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if s.is_empty() { "root".into() } else { s }
 }
 
 /// For a linked git worktree, the main worktree's root. Reads only the `.git` file and `commondir`: no git call,
