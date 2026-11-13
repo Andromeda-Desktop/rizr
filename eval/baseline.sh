@@ -4,7 +4,9 @@
 set -uo pipefail
 
 ROOT=${ROOT:-/tmp/rizr-eval}
-OUT=${OUT:-$(cd "$(dirname "$0")/.." && pwd)/.agent/scratch/eval-runs}
+ARM=${ARM:-bare} # bare: compose + shell; rizr: the same, plus rizr on PATH and one line in CLAUDE.md
+RIZR=${RIZR:-$(cd "$(dirname "$0")/.." && pwd)/target/debug/rizr}
+OUT=${OUT:-$(cd "$(dirname "$0")/.." && pwd)/.agent/scratch/eval-runs$([[ $ARM == rizr ]] && echo -rizr)}
 LIMIT=${LIMIT:-1200}
 MODEL=${MODEL:-haiku}
 mkdir -p "$ROOT" "$OUT"
@@ -19,7 +21,9 @@ declare -A REPO=(
   [7]="knadh/listmonk 32078ede6d87c83f4948cc592c76bee91d629f0b"
   [8]="dockersamples/example-voting-app 63e9150ca17af4ed05880d4245e486481f73fcb4"
   [9]="saleor/saleor-platform ab6315bd59c58b4815175df4c679107ff9695be4"
+  [10]="knadh/listmonk 32078ede6d87c83f4948cc592c76bee91d629f0b"
 )
+MARK=eval-marker@example.com # task 10: a row in the first copy's data that the second copy must have
 OTHER=rizr-eval-other # task 7: a server outside the stack that holds the stack's port
 declare -A COMPOSE=([5]="-f pwd.yml")
 
@@ -77,12 +81,13 @@ prep() { # task: pull and build images, so the run measures the agent, not the n
     log "task $t: prep try $try failed, retrying"
   done
   case $t in
-    3) # first copy runs before the agent starts; the agent must add a second one
-      git -C "$d" worktree add -q --detach "$ROOT/3/wt2" HEAD
+    3|10) # first copy runs before the agent starts; the agent must add a second one
+      git -C "$d" worktree add -q --detach "$ROOT/$t/wt2" HEAD
       (cd "$d" && docker compose up -d) >>"$OUT/$t/prep.log" 2>&1
-      wait_http http://localhost:9000/ 180 || log "task 3: first copy not ready"
-      docker ps -q --filter label=com.docker.compose.project=repo | sort >"$OUT/3/first-ids"
-      docker inspect -f '{{.State.StartedAt}}' $(cat "$OUT/3/first-ids") | sort >"$OUT/3/first-start" ;;
+      wait_http http://localhost:9000/ 180 || log "task $t: first copy not ready"
+      [[ $t == 10 ]] && docker exec listmonk_db psql -U listmonk -qc "insert into subscribers (uuid, email, name, status) values (gen_random_uuid(), '$MARK', 'Eval Marker', 'enabled')" >>"$OUT/$t/prep.log" 2>&1
+      docker ps -q --filter label=com.docker.compose.project=repo | sort >"$OUT/$t/first-ids"
+      docker inspect -f '{{.State.StartedAt}}' $(cat "$OUT/$t/first-ids") | sort >"$OUT/$t/first-start" ;;
     4) # migrate with the correct env, stop, then inject the fault the agent must find
       (cd "$d" && docker compose run --rm api python3 manage.py migrate && docker compose down) >>"$OUT/$t/prep.log" 2>&1
       sed -i 's|^DATABASE_URL=postgres://saleor:saleor@db/saleor$|DATABASE_URL=postgres://saleor:saleor@database/saleor|' "$d/backend.env"
@@ -101,6 +106,20 @@ prep() { # task: pull and build images, so the run measures the agent, not the n
   esac
 }
 
+arm() { # task: give the agent rizr the way a user would: on PATH, trusted once, named in CLAUDE.md
+  [[ $ARM == rizr ]] || { rm -rf "$ROOT/bin"; return 0; }
+  local dir
+  mkdir -p "$ROOT/bin" && rm -rf "$ROOT/rizr-data"
+  cp "$RIZR" "$ROOT/bin/rizr.real"
+  printf '#!/bin/sh\nXDG_DATA_HOME=%s exec %s "$@"\n' "$ROOT/rizr-data" "$ROOT/bin/rizr.real" >"$ROOT/bin/rizr"
+  chmod +x "$ROOT/bin/rizr"
+  for dir in "$ROOT/$1/repo" "$ROOT/$1/wt2"; do
+    [[ -d $dir ]] || continue
+    echo 'This stack runs with rizr (on PATH). Run `rizr context --json` first; `rizr --help` lists the verbs.' >"$dir/CLAUDE.md"
+    (cd "$dir" && script -qec "$ROOT/bin/rizr trust" /dev/null <<<y) >>"$OUT/$1/prep.log" 2>&1 || log "task $1: rizr trust failed in $dir"
+  done
+}
+
 prompt() {
   local d=$ROOT/$1/repo
   case $1 in
@@ -111,6 +130,7 @@ prompt() {
     5) echo "You are in a repository with a docker compose stack ($d; use pwd.yml). Start the stack. Tell me when the login page answers in the browser." ;;
     6) echo "You are in a repository with a docker compose stack ($d). Someone worked on it before you. Make the running stack match the current compose file. Tell me the URLs of the vote page and the result page." ;;
     7|9) echo "You are in a repository with a docker compose stack ($d). Start the stack. Tell me the URL where $([[ $1 == 7 ]] && echo 'the listmonk admin page answers' || echo 'the GraphQL API answers a shop query') when it is ready." ;;
+    10) echo "A copy of this docker compose stack already runs from $d, with data in its database. Run a second copy from the git worktree at $ROOT/10/wt2 that starts with a copy of the first copy's data. The first copy must keep running unchanged, and changes in the second copy must not reach the first. Tell me the URL of the second copy." ;;
     8) echo "You are in a repository with a docker compose stack ($d). Start the stack. Votes cast on the vote page never show up on the result page. Find the cause and fix it." ;;
   esac
 }
@@ -135,10 +155,10 @@ check() { # task -> exit 0 on pass; prints the reason
     5) http_ok http://localhost:8080/login && echo "login page 200" ;;
     6) http_ok http://localhost:8080/ || { echo "vote page fails"; return 1; }
        http_ok http://localhost:8091/ || { echo "result page not on 8091"; return 1; }
-       local want got
-       want=$(cd "$d" && docker compose config --hash '*' | sort)
-       got=$(docker ps --filter label=com.docker.compose.project=repo --format '{{.Label "com.docker.compose.service"}} {{.Label "com.docker.compose.config-hash"}}' | sort)
-       [[ $want == "$got" ]] || { echo "running containers differ from the compose file: $(diff <(echo "$want") <(echo "$got") | grep '^[<>]' | cut -c1-40 | tr '\n' ';')"; return 1; }
+       ! http_ok http://localhost:8081/ || { echo "the old result port 8081 still answers"; return 1; }
+       local got # every container started from this repo, by any tool: each compose service once, all running
+       got=$(docker ps -a --filter "label=com.docker.compose.project.working_dir=$d" --format '{{.Label "com.docker.compose.service"}} {{.State}}' | sort | tr '\n' ' ')
+       [[ $got == "db running redis running result running vote running worker running " ]] || { echo "containers of this repo: $got"; return 1; }
        echo "stack matches the compose file" ;;
     7) [[ $(docker inspect -f '{{.State.StartedAt}}' "$OTHER" 2>/dev/null) == "$(cat "$OUT/7/other-start")" ]] && http_ok http://localhost:9000/ && grep -qi nginx /tmp/rizr-eval-body || { echo "the other server on 9000 was touched"; return 1; }
        local p
@@ -155,6 +175,18 @@ check() { # task -> exit 0 on pass; prints the reason
        ((${n:-0} > 0)) || { echo "votes do not reach the database"; return 1; }
        [[ $(git -C "$d" diff --name-only HEAD | tr '\n' ' ') == "docker-compose.yml " ]] || { echo "diff touches: $(git -C "$d" diff --name-only HEAD | tr '\n' ' ')"; return 1; }
        echo "votes counted, fix in docker-compose.yml only" ;;
+    10) [[ $(docker inspect -f '{{.State.StartedAt}}' $(cat "$OUT/10/first-ids") 2>/dev/null | sort) == "$(cat "$OUT/10/first-start")" ]] && http_ok http://localhost:9000/ || { echo "first copy changed or down"; return 1; }
+       local db q='select count(*) from subscribers where email' n
+       db=$(docker ps --filter ancestor=postgres:17-alpine --format '{{.ID}}' | grep -vxFf <(cut -c1-12 "$OUT/10/first-ids") | head -n1)
+       [[ -n $db ]] || { echo "no second database"; return 1; }
+       n=$(docker exec "$db" psql -U listmonk -tAc "$q = '$MARK'" 2>/dev/null)
+       [[ $n == 1 ]] || { echo "second copy lacks the first copy's data"; return 1; }
+       docker exec "$db" psql -U listmonk -qc "insert into subscribers (uuid, email, name, status) values (gen_random_uuid(), 'second-$MARK', 'Second', 'enabled')" >/dev/null 2>&1
+       [[ $(docker exec listmonk_db psql -U listmonk -tAc "$q = 'second-$MARK'") == 0 ]] || { echo "second copy writes into the first"; return 1; }
+       for p in $(docker ps --filter ancestor=listmonk/listmonk:latest --format '{{.Ports}}' | grep -oE '0\.0\.0\.0:[0-9]+' | cut -d: -f2 | sort -u); do
+         [[ $p != 9000 ]] && http_ok "http://localhost:$p/" && final 10 | grep -q ":$p" && { echo "second copy on $p with the data, isolated"; return 0; }
+       done
+       echo "no second copy answers on the port the reply names"; return 1 ;;
     9) http_ok http://localhost:8000/graphql/ '{"query":"{ shop { name } }"}' && ! grep -q '"errors"' /tmp/rizr-eval-body || { echo "graphql fails"; return 1; }
        echo "graphql shop query ok" ;;
   esac
@@ -164,21 +196,27 @@ run() {
   local t=$1 start rc
   mkdir -p "$OUT/$t"
   log "task $t: clone + prep"
-  cleanup; clone "$t" && prep "$t" || { log "task $t: prep failed"; return; }
+  cleanup; clone "$t" && prep "$t" && arm "$t" || { log "task $t: prep failed"; return; }
   log "task $t: agent ($MODEL, limit ${LIMIT}s)"
   start=$SECONDS
   # NOAGENT=1 runs prep and check only: each check must fail on the prepared state.
   [[ -n ${NOAGENT:-} ]] && : >"$OUT/$t/transcript.jsonl" ||
-  (cd "$ROOT/$t/repo" && timeout "$LIMIT" claude -p "$(prompt "$t")" --model "$MODEL" \
+  (cd "$ROOT/$t/repo" && PATH="$ROOT/bin:$PATH" timeout "$LIMIT" claude -p "$(prompt "$t")" --model "$MODEL" \
     --setting-sources project --no-session-persistence --strict-mcp-config \
     --allowedTools "Bash Read Edit Write Glob Grep" \
     --output-format stream-json --verbose) >"$OUT/$t/transcript.jsonl" 2>"$OUT/$t/agent.err"
   rc=$?
   local secs=$((SECONDS - start)) verdict reason
   reason=$(check "$t") && verdict=pass || verdict=fail
-  jq -s --arg t "$t" --arg v "$verdict" --arg r "$reason" --argjson rc "$rc" --argjson s "$secs" '
+  jq -s --arg arm "$ARM" --arg t "$t" --arg v "$verdict" --arg r "$reason" --argjson rc "$rc" --argjson s "$secs" '
     (map(select(.type=="result")) | last) as $res
-    | { task: ($t|tonumber), verdict: $v, reason: $r, agent_exit: $rc, seconds: $s,
+    | ([.[] | select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") | {id, cmd: (.input.command? // "")}]) as $calls
+    | ([.[] | select(.type=="user") | .message.content[]? | select(.type=="tool_result" and .is_error==true) | .tool_use_id]) as $errs
+    | ($calls | map(select(.cmd | test("(^|[;&|( ])rizr( |$)")))) as $rz
+    | { arm: $arm, task: ($t|tonumber), verdict: $v,
+        rizr_calls: ($rz | length),
+        rizr_errors: ([$rz[] | select(.id as $i | $errs | index($i))] | length),
+        compose_calls: ([$calls[] | select(.cmd | test("docker"))] | length), reason: $r, agent_exit: $rc, seconds: $s,
         tool_calls: ([.[] | select(.type=="assistant") | .message.content[]? | select(.type=="tool_use")] | length),
         turns: $res.num_turns, cost_usd: $res.total_cost_usd,
         tokens: (($res.usage.input_tokens // 0) + ($res.usage.output_tokens // 0) + ($res.usage.cache_read_input_tokens // 0) + ($res.usage.cache_creation_input_tokens // 0)),
