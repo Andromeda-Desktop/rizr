@@ -23,6 +23,8 @@ pub enum ErrorCode {
     JobFailed,
     Unhealthy,
     DependencyFailed,
+    /// A node shares no network with a node it depends on: it can never reach it.
+    Unreachable,
     NotBuilt,
 }
 
@@ -52,7 +54,8 @@ impl ErrorCode {
             | ErrorCode::StartTimeout
             | ErrorCode::JobFailed
             | ErrorCode::Unhealthy
-            | ErrorCode::DependencyFailed => ErrorClass::NotReady,
+            | ErrorCode::DependencyFailed
+            | ErrorCode::Unreachable => ErrorClass::NotReady,
             ErrorCode::NotBuilt => ErrorClass::NotBuilt,
         }
     }

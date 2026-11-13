@@ -52,6 +52,15 @@ pub struct Model {
     /// Digest of the trusted inputs this model was imported from.
     pub inputs: Digest,
     pub nodes: BTreeMap<NodeId, NodeSpec>,
+    /// Defects the import finds in the files before anything runs.
+    pub findings: Vec<Finding>,
+}
+
+/// A defect of one node that no start can fix: the files must change.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Finding {
+    pub node: NodeId,
+    pub error: crate::error::Error,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

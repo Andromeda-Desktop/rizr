@@ -95,6 +95,48 @@ pub fn import(
     Ok((model(&config, instance, inputs)?, restart))
 }
 
+/// A dependency that is not a finished job must share a network with its dependent, or its name never resolves.
+/// A service with `network_mode` (host, `service:x`) is skipped: it has no networks of its own.
+fn unreachable(
+    services: &serde_json::Map<String, Value>,
+    nodes: &BTreeMap<NodeId, rizr_core::model::NodeSpec>,
+    id: &dyn Fn(&str) -> NodeId,
+) -> Vec<rizr_core::model::Finding> {
+    let nets = |name: &str| -> Option<BTreeSet<String>> {
+        let svc = &services[name];
+        if !svc["network_mode"].is_null() {
+            return None;
+        }
+        Some(match svc["networks"].as_object() {
+            Some(n) => n.keys().cloned().collect(),
+            None => BTreeSet::from(["default".to_string()]),
+        })
+    };
+    let mut out = Vec::new();
+    for (node, spec) in nodes {
+        let a = &node.name.0;
+        for d in spec.deps.iter().filter(|d| d.gate != Gate::Completed) {
+            let b = &d.node.name.0;
+            let (Some(na), Some(nb)) = (nets(a), nets(b)) else {
+                continue;
+            };
+            if na.is_disjoint(&nb) {
+                let list = |n: &BTreeSet<String>| n.iter().cloned().collect::<Vec<_>>().join(", ");
+                out.push(rizr_core::model::Finding {
+                    node: id(a),
+                    error: rizr_core::error::Error::new(
+                        rizr_core::error::ErrorCode::Unreachable,
+                        format!("{a} cannot reach {b}: {a} is on {}, {b} on {}", list(&na), list(&nb)),
+                        format!("add a network of {b} to `{a}.networks` in the compose file, then run up again"),
+                        "rizr up --wait ready",
+                    ),
+                });
+            }
+        }
+    }
+    out
+}
+
 pub fn model(config: &Value, instance: &InstanceId, inputs: Digest) -> Result<Model, String> {
     let services = config["services"]
         .as_object()
@@ -145,7 +187,12 @@ pub fn model(config: &Value, instance: &InstanceId, inputs: Digest) -> Result<Mo
             },
         );
     }
-    let m = Model { inputs, nodes };
+    let findings = unreachable(services, &nodes, &id);
+    let m = Model {
+        inputs,
+        nodes,
+        findings,
+    };
     if let Some(n) = cycle(&m) {
         return Err(format!("dependency cycle through `{}`", n.name.0));
     }
@@ -220,6 +267,33 @@ pub fn tail(stderr: &[u8]) -> String {
 #[allow(clippy::unwrap_used, reason = "a test panics on a broken precondition")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dependency_on_no_shared_network_is_a_finding() {
+        let config = serde_json::json!({"services": {
+            "redis": {"networks": {"back": null}},
+            "migrate": {"networks": {"back": null}},
+            "host": {"network_mode": "host"},
+            "worker": {"networks": {"front": null}, "depends_on": {
+                "redis": {"condition": "service_healthy"},
+                "migrate": {"condition": "service_completed_successfully"},
+                "host": {"condition": "service_started"}}},
+            "vote": {"networks": {"front": null, "back": null}, "depends_on": {"redis": {"condition": "service_started"}}},
+        }});
+        let m = model(&config, &"main".into(), "d".into()).unwrap();
+        let found: Vec<_> = m
+            .findings
+            .iter()
+            .map(|f| (f.node.name.0.as_str(), f.error.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [(
+                "worker",
+                "worker cannot reach redis: worker is on front, redis on back"
+            )]
+        );
+    }
 
     #[test]
     fn jobs_gates_and_readiness_signals() {

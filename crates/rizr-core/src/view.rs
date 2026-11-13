@@ -131,7 +131,11 @@ pub fn outcome(s: &State) -> Option<Result<(), Error>> {
 }
 
 fn first_problem(s: &State) -> Option<Error> {
-    let order = s.loaded()?.topo();
+    let m = s.loaded()?;
+    node_problem(s, &m.topo()).or_else(|| m.findings.first().map(|f| f.error.clone()))
+}
+
+fn node_problem(s: &State, order: &[NodeId]) -> Option<Error> {
     order.iter().find_map(|id| {
         let n = s.nodes.get(id)?;
         let name = &id.name.0;

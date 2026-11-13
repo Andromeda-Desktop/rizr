@@ -131,9 +131,13 @@ fn run(cli: Cli) -> Result<(), Error> {
                 .collect();
             let drift = view::drift(&s);
             if json {
-                println!("{}", json!({"steps": steps, "drift": drift}));
+                println!(
+                    "{}",
+                    json!({"steps": steps, "drift": drift, "findings": findings(&s)})
+                );
                 return Ok(());
             }
+            print_findings(&s);
             println!("next steps of `rizr up` (later steps follow as nodes become ready):");
             for st in &steps {
                 println!("  - {}", st["reason"].as_str().unwrap_or_default());
@@ -149,7 +153,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             if json {
                 println!(
                     "{}",
-                    json!({"status": view::instance_status(&s), "nodes": view::nodes(&s), "drift": view::drift(&s)})
+                    json!({"status": view::instance_status(&s), "nodes": view::nodes(&s), "drift": view::drift(&s), "findings": findings(&s)})
                 );
             } else {
                 print_status(&stack, &s);
@@ -163,11 +167,16 @@ fn run(cli: Cli) -> Result<(), Error> {
         Command::Context => {
             let s = docker::run(&stack, i.digest, None)?;
             let status = view::instance_status(&s);
-            let failed: Vec<String> = view::nodes(&s)
+            let mut failed: Vec<String> = view::nodes(&s)
                 .into_iter()
                 .filter(|n| n.state.starts_with("failed") || n.state == "unhealthy")
                 .map(|n| n.node.name.0)
                 .collect();
+            for f in findings(&s) {
+                if !failed.contains(&f.node.name.0) {
+                    failed.push(f.node.name.0.clone());
+                }
+            }
             let mut next: Vec<String> = failed
                 .iter()
                 .flat_map(|n| [format!("rizr why {n}"), format!("rizr logs {n}")])
@@ -198,6 +207,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                 json!({
                     "root": stack.root, "project": stack.compose_name(), "data_dir": stack.dir,
                     "compose_files": compose::resolve(&stack.root, &stack.files), "status": status,
+                    "findings": findings(&s),
                     "generation": s.intents.generation.0, "graph": graph, "nodes": view::nodes(&s),
                     "drift": view::drift(&s), "failed": failed, "next": next,
                 })
@@ -225,7 +235,23 @@ fn run(cli: Cli) -> Result<(), Error> {
     }
 }
 
+/// Defects of the files that no start fixes (`Model::findings`).
+fn findings(s: &State) -> &[rizr_core::model::Finding] {
+    s.loaded().map_or(&[], |m| &m.findings)
+}
+
+fn print_findings(s: &State) {
+    for f in findings(s) {
+        println!(
+            "problem: {}
+  fix: {}",
+            f.error.message, f.error.hint
+        );
+    }
+}
+
 fn print_status(stack: &docker::Stack, s: &State) {
+    print_findings(s);
     println!(
         "{}: {:?} (generation {})",
         stack.compose_name(),
@@ -325,6 +351,11 @@ fn why(stack: &docker::Stack, s: &State, name: &str, json: bool) -> Result<(), E
         Some(NodeKind::Service { .. }) => "service",
         None => "removed from the compose file",
     };
+    let problems: Vec<_> = findings(s)
+        .iter()
+        .filter(|f| f.node == v.node)
+        .map(|f| &f.error)
+        .collect();
     let generated = std::fs::read_to_string(stack.dir.join("dev.env")).unwrap_or_default();
     let generated: Vec<&str> = generated
         .lines()
@@ -335,11 +366,14 @@ fn why(stack: &docker::Stack, s: &State, name: &str, json: bool) -> Result<(), E
             "{}",
             json!({"node": name, "state": v.state, "kind": kind, "signal": v.signal, "deps": deps,
                    "needed_by": needed_by, "next": next, "runtime": format!("compose service `{name}` in project {}", stack.compose_name()),
-                   "generated_env": generated})
+                   "generated_env": generated, "problems": problems})
         );
         return Ok(());
     }
     println!("{name}: {}", v.state);
+    for e in &problems {
+        println!("  problem: {}\n    fix: {}", e.message, e.hint);
+    }
     println!("  kind: {kind}");
     println!("  ready when: {}", v.signal);
     for d in &deps {

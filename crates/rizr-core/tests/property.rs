@@ -143,6 +143,7 @@ impl Fake {
         Model {
             inputs: self.inputs(),
             nodes,
+            findings: vec![],
         }
     }
 
@@ -685,6 +686,7 @@ fn a_snapshot_before_the_model_keeps_a_finished_job_done() {
         }],
     };
     let model = Model {
+        findings: vec![],
         inputs: Digest::from("in"),
         nodes: BTreeMap::from([(
             node.clone(),
