@@ -85,8 +85,12 @@ fn run(cli: Cli) -> Result<(), Error> {
         println!("{schema:#}");
         return Ok(());
     }
-    if let Command::Action(Action::Trust) = cli.command {
-        let i = trust::gate(Path::new("."), &cli.file, true)?;
+    if let Command::Action(Action::Trust { yes }) = cli.command {
+        let i = if yes {
+            trust::retrust(Path::new("."), &cli.file)?
+        } else {
+            trust::gate(Path::new("."), &cli.file, true)?
+        };
         eprintln!("trusted {} ({} files)", i.root.display(), i.files.len());
         return Ok(());
     }
@@ -103,7 +107,7 @@ fn run(cli: Cli) -> Result<(), Error> {
         })?;
     let stack = docker::Stack::new(i.root, cli.file.clone(), &data);
     match cli.command {
-        Command::Schema | Command::Action(Action::Trust) => Ok(()),
+        Command::Schema | Command::Action(Action::Trust { .. }) => Ok(()),
         Command::Action(action) => {
             let up = matches!(action, Action::Up { .. });
             let s = docker::run(&stack, i.digest, Some(action))?;

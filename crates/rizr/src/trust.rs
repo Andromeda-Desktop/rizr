@@ -214,6 +214,30 @@ pub fn grant(store: &Path, i: &Inputs) -> std::io::Result<()> {
     std::fs::rename(tmp, store)
 }
 
+/// A person trusted this repo once; its files may have changed since.
+fn known(store: &Path, i: &Inputs) -> bool {
+    load(store).contains_key(&*i.root.to_string_lossy())
+}
+
+/// `rizr trust --yes`: trusts the present files without a terminal, but only in a repo a person trusted before.
+/// The first trust of a repo always needs a person (user, 2026-11-13).
+pub fn retrust(root: &Path, chosen: &[PathBuf]) -> Result<Inputs, Error> {
+    let i = inputs(root, chosen)?;
+    let store = store_path().ok_or_else(|| {
+        Error::new(
+            ErrorCode::Usage,
+            "neither XDG_DATA_HOME nor HOME is set",
+            "rizr keeps the trust store in the user's data directory",
+            "HOME=/home/me rizr up",
+        )
+    })?;
+    if !known(&store, &i) {
+        return Err(untrusted(&i, chosen, false));
+    }
+    grant(&store, &i).map_err(|e| io_error(&store, &e))?;
+    Ok(i)
+}
+
 /// The gate before any verb that reads or runs repo content. Asks on a terminal; refuses without one.
 pub fn gate(root: &Path, chosen: &[PathBuf], ask: bool) -> Result<Inputs, Error> {
     let i = inputs(root, chosen)?;
@@ -228,9 +252,10 @@ pub fn gate(root: &Path, chosen: &[PathBuf], ask: bool) -> Result<Inputs, Error>
     if is_trusted(&store, &i) {
         return Ok(i);
     }
+    let known = known(&store, &i);
     let terminal = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     if !ask || !terminal {
-        return Err(untrusted(&i, chosen));
+        return Err(untrusted(&i, chosen, known));
     }
     eprintln!(
         "rizr has not run {} with these files yet:",
@@ -248,17 +273,17 @@ pub fn gate(root: &Path, chosen: &[PathBuf], ask: bool) -> Result<Inputs, Error>
     let mut line = String::new();
     let _ = std::io::stdin().lock().read_line(&mut line);
     if !matches!(line.trim(), "y" | "Y" | "yes") {
-        return Err(untrusted(&i, chosen));
+        return Err(untrusted(&i, chosen, known));
     }
     grant(&store, &i).map_err(|e| io_error(&store, &e))?;
     Ok(i)
 }
 
-fn untrusted(i: &Inputs, chosen: &[PathBuf]) -> Error {
+fn untrusted(i: &Inputs, chosen: &[PathBuf], known: bool) -> Error {
     let trust: String = chosen
         .iter()
         .map(|f| format!("-f {} ", f.display()))
-        .chain(["trust".into()])
+        .chain([if known { "trust --yes" } else { "trust" }.into()])
         .collect();
     let files: Vec<_> = i.files.iter().map(|f| f.display().to_string()).collect();
     Error::new(
@@ -272,7 +297,13 @@ fn untrusted(i: &Inputs, chosen: &[PathBuf]) -> Error {
                 files.join(", ")
             }
         ),
-        format!("a human reviews the files, then runs `rizr {trust}` in a terminal"),
+        if known {
+            format!(
+                "the files changed since a person trusted this repo; review the change (`git diff`), then run `rizr {trust}`"
+            )
+        } else {
+            format!("a human reviews the files, then runs `rizr {trust}` in a terminal")
+        },
         format!("rizr {trust}"),
     )
 }

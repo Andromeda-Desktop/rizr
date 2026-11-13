@@ -22,7 +22,12 @@ pub enum Action {
     /// Clear the failure of one node and start it again.
     Restart { node: NodeName },
     /// Trust the repo files that rizr will read and run.
-    Trust,
+    Trust {
+        /// Without a terminal: trust the changed files of a repo that a person trusted before.
+        #[cfg_attr(feature = "clap", arg(long))]
+        #[serde(default)]
+        yes: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

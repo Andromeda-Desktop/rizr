@@ -56,7 +56,13 @@ fn hostile_untrusted_repo_starts_no_process() {
         );
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    for args in [&["up"][..], &["up", "--json"], &["down"], &["trust"]] {
+    for args in [
+        &["up"][..],
+        &["up", "--json"],
+        &["down"],
+        &["trust"],
+        &["trust", "--yes"],
+    ] {
         let out = Command::new(env!("CARGO_BIN_EXE_rizr"))
             .args(args)
             .current_dir(&repo)
@@ -79,4 +85,46 @@ fn hostile_untrusted_repo_starts_no_process() {
         );
     }
     assert!(!home.join(".local/share/rizr/trust.json").exists());
+}
+
+/// After a person trusted a repo once, an agent re-trusts changed files with `--yes`, without a terminal.
+#[test]
+fn trust_yes_works_only_after_a_first_trust() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("repo"), tmp.path().join("home"));
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join("compose.yml"),
+        "services:\n  x:\n    image: alpine\n",
+    )
+    .unwrap();
+    let rizr = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_rizr"))
+            .args(args)
+            .current_dir(&repo)
+            .env_clear()
+            .env("HOME", &home)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    assert_eq!(rizr(&["trust", "--yes"]).status.code(), Some(3));
+    let store = home.join(".local/share/rizr/trust.json");
+    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+    let root = repo.canonicalize().unwrap();
+    std::fs::write(&store, format!("{{\"{}\": \"stale\"}}", root.display())).unwrap();
+    let refused = rizr(&["up", "--json"]);
+    assert!(
+        String::from_utf8_lossy(&refused.stdout).contains("rizr trust --yes"),
+        "{}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let out = rizr(&["trust", "--yes"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!std::fs::read_to_string(&store).unwrap().contains("stale"));
 }

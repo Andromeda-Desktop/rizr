@@ -314,7 +314,7 @@ fn action(s: &mut State, a: Action) {
                 None => s.reject(format!("restart of unknown node {}", node.0)),
             }
         }
-        Action::Trust => {
+        Action::Trust { .. } => {
             if let Trust::Untrusted(i) | Trust::Refused(i) = &s.trust {
                 s.trust = Trust::Trusted(i.clone());
             }
