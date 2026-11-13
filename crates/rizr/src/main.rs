@@ -1,10 +1,12 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use rizr_core::Action;
 use rizr_core::error::{Error, ErrorCode};
-use rizr_core::view::{Drift, Receipt};
+use rizr_core::model::{Gate, NodeKind};
+use rizr_core::view::{self, Drift, InstanceStatus, Receipt};
+use rizr_core::{Action, Event, State, plan, reduce};
+use serde_json::json;
 
 mod compose;
 mod devenv;
@@ -26,69 +28,435 @@ struct Cli {
 enum Command {
     #[command(flatten)]
     Action(Action),
+    /// Show the steps `up` would take now, with their reasons and real commands. Runs nothing.
+    Plan,
+    /// Show each node's state and each difference between desired and actual.
+    Status,
+    /// Explain one node: its state, readiness signal, dependencies and next step.
+    Why { node: String },
+    /// One call for agents: graph, live state, first failure and next commands (JSON).
+    Context,
+    /// Print the logs of the stack or of one node.
+    Logs {
+        node: Option<String>,
+        #[arg(long, short)]
+        follow: bool,
+        #[arg(long, default_value = "200")]
+        tail: String,
+    },
+    /// Write plain files that run this stack without rizr: env files and an `up.sh` in dependency order.
+    Eject {
+        #[arg(long, default_value = "rizr-eject")]
+        out: PathBuf,
+    },
     /// Print the JSON Schema of the API: actions, errors, receipt and drift.
     Schema,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let json = cli.json;
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            let e = known_cause(e);
+            if json {
+                println!("{}", serde_json::to_string(&e).unwrap_or_default());
+            } else {
+                eprintln!("error: {}\nhint: {}\ntry: {}", e.message, e.hint, e.example);
+            }
+            ExitCode::from(e.code.class().exit_code())
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<(), Error> {
+    let json = cli.json;
+    if let Command::Schema = cli.command {
+        let schema = json!({
+            "action": schemars::schema_for!(Action),
+            "error": schemars::schema_for!(Error),
+            "receipt": schemars::schema_for!(Receipt),
+            "drift": schemars::schema_for!(Drift),
+        });
+        println!("{schema:#}");
+        return Ok(());
+    }
+    if let Command::Action(Action::Trust) = cli.command {
+        let i = trust::gate(Path::new("."), true)?;
+        eprintln!("trusted {} ({} files)", i.root.display(), i.files.len());
+        return Ok(());
+    }
+    let i = trust::gate(Path::new("."), !json)?;
+    let data = trust::store_path()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .ok_or_else(|| {
+            Error::new(
+                ErrorCode::Usage,
+                "HOME is not set",
+                "set HOME",
+                "HOME=/home/me rizr up",
+            )
+        })?;
+    let stack = docker::Stack::new(i.root, &data);
     match cli.command {
-        Command::Schema => {
-            let schema = serde_json::json!({
-                "action": schemars::schema_for!(Action),
-                "error": schemars::schema_for!(Error),
-                "receipt": schemars::schema_for!(Receipt),
-                "drift": schemars::schema_for!(Drift),
-            });
-            println!("{schema:#}");
-            ExitCode::SUCCESS
-        }
-        Command::Action(Action::Trust) => match trust::gate(Path::new("."), true) {
-            Ok(i) => {
-                eprintln!("trusted {} ({} files)", i.root.display(), i.files.len());
-                ExitCode::SUCCESS
-            }
-            Err(e) => fail(cli.json, &e),
-        },
+        Command::Schema | Command::Action(Action::Trust) => Ok(()),
         Command::Action(action) => {
-            let i = match trust::gate(Path::new("."), !cli.json) {
-                Ok(i) => i,
-                Err(e) => return fail(cli.json, &e),
-            };
-            let Some(data) = trust::store_path().and_then(|p| p.parent().map(Path::to_path_buf))
-            else {
-                return fail(
-                    cli.json,
-                    &Error::new(ErrorCode::Usage, "HOME is not set", "set HOME", "rizr up"),
+            let up = matches!(action, Action::Up { .. });
+            let s = docker::run(&stack, i.digest, Some(action))?;
+            if json && up {
+                println!(
+                    "{}",
+                    serde_json::to_string(&view::receipt(&s)).unwrap_or_default()
                 );
-            };
-            let name = verb(&action);
-            let stack = docker::Stack::new(i.root, &data);
-            match docker::run(&stack, i.digest, action) {
-                Ok(_) => {
-                    eprintln!("{name}: done ({})", stack.dir.display());
-                    ExitCode::SUCCESS
-                }
-                Err(e) => fail(cli.json, &e),
+            } else {
+                print_status(&stack, &s);
             }
+            Ok(())
+        }
+        Command::Plan => {
+            let s = docker::run(&stack, i.digest, None)?;
+            let s = reduce(
+                s,
+                Event::Action(Action::Up {
+                    wait: Default::default(),
+                }),
+            );
+            let steps: Vec<_> = plan(&s)
+                .into_iter()
+                .map(|e| json!({"reason": e.reason, "command": docker::render(&stack, &e.op)}))
+                .collect();
+            let drift = view::drift(&s);
+            if json {
+                println!("{}", json!({"steps": steps, "drift": drift}));
+                return Ok(());
+            }
+            println!("next steps of `rizr up` (later steps follow as nodes become ready):");
+            for st in &steps {
+                println!("  - {}", st["reason"].as_str().unwrap_or_default());
+                if let Some(c) = st["command"].as_str() {
+                    println!("    $ {c}");
+                }
+            }
+            print_order(&s);
+            Ok(())
+        }
+        Command::Status => {
+            let s = docker::run(&stack, i.digest, None)?;
+            if json {
+                println!(
+                    "{}",
+                    json!({"status": view::instance_status(&s), "nodes": view::nodes(&s), "drift": view::drift(&s)})
+                );
+            } else {
+                print_status(&stack, &s);
+            }
+            Ok(())
+        }
+        Command::Why { node } => {
+            let s = docker::run(&stack, i.digest, None)?;
+            why(&stack, &s, &node, json)
+        }
+        Command::Context => {
+            let s = docker::run(&stack, i.digest, None)?;
+            let status = view::instance_status(&s);
+            let failed: Vec<String> = view::nodes(&s)
+                .into_iter()
+                .filter(|n| n.state.starts_with("failed") || n.state == "unhealthy")
+                .map(|n| n.node.name.0)
+                .collect();
+            let mut next: Vec<String> = failed
+                .iter()
+                .flat_map(|n| [format!("rizr why {n}"), format!("rizr logs {n}")])
+                .collect();
+            next.push(match status {
+                InstanceStatus::Up => "rizr status".into(),
+                _ => "rizr up --wait ready".into(),
+            });
+            let graph: Vec<_> = s
+                .loaded()
+                .map(|m| {
+                    m.topo()
+                        .into_iter()
+                        .filter_map(|id| {
+                            let n = m.nodes.get(&id)?;
+                            Some(json!({
+                                "node": id.name.0,
+                                "kind": if matches!(n.kind, NodeKind::Job { .. }) { "job" } else { "service" },
+                                "signal": view::signal(Some(&n.kind)),
+                                "deps": n.deps.iter().map(|d| json!({"node": d.node.name.0, "gate": gate(d.gate)})).collect::<Vec<_>>(),
+                            }))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            println!(
+                "{:#}",
+                json!({
+                    "root": stack.root, "project": stack.compose_name(), "data_dir": stack.dir,
+                    "compose_files": compose::files(&stack.root), "status": status,
+                    "generation": s.intents.generation.0, "graph": graph, "nodes": view::nodes(&s),
+                    "drift": view::drift(&s), "failed": failed, "next": next,
+                })
+            );
+            Ok(())
+        }
+        Command::Logs { node, follow, tail } => {
+            let mut c = stack.compose();
+            c.args(["logs", "--no-color", "--tail", &tail]);
+            if follow {
+                c.arg("--follow");
+            }
+            c.args(node);
+            let st = c.status().map_err(|e| runtime_error(&e.to_string()))?;
+            if st.success() {
+                Ok(())
+            } else {
+                Err(runtime_error("docker compose logs failed"))
+            }
+        }
+        Command::Eject { out } => {
+            let s = docker::run(&stack, i.digest, None)?;
+            eject(&stack, &s, &out)
         }
     }
 }
 
-fn verb(a: &Action) -> &'static str {
-    match a {
-        Action::Up { .. } => "up",
-        Action::Down => "down",
-        Action::Restart { .. } => "restart",
-        Action::Trust => "trust",
+fn print_status(stack: &docker::Stack, s: &State) {
+    println!(
+        "{}: {:?} (generation {})",
+        stack.compose_name(),
+        view::instance_status(s),
+        s.intents.generation.0
+    );
+    let drift = view::drift(s);
+    for n in view::nodes(s) {
+        let next = drift
+            .iter()
+            .find(|d| d.node == n.node)
+            .and_then(|d| d.next.clone())
+            .map(|x| format!("  next: {x}"))
+            .unwrap_or_default();
+        println!("  {:<20} {:<16} {}{next}", n.node.name.0, n.state, n.signal);
     }
 }
 
-fn fail(json: bool, e: &Error) -> ExitCode {
-    if json {
-        println!("{}", serde_json::to_string(e).unwrap_or_default());
-    } else {
-        eprintln!("error: {}\nhint: {}\ntry: {}", e.message, e.hint, e.example);
+fn print_order(s: &State) {
+    let Some(m) = s.loaded() else { return };
+    println!("order:");
+    for id in m.topo() {
+        let Some(n) = m.nodes.get(&id) else { continue };
+        let deps: Vec<String> = n
+            .deps
+            .iter()
+            .map(|d| format!("{} {}", d.node.name.0, gate(d.gate)))
+            .collect();
+        let kind = if matches!(n.kind, NodeKind::Job { .. }) {
+            "job"
+        } else {
+            "service"
+        };
+        let after = if deps.is_empty() {
+            String::new()
+        } else {
+            format!(" after {}", deps.join(", "))
+        };
+        println!(
+            "  {} ({kind}, {}){after}",
+            id.name.0,
+            view::signal(Some(&n.kind))
+        );
     }
-    ExitCode::from(e.code.class().exit_code())
+}
+
+fn gate(g: Gate) -> &'static str {
+    match g {
+        Gate::Started => "started",
+        Gate::Ready => "ready",
+        Gate::Completed => "completed",
+    }
+}
+
+fn why(stack: &docker::Stack, s: &State, name: &str, json: bool) -> Result<(), Error> {
+    let nodes = view::nodes(s);
+    let Some(v) = nodes.iter().find(|n| n.node.name.0 == name) else {
+        let names: Vec<_> = nodes.iter().map(|n| n.node.name.0.as_str()).collect();
+        return Err(Error::new(
+            ErrorCode::Usage,
+            format!("no node `{name}`; nodes: {}", names.join(", ")),
+            "name a service or job of the compose file",
+            format!("rizr why {}", names.first().unwrap_or(&"<node>")),
+        ));
+    };
+    let state_of = |n: &str| {
+        nodes
+            .iter()
+            .find(|x| x.node.name.0 == n)
+            .map_or("unknown".into(), |x| x.state.clone())
+    };
+    let spec = s.loaded().and_then(|m| m.nodes.get(&v.node));
+    let deps: Vec<_> = spec
+        .map(|sp| {
+            sp.deps
+                .iter()
+                .map(|d| json!({"node": d.node.name.0, "gate": gate(d.gate), "state": state_of(&d.node.name.0)}))
+                .collect()
+        })
+        .unwrap_or_default();
+    let needed_by: Vec<String> = s
+        .loaded()
+        .map(|m| {
+            m.nodes
+                .iter()
+                .filter(|(_, n)| n.deps.iter().any(|d| d.node == v.node))
+                .map(|(id, _)| id.name.0.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let next = view::drift(s)
+        .into_iter()
+        .find(|d| d.node == v.node)
+        .and_then(|d| d.next);
+    let kind = match spec.map(|sp| &sp.kind) {
+        Some(NodeKind::Job { .. }) => "job: a service that others wait on to exit 0",
+        Some(NodeKind::Service { .. }) => "service",
+        None => "removed from the compose file",
+    };
+    let generated = std::fs::read_to_string(stack.dir.join("dev.env")).unwrap_or_default();
+    let generated: Vec<&str> = generated
+        .lines()
+        .filter_map(|l| l.split('=').next())
+        .collect();
+    if json {
+        println!(
+            "{}",
+            json!({"node": name, "state": v.state, "kind": kind, "signal": v.signal, "deps": deps,
+                   "needed_by": needed_by, "next": next, "runtime": format!("compose service `{name}` in project {}", stack.compose_name()),
+                   "generated_env": generated})
+        );
+        return Ok(());
+    }
+    println!("{name}: {}", v.state);
+    println!("  kind: {kind}");
+    println!("  ready when: {}", v.signal);
+    for d in &deps {
+        println!(
+            "  waits for: {} to be {} (now {})",
+            d["node"].as_str().unwrap_or_default(),
+            d["gate"].as_str().unwrap_or_default(),
+            d["state"].as_str().unwrap_or_default()
+        );
+    }
+    if !needed_by.is_empty() {
+        println!("  needed by: {}", needed_by.join(", "));
+    }
+    println!(
+        "  runtime: compose service `{name}` in project {}",
+        stack.compose_name()
+    );
+    if !generated.is_empty() {
+        println!(
+            "  env generated by rizr (all services): {} in {}",
+            generated.join(", "),
+            stack.dir.join("dev.env").display()
+        );
+    }
+    println!("  next: {}", next.as_deref().unwrap_or("nothing"));
+    Ok(())
+}
+
+fn eject(stack: &docker::Stack, s: &State, out: &Path) -> Result<(), Error> {
+    let io = |e: std::io::Error| {
+        Error::new(
+            ErrorCode::Usage,
+            format!("cannot write {}: {e}", out.display()),
+            "choose another directory",
+            "rizr eject --out /tmp/stack",
+        )
+    };
+    let m = s
+        .loaded()
+        .ok_or_else(|| runtime_error("the compose model did not load"))?;
+    std::fs::create_dir_all(out).map_err(io)?;
+    let out = out.canonicalize().map_err(io)?;
+    let mut args: Vec<String> = Vec::new();
+    for f in compose::files(&stack.root) {
+        args.push(format!("-f '{}'", f.display()));
+    }
+    let a = devenv::args(&stack.root, &stack.dir);
+    for pair in a.chunks(2) {
+        let [flag, file] = pair else { continue };
+        let src = PathBuf::from(file);
+        let dst = out.join(src.file_name().unwrap_or_default());
+        if src != dst && src.starts_with(&stack.dir) {
+            std::fs::copy(&src, &dst).map_err(io)?;
+            args.push(format!(
+                "{} \"$here/{}\"",
+                flag.to_string_lossy(),
+                dst.file_name().unwrap_or_default().to_string_lossy()
+            ));
+        } else {
+            args.push(format!("{} '{}'", flag.to_string_lossy(), src.display()));
+        }
+    }
+    let mut sh = format!(
+        "#!/bin/sh\n# Written by `rizr eject`: starts the stack in dependency order without rizr.\nset -eu\nhere=$(cd \"$(dirname \"$0\")\" && pwd)\nc() {{ docker compose -p {} --project-directory '{}' {} \"$@\"; }}\n",
+        stack.compose_name(),
+        stack.root.display(),
+        args.join(" ")
+    );
+    for id in m.topo() {
+        let Some(n) = m.nodes.get(&id) else { continue };
+        let svc = &id.name.0;
+        sh.push_str(&match n.kind {
+            NodeKind::Job { .. } => format!("c up -d --no-deps {svc}\ntest \"$(docker wait \"$(c ps -aq {svc})\")\" = 0 || {{ echo 'job {svc} failed' >&2; exit 1; }}\n"),
+            NodeKind::Service { .. } => format!("c up -d --no-deps --wait {svc}\n"),
+        });
+    }
+    let script = out.join("up.sh");
+    std::fs::write(&script, sh).map_err(io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).map_err(io)?;
+    }
+    println!("wrote {}", script.display());
+    Ok(())
+}
+
+fn runtime_error(msg: &str) -> Error {
+    Error::new(
+        ErrorCode::RuntimeUnavailable,
+        msg,
+        "check that docker runs",
+        "docker info",
+    )
+}
+
+/// The failure catalog (VISION section 9): a known cause gets its own hint and next command.
+fn known_cause(mut e: Error) -> Error {
+    let m = e.message.to_ascii_lowercase();
+    if m.contains("port is already allocated") || m.contains("address already in use") {
+        let port = e.message.rsplit(':').find_map(|p| {
+            p.split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse::<u16>()
+                .ok()
+        });
+        e.hint =
+            "another process or stack holds the port; stop it, or change the published port".into();
+        e.example = port.map_or("ss -ltnp".into(), |p| format!("ss -ltnp 'sport = :{p}'"));
+    } else if [
+        "pull access denied",
+        "manifest unknown",
+        "failed to resolve reference",
+        "not found: manifest",
+    ]
+    .iter()
+    .any(|k| m.contains(k))
+    {
+        e.hint = "the image does not exist or needs a login; check its name and tag".into();
+        e.example = "docker login".into();
+    }
+    e
 }

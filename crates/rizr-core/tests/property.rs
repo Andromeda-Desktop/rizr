@@ -662,3 +662,66 @@ fn stale_buffered_event_does_not_undo_the_snapshot() {
     );
     assert_eq!(s.nodes[&node].machine, Machine::Service(Service::Ready));
 }
+
+/// `status` right after `up`: the snapshot answers before the model loads, so it cannot know `migrate` is a job.
+/// The finished job must still show as done, not pending.
+#[test]
+fn a_snapshot_before_the_model_keeps_a_finished_job_done() {
+    use rizr_core::machine::Job;
+    let node = NodeId {
+        scope: Scope::Instance(InstanceId::from("main")),
+        name: NodeName::from("migrate"),
+    };
+    let world = World {
+        at: 1,
+        seen: vec![Seen {
+            node: node.clone(),
+            spec: Digest::from("s"),
+            generation: Gen(3),
+            status: Status::Exited { code: 0 },
+        }],
+    };
+    let model = Model {
+        inputs: Digest::from("in"),
+        nodes: BTreeMap::from([(
+            node.clone(),
+            NodeSpec {
+                kind: NodeKind::Job {
+                    kind: JobKind::Migrate,
+                },
+                deps: vec![],
+                spec: Digest::from("s"),
+                provider: ProviderName::from("fake"),
+            },
+        )]),
+    };
+    let mut s = State::new(ProjectId::from("p"), InstanceId::from("main"), Gen(3));
+    s = reduce(
+        s,
+        Event::Hashed {
+            inputs: Digest::from("in"),
+            trusted: true,
+        },
+    );
+    for _ in 0..16 {
+        for e in plan(&s) {
+            s = reduce(s, Event::Sent(e));
+        }
+        let Some(e) = s
+            .pending
+            .values()
+            .find(|e| e.op != Op::Import)
+            .or_else(|| s.pending.values().next())
+            .cloned()
+        else {
+            break;
+        };
+        let answer = match e.op {
+            Op::Observe => Answer::Observed(world.clone()),
+            Op::Import => Answer::Imported(model.clone()),
+            _ => Answer::Ok,
+        };
+        s = reduce(s, Event::Done { id: e.id, answer });
+    }
+    assert_eq!(s.nodes[&node].machine, Machine::Job(Job::Done(Gen(3))));
+}

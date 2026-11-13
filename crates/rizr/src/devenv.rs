@@ -49,7 +49,9 @@ pub fn prepare(root: &Path, dir: &Path, compose_files: &[PathBuf]) -> Result<(),
         let Ok(text) = std::fs::read(file) else {
             continue;
         };
-        let Ok(doc) = serde_norway::from_slice::<serde_norway::Value>(&text) else {
+        let Ok(doc) = serde_norway::from_slice::<serde_norway::Value>(&text)
+            .and_then(|mut v| v.apply_merge().map(|()| v))
+        else {
             continue;
         };
         let Some(svcs) = doc.get("services").and_then(|s| s.as_mapping()) else {

@@ -65,17 +65,18 @@ impl Stack {
     }
 
     /// The compose project name: `<project>-<instance>` (SPEC-core section 2).
-    fn compose_name(&self) -> String {
+    pub fn compose_name(&self) -> String {
         format!("{}-{}", self.project.0, self.instance.0)
     }
 
-    fn compose(&self) -> Command {
+    pub fn compose(&self) -> Command {
         compose::command(&self.root, &self.compose_name(), &self.dir)
     }
 }
 
 /// Run one action to its outcome. The caller has passed the trust gate.
-pub fn run(stack: &Stack, inputs: Digest, action: Action) -> Result<State, Error> {
+/// Run one action to its outcome; `None` only observes (status, why, plan, context).
+pub fn run(stack: &Stack, inputs: Digest, action: Option<Action>) -> Result<State, Error> {
     let gen_file = stack.dir.join("generation");
     let generation = std::fs::read_to_string(&gen_file)
         .ok()
@@ -98,7 +99,9 @@ pub fn run(stack: &Stack, inputs: Digest, action: Action) -> Result<State, Error
             trusted: true,
         },
     );
-    s = reduce(s, Event::Action(action));
+    if let Some(a) = action {
+        s = reduce(s, Event::Action(a));
+    }
     let result = p.drive(s, &rx);
     if let Ok(s) = &result {
         let _ = std::fs::create_dir_all(&stack.dir);
@@ -526,6 +529,44 @@ fn exec(mut cmd: Command) -> Answer {
             tail: format!("cannot run docker compose: {e}"),
         },
     }
+}
+
+/// The real command of an effect, for `plan` and `eject`. `None`: rizr does it itself (timers, prompts).
+pub fn render(stack: &Stack, op: &Op) -> Option<String> {
+    let base = |c: Command| {
+        std::iter::once(c.get_program())
+            .chain(c.get_args())
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    Some(match op {
+        Op::Import => format!("{} config --format json", base(stack.compose())),
+        Op::Start { node, .. } => format!(
+            "{} -f {} up -d --no-deps {}",
+            base(stack.compose()),
+            stack
+                .dir
+                .join(format!("override-{}.yml", node.name.0))
+                .display(),
+            node.name.0
+        ),
+        Op::Stop(node) => format!(
+            "{} rm --stop --force {}",
+            base(stack.compose()),
+            node.name.0
+        ),
+        Op::Subscribe => format!(
+            "docker events --filter label=rizr.project={} --filter label=rizr.instance={}",
+            stack.project.0, stack.instance.0
+        ),
+        Op::Observe => format!(
+            "docker ps -aq --filter label=rizr.project={}",
+            stack.project.0
+        ),
+        Op::Inspect(n) | Op::Probe(n) => format!("docker inspect <{} container>", n.name.0),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]

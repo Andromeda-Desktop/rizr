@@ -46,6 +46,19 @@ pub fn plan(s: &State) -> Vec<Effect> {
             return number(s, ops);
         }
     };
+    if s.sync == Sync::Synced && s.intents.target == Target::Keep {
+        // Observe only: one probe per running service shows whether it is ready; nothing starts or stops.
+        for (id, n) in &s.nodes {
+            let active = matches!(&n.spec, Some(sp) if matches!(&sp.kind, NodeKind::Service { probe } if probe.is_active()));
+            if n.machine == Machine::Service(Service::Starting(ProbeTurn::Due))
+                && active
+                && n.running
+                && !s.pending_for(id).any(|op| matches!(op, Op::Probe(_)))
+            {
+                ops.push((Op::Probe(id.clone()), "check readiness".into()));
+            }
+        }
+    }
     if s.sync != Sync::Synced || s.intents.target == Target::Keep {
         return number(s, ops);
     }

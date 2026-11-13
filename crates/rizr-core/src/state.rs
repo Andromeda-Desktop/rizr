@@ -455,6 +455,7 @@ fn runtime(s: &mut State, node: NodeId, spec: Digest, kind: RuntimeKind) {
 /// Loads an imported model: new nodes start fresh, changed specs move their nodes on, removed nodes lose
 /// their spec so `plan` stops them.
 fn load(s: &mut State, model: Model) {
+    let mut relabel = false;
     for (id, spec) in &model.nodes {
         let changed = match s.nodes.get_mut(id) {
             None => {
@@ -478,6 +479,8 @@ fn load(s: &mut State, model: Model) {
                 );
                 if !same_kind && !n.machine.is_waiting() {
                     n.machine = fresh(spec);
+                    // The snapshot was mapped without this node's kind; read it again with the model.
+                    relabel |= n.live.is_some();
                 }
                 n.spec = Some(spec.clone());
                 n.live.as_ref().is_some_and(|l| l != &spec.spec)
@@ -493,6 +496,9 @@ fn load(s: &mut State, model: Model) {
         }
     }
     s.model = ModelState::Loaded(model);
+    if relabel && s.sync == Sync::Synced {
+        s.sync = Sync::Subscribed;
+    }
 }
 
 /// Rebuilds every machine from what the runtime holds (SPEC-core section 4.4).

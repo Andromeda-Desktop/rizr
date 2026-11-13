@@ -81,14 +81,17 @@ pub fn inputs(root: &Path) -> Result<Inputs, Error> {
 /// Files a compose file pulls in: `include` and `extends.file` (compose, followed) and `env_file` (plain).
 /// A path with `$` needs interpolation, which runs only after trust; the compose text that holds it is hashed.
 fn refs(path: &Path, bytes: &[u8]) -> Result<Vec<(String, bool)>, Error> {
-    let doc: Value = serde_norway::from_slice(bytes).map_err(|e| {
-        Error::new(
-            ErrorCode::ImportFailed,
-            format!("{} is not valid YAML: {e}", path.display()),
-            "fix the compose file",
-            "rizr trust",
-        )
-    })?;
+    // `apply_merge` expands `<<: *anchor`: compose files often set `env_file` through one.
+    let doc: Value = serde_norway::from_slice(bytes)
+        .and_then(|mut v: Value| v.apply_merge().map(|()| v))
+        .map_err(|e| {
+            Error::new(
+                ErrorCode::ImportFailed,
+                format!("{} is not valid YAML: {e}", path.display()),
+                "fix the compose file",
+                "rizr trust",
+            )
+        })?;
     let mut out = Vec::new();
     for v in seq(doc.get("include")) {
         let p = v.get("path").unwrap_or(v);
@@ -276,7 +279,7 @@ mod tests {
         std::fs::create_dir(repo.path().join("sub")).unwrap();
         w(
             "compose.yml",
-            "include: [sub/inc.yml]\nservices:\n  a:\n    image: x\n    env_file: [a.env]\n",
+            "include: [sub/inc.yml]\nx-base: &base\n  env_file: [a.env]\nservices:\n  a:\n    <<: *base\n    image: x\n",
         );
         w(
             "sub/inc.yml",
