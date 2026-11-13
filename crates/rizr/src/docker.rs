@@ -553,7 +553,7 @@ impl Provider<'_> {
                 spec,
                 generation,
             } if node.scope == Scope::Project => {
-                let project = self.stack.project.0.clone();
+                let (project, tx) = (self.stack.project.0.clone(), self.tx.clone());
                 let pg = self
                     .pg
                     .lock()
@@ -567,8 +567,29 @@ impl Provider<'_> {
                                 .ok()
                                 .and_then(|v| v.into_iter().next())
                                 .filter(|c| c["State"]["Running"] == true);
+                            let same = running.as_ref().is_some_and(|c| {
+                                c["Config"]["Labels"]["rizr.spec"] == spec.0.as_str()
+                            });
+                            // Another instance started it while this one waited for the project lock: use it.
+                            // Its start event came before this start, so this instance replays what it missed.
+                            if let (true, Some(c)) = (same, &running) {
+                                let _ = tx.send(Msg::Event(synthetic(
+                                    node.clone(),
+                                    spec.clone(),
+                                    RuntimeKind::Start,
+                                )));
+                                if let Some(h) =
+                                    c["State"]["Health"]["Status"].as_str().and_then(health)
+                                {
+                                    let _ = tx.send(Msg::Event(synthetic(
+                                        node,
+                                        spec,
+                                        RuntimeKind::Health(h),
+                                    )));
+                                }
+                                Answer::Ok
                             // Other instances use a running server: never replace it under them.
-                            if let Some(c) = running {
+                            } else if let Some(c) = running {
                                 Answer::Err {
                                     tail: format!(
                                         "{name} runs {}, and other worktrees may use it; this one wants {} or other \

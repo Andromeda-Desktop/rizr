@@ -356,6 +356,15 @@ impl Db {
         if comment == IMPORTED || tables != "0" {
             return q("postgres", &mark).map(|_| false);
         }
+        // A volume that compose never made, or an empty bind, holds no old data; `docker run` would create it.
+        let present = if Path::new(&old.0).is_absolute() {
+            std::fs::read_dir(&old.0).is_ok_and(|mut d| d.next().is_some())
+        } else {
+            ok(Command::new("docker").args(["volume", "inspect", &old.0]))
+        };
+        if !present {
+            return q("postgres", &mark).map(|_| false);
+        }
         let tmp = format!("rizr-{project}-import-{instance}");
         let _ = Command::new("docker")
             .args(["rm", "--force", &tmp])
