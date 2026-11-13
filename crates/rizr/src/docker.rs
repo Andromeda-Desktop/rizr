@@ -128,6 +128,7 @@ pub fn run(stack: &Stack, inputs: Digest, action: Option<Action>) -> Result<Stat
         side: Arc::default(),
         host: Arc::default(),
         pg: Arc::default(),
+        dbs: Arc::default(),
         units: crate::supervisor::Units::of(stack),
         unit_events: None,
         project_lock: Arc::default(),
@@ -163,6 +164,8 @@ struct Provider<'a> {
     host: Arc<Mutex<BTreeMap<String, crate::manifest::HostService>>>,
     /// Shared postgres servers by node name.
     pg: Arc<Mutex<BTreeMap<String, crate::postgres::Server>>>,
+    /// This instance's databases on shared servers, by compose service name.
+    dbs: Arc<Mutex<BTreeMap<String, crate::postgres::Db>>>,
     units: crate::supervisor::Units,
     unit_events: Option<Child>,
     /// Held while this instance changes a node that all instances share; the OS frees it if rizr dies.
@@ -280,10 +283,33 @@ impl Provider<'_> {
                     self.stack.instance.clone(),
                 );
                 let units = self.units.clone();
+                let (dbs, project) = (
+                    self.dbs.lock().map(|d| d.clone()).unwrap_or_default(),
+                    self.stack.project.0.clone(),
+                );
                 std::thread::spawn(move || {
                     done(
                         match observe(&labels, &instance, &current).and_then(|mut w| {
                             w.seen.extend(crate::supervisor::observe(&units)?);
+                            // A shared database is up while its server answers to the service name; a
+                            // container of the same name is the compose service from before the switch.
+                            for (svc, db) in &dbs {
+                                w.seen.retain(|x| {
+                                    x.node.name.0 != *svc || x.node.scope == Scope::Project
+                                });
+                                let server = inspect_one(&db.shared.server.container(&project));
+                                if server.is_ok_and(|s| db.attached(&s, svc)) {
+                                    w.seen.push(Seen {
+                                        node: NodeId {
+                                            scope: Scope::Instance(instance.clone()),
+                                            name: NodeName(svc.clone()),
+                                        },
+                                        spec: db.spec.clone(),
+                                        generation: Gen(0),
+                                        status: Status::Running { health: None },
+                                    });
+                                }
+                            }
                             Ok(w)
                         }) {
                             Ok(w) => Answer::Observed(w),
@@ -301,7 +327,7 @@ impl Provider<'_> {
                     st.instance.clone(),
                     self.side.clone(),
                 );
-                let (host, pg) = (self.host.clone(), self.pg.clone());
+                let (host, pg, dbs) = (self.host.clone(), self.pg.clone(), self.dbs.clone());
                 let inputs = match &s.trust {
                     rizr_core::state::Trust::Trusted(d) => d.clone(),
                     _ => Digest(String::new()),
@@ -309,9 +335,12 @@ impl Provider<'_> {
                 std::thread::spawn(move || {
                     done(
                         match import(&root, &files, &name, &dir, &instance, inputs) {
-                            Ok((m, imported, services, servers)) => {
+                            Ok((m, imported, services, (servers, databases))) => {
                                 if let Ok(mut r) = pg.lock() {
                                     *r = servers;
+                                }
+                                if let Ok(mut r) = dbs.lock() {
+                                    *r = databases;
                                 }
                                 if let Ok(mut r) = side.lock() {
                                     *r = imported;
@@ -431,6 +460,25 @@ impl Provider<'_> {
                     })
                 });
             }
+            Op::Start { node, spec, .. } if self.db(&node).is_some() => {
+                let db = self.db(&node);
+                let (project, tx) = (self.stack.project.0.clone(), self.tx.clone());
+                let mut old = self.stack.compose();
+                old.args(["rm", "--stop", "--force"]).arg(&node.name.0);
+                std::thread::spawn(move || {
+                    let r = db.ok_or_else(String::new).and_then(|db| {
+                        let _ = old.output();
+                        db.attach(&project, &node.name.0)
+                    });
+                    if r.is_ok() {
+                        let _ = tx.send(Msg::Event(synthetic(node, spec, RuntimeKind::Start)));
+                    }
+                    done(match r {
+                        Ok(()) => Answer::Ok,
+                        Err(tail) => Answer::Err { tail },
+                    });
+                });
+            }
             Op::Start {
                 node,
                 spec,
@@ -501,6 +549,28 @@ impl Provider<'_> {
                 let cmd = crate::supervisor::stop(&self.units, &node.name.0);
                 std::thread::spawn(move || done(exec(cmd)));
             }
+            Op::Stop(node) if self.db(&node).is_some() => {
+                let (db, project, tx) = (
+                    self.db(&node),
+                    self.stack.project.0.clone(),
+                    self.tx.clone(),
+                );
+                let spec = s
+                    .nodes
+                    .get(&node)
+                    .and_then(|n| n.live.clone())
+                    .unwrap_or(Digest(String::new()));
+                std::thread::spawn(move || {
+                    let r = db.map_or(Ok(()), |db| db.detach(&project));
+                    if r.is_ok() {
+                        let _ = tx.send(Msg::Event(synthetic(node, spec, RuntimeKind::Destroy)));
+                    }
+                    done(match r {
+                        Ok(()) => Answer::Ok,
+                        Err(tail) => Answer::Err { tail },
+                    });
+                });
+            }
             Op::Stop(node) if node.scope == Scope::Project => {
                 let mut cmd = Command::new("docker");
                 cmd.args(["rm", "--force"])
@@ -513,6 +583,14 @@ impl Provider<'_> {
                 std::thread::spawn(move || done(exec(cmd)));
             }
         }
+    }
+
+    /// The shared database behind an instance node, when the node is one.
+    fn db(&self, node: &NodeId) -> Option<crate::postgres::Db> {
+        if node.scope == Scope::Project {
+            return None;
+        }
+        self.dbs.lock().ok()?.get(&node.name.0).cloned()
     }
 
     fn is_host(&self, node: &NodeName) -> bool {
@@ -746,6 +824,26 @@ fn observe(labels: &[String], instance: &InstanceId, current: &Current) -> Resul
     Ok(World { at, seen })
 }
 
+/// The runtime event of a node that has no container of its own.
+fn synthetic(node: NodeId, spec: Digest, kind: RuntimeKind) -> Event {
+    let at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    Event::Runtime {
+        node,
+        spec,
+        kind,
+        at,
+    }
+}
+
+pub fn inspect_one(name: &str) -> Result<Value, String> {
+    inspect(&[name.to_owned()])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no container {name}"))
+}
+
 fn inspect(ids: &[String]) -> Result<Vec<Value>, String> {
     let out = Command::new("docker")
         .arg("inspect")
@@ -829,7 +927,13 @@ pub fn shared_container(stack: &Stack, node: &str) -> Option<String> {
 }
 
 /// The real command of an effect, for `plan` and `eject`. `None`: rizr does it itself (timers, prompts).
-pub fn render(stack: &Stack, op: &Op) -> Option<String> {
+pub fn render(stack: &Stack, s: &State, op: &Op) -> Option<String> {
+    let db = |n: &NodeId| {
+        n.scope != Scope::Project
+            && s.loaded()
+                .and_then(|m| m.nodes.get(n))
+                .is_some_and(|x| x.provider.0 == crate::postgres::PROVIDER)
+    };
     let base = |c: Command| {
         std::iter::once(c.get_program())
             .chain(c.get_args())
@@ -839,6 +943,14 @@ pub fn render(stack: &Stack, op: &Op) -> Option<String> {
     };
     Some(match op {
         Op::Import => format!("{} config --format json", base(stack.compose())),
+        Op::Start { node, .. } if db(node) => format!(
+            "docker exec <server> createdb <database>; docker network connect --alias {} <network> <server>",
+            node.name.0
+        ),
+        Op::Stop(node) if db(node) => format!(
+            "docker network disconnect <network> <server> ({})",
+            node.name.0
+        ),
         Op::Start { node, .. } if node.scope == Scope::Project => format!(
             "docker run -d --name rizr-{0}-{1} --volume rizr-{0}-{1}:<data> --publish 127.0.0.1::5432 <image>",
             stack.project.0, node.name.0
@@ -887,7 +999,7 @@ fn import(
         rizr_core::model::Model,
         BTreeMap<String, compose::Side>,
         BTreeMap<String, crate::manifest::HostService>,
-        BTreeMap<String, crate::postgres::Server>,
+        crate::postgres::Resources,
     ),
     String,
 > {
@@ -905,7 +1017,7 @@ fn import(
             compose::import(root, files, name, dir, instance, inputs)?
         };
     let host = crate::manifest::merge(root, instance, &mut m)?;
-    let pg = crate::postgres::add(&mut m, &side, &crate::manifest::unshared(root))?;
+    let pg = crate::postgres::add(&mut m, &side, &crate::manifest::unshared(root), instance)?;
     if let Some(n) = compose::cycle(&m) {
         return Err(format!("dependency cycle through `{}`", n.name.0));
     }

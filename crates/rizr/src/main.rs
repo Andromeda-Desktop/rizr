@@ -203,7 +203,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             );
             let steps: Vec<_> = plan(&s)
                 .into_iter()
-                .map(|e| json!({"reason": e.reason, "command": docker::render(&stack, &e.op)}))
+                .map(|e| json!({"reason": e.reason, "command": docker::render(&stack, &s, &e.op)}))
                 .collect();
             let drift = view::drift(&s);
             if json {
