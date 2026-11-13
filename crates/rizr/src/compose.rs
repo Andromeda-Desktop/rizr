@@ -184,9 +184,16 @@ pub fn model(config: &Value, instance: &InstanceId, inputs: Digest) -> Result<Mo
                 },
             })
             .collect();
+        // A service that compose must never restart runs once: a setup step that nothing waits on (frappe
+        // create-site). It runs once per data set, not on every `up`.
+        let once = svc["deploy"]["restart_policy"]["condition"] == "none" || svc["restart"] == "no";
         let kind = if jobs.contains(name.as_str()) {
             NodeKind::Job {
                 kind: JobKind::Migrate,
+            }
+        } else if once {
+            NodeKind::Job {
+                kind: JobKind::Seed,
             }
         } else {
             NodeKind::Service { probe: probe(svc) }
@@ -315,6 +322,7 @@ mod tests {
         let config = serde_json::json!({"services": {
             "db": {"healthcheck": {"test": ["CMD", "true"]}, "ports": [{"target": 5432, "protocol": "tcp"}]},
             "cache": {"expose": ["6379/tcp"]},
+            "create-site": {"deploy": {"restart_policy": {"condition": "none"}}},
             "migrate": {"depends_on": {"db": {"condition": "service_healthy"}}},
             "api": {"depends_on": {
                 "migrate": {"condition": "service_completed_successfully"},
@@ -338,6 +346,12 @@ mod tests {
             get("migrate").kind,
             NodeKind::Job {
                 kind: JobKind::Migrate
+            }
+        );
+        assert_eq!(
+            get("create-site").kind,
+            NodeKind::Job {
+                kind: JobKind::Seed
             }
         );
         let gates: Vec<_> = get("api")
