@@ -11,6 +11,7 @@ use serde_json::json;
 mod compose;
 mod devenv;
 mod docker;
+mod exec;
 mod ports;
 mod trust;
 
@@ -53,6 +54,14 @@ enum Command {
         #[arg(long, default_value = "rizr-eject")]
         out: PathBuf,
     },
+    /// Run a one-off command in a running node, such as a migration. Returns within 100 s; a longer command keeps running.
+    Exec {
+        node: String,
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
+    /// Wait up to 100 s more for the last `exec` (or the given job) and print its new output and exit code.
+    Wait { job: Option<String> },
     /// Print the JSON Schema of the API: actions, errors, receipt and drift.
     Schema,
 }
@@ -131,9 +140,18 @@ fn run(cli: Cli) -> Result<(), Error> {
                     u["log_tail"] = log_tail(&stack, &node, since).into();
                 }
             }
+            let failed = urls
+                .iter()
+                .find(|u| u["check"].as_str().is_some_and(|c| c.starts_with("HTTP 5")))
+                .map(server_error);
             if json && up {
                 let mut r = serde_json::to_value(view::receipt(&s)).unwrap_or_default();
                 r["urls"] = urls.into();
+                if let Some(e) = &failed {
+                    r["error"] = serde_json::to_value(e).unwrap_or_default();
+                    println!("{r}");
+                    std::process::exit(e.code.class().exit_code().into());
+                }
                 println!("{r}");
             } else {
                 print_status(&stack, &s);
@@ -149,8 +167,10 @@ fn run(cli: Cli) -> Result<(), Error> {
                     }
                 }
             }
-            Ok(())
+            failed.map_or(Ok(()), Err)
         }
+        Command::Exec { node, cmd } => exec::start(&stack, &node, &cmd),
+        Command::Wait { job } => exec::wait(&stack, job.as_deref()),
         Command::Plan => {
             let s = docker::run(&stack, i.digest, None)?;
             let s = reduce(
@@ -275,6 +295,55 @@ fn run(cli: Cli) -> Result<(), Error> {
             eject(&stack, &s, &out)
         }
     }
+}
+
+/// A node that answers HTTP 5xx; a missing table in its log means the schema was never migrated.
+fn server_error(u: &serde_json::Value) -> Error {
+    let node = u["node"].as_str().unwrap_or_default();
+    let message = format!(
+        "{node} {} -> {}",
+        u["url"].as_str().unwrap_or_default(),
+        u["check"].as_str().unwrap_or_default()
+    );
+    let log = u["log_tail"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let unmigrated = [
+        "does not exist",
+        "no such table",
+        "doesn't exist",
+        "undefinedtable",
+        "unapplied migration",
+        "pending migration",
+    ]
+    .iter()
+    .any(|p| log.contains(p));
+    if !unmigrated {
+        return Error::new(
+            ErrorCode::Unhealthy,
+            message,
+            format!("{node} runs but answers with a server error; its log shows why"),
+            format!("rizr logs {node}"),
+        );
+    }
+    let migrate = if log.contains("django") {
+        "python3 manage.py migrate"
+    } else if log.contains("activerecord") {
+        "bin/rails db:migrate"
+    } else if log.contains("sqlalchemy") || log.contains("alembic") {
+        "alembic upgrade head"
+    } else {
+        "<the migrate command from the README>"
+    };
+    Error::new(
+        ErrorCode::Unhealthy,
+        message,
+        format!(
+            "{node} runs, but its database has no tables: run the app's migration once, then `rizr up` again"
+        ),
+        format!("rizr exec {node} -- {migrate}"),
+    )
 }
 
 /// For a URL check that failed: the log lines of `node` since `since` (unix seconds), else its last lines; at

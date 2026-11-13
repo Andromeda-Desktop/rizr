@@ -26,6 +26,8 @@ pub enum ErrorCode {
     /// A node shares no network with a node it depends on: it can never reach it.
     Unreachable,
     NotBuilt,
+    /// An `exec` job outlived the call's wait; `rizr wait` picks it up.
+    StillRunning,
 }
 
 /// Exit code classes: an agent can branch on the class without parsing the message.
@@ -55,7 +57,8 @@ impl ErrorCode {
             | ErrorCode::JobFailed
             | ErrorCode::Unhealthy
             | ErrorCode::DependencyFailed
-            | ErrorCode::Unreachable => ErrorClass::NotReady,
+            | ErrorCode::Unreachable
+            | ErrorCode::StillRunning => ErrorClass::NotReady,
             ErrorCode::NotBuilt => ErrorClass::NotBuilt,
         }
     }
