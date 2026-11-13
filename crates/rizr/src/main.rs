@@ -123,6 +123,14 @@ fn run(cli: Cli) -> Result<(), Error> {
         Command::Action(action) => {
             let up = matches!(action, Action::Up { .. });
             let down = matches!(action, Action::Down);
+            let _lock = stack.lock().map_err(|e| {
+                Error::new(
+                    ErrorCode::RuntimeUnavailable,
+                    format!("cannot lock instance {}: {e}", stack.instance.0),
+                    "rizr keeps a lock file in its data directory; check that it is writable",
+                    format!("ls -l {}", stack.dir.display()),
+                )
+            })?;
             let s = docker::run(&stack, i.digest, Some(action))?;
             if down {
                 exec::remove(&stack, true);

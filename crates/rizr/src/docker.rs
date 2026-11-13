@@ -42,24 +42,33 @@ pub struct Stack {
 }
 
 impl Stack {
+    /// The project is the repo, shared by all its git worktrees; the instance is `main` for the main worktree,
+    /// else the worktree's directory name.
     pub fn new(root: PathBuf, files: Vec<PathBuf>, data: &Path) -> Self {
-        let name: String = root
-            .file_name()
-            .map(|n| n.to_string_lossy().to_lowercase())
-            .unwrap_or_default()
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        let project = ProjectId(if name.is_empty() { "root".into() } else { name });
-        let instance = InstanceId("main".into());
+        let slug = |p: &Path| -> String {
+            let s: String = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default()
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            if s.is_empty() { "root".into() } else { s }
+        };
+        let main = main_worktree(&root);
+        let project = ProjectId(slug(main.as_deref().unwrap_or(&root)));
+        let instance = InstanceId(main.as_ref().map_or("main".into(), |_| slug(&root)));
         let dir = data.join(format!("{}-{}", project.0, instance.0));
-        let compose_name = compose::default_name(&root, &files);
+        let compose_name = match &main {
+            None => compose::default_name(&root, &files),
+            Some(m) => format!("{}-{}", compose::default_name(m, &files), instance.0),
+        };
         Self {
             root,
             files,
@@ -70,7 +79,17 @@ impl Stack {
         }
     }
 
-    /// The compose project name: the one plain `docker compose` uses in this repo, so its volumes carry over.
+    /// Hold this instance's lock until the file drops: one mutating rizr call per instance at a time. The OS
+    /// releases it when the process dies, so a kill -9 leaves no stale lock.
+    pub fn lock(&self) -> std::io::Result<std::fs::File> {
+        std::fs::create_dir_all(&self.dir)?;
+        let f = std::fs::File::create(self.dir.join("lock"))?;
+        f.lock()?;
+        Ok(f)
+    }
+
+    /// The compose project name: the one plain `docker compose` uses in the main worktree, so its volumes carry
+    /// over; `<that>-<instance>` in another worktree.
     pub fn compose_name(&self) -> String {
         self.compose_name.clone()
     }
@@ -78,6 +97,17 @@ impl Stack {
     pub fn compose(&self) -> Command {
         compose::command(&self.root, &self.files, &self.compose_name(), &self.dir)
     }
+}
+
+/// For a linked git worktree, the main worktree's root. Reads only the `.git` file and `commondir`: no git call,
+/// so it is safe before trust.
+fn main_worktree(root: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(root.join(".git")).ok()?;
+    let gitdir = root.join(text.strip_prefix("gitdir:")?.trim());
+    let common = std::fs::read_to_string(gitdir.join("commondir"))
+        .map_or_else(|_| gitdir.join("../.."), |c| gitdir.join(c.trim()));
+    let common = common.canonicalize().ok()?;
+    (common.file_name()? == ".git").then(|| common.parent().map(Path::to_path_buf))?
 }
 
 /// Run one action to its outcome. The caller has passed the trust gate.
