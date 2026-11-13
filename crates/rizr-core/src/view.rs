@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, ErrorCode};
 use crate::event::Wait;
 use crate::machine::{Failure, Job, Machine, Service, failure_label};
-use crate::model::{Gate, NodeId, NodeKind, NodeName, Probe};
+use crate::model::{Gate, NodeId, NodeKind, NodeName, Probe, Scope};
 use crate::plan::{gate_holds, plan};
 use crate::state::{ModelState, State, Sync, Target, Trust};
 
@@ -106,7 +106,12 @@ pub fn outcome(s: &State) -> Option<Result<(), Error>> {
     if !s.trusted() || s.sync != Sync::Synced || s.loaded().is_none() || !s.pending.is_empty() {
         return None;
     }
-    let quiet = plan(s).is_empty() && !s.nodes.values().any(|n| n.machine.is_waiting());
+    // `down` leaves shared project nodes as they are, so it does not wait for them.
+    let quiet = plan(s).is_empty()
+        && !s.nodes.iter().any(|(id, n)| {
+            n.machine.is_waiting()
+                && (s.intents.target != Target::Down || id.scope != Scope::Project)
+        });
     match s.intents.target {
         Target::Keep => Some(Ok(())),
         Target::Down => quiet.then_some(Ok(())),

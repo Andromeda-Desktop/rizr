@@ -58,15 +58,21 @@ pub fn check(s: &State, planned: &[Effect]) -> Result<(), String> {
         }
     }
 
-    // 6. Quiet: an exited loop leaves no pending effect and no deadline.
+    // 6. Quiet: an exited loop leaves no pending effect and no deadline. `down` leaves a shared project node
+    // as it is, with its deadline: the next `up` of any instance drives it.
+    let deadlines = s
+        .deadlines
+        .values()
+        .filter(|d| s.intents.target != Target::Down || d.node.scope != Scope::Project)
+        .count();
     if planned.is_empty()
         && matches!(outcome(s), Some(Ok(())))
-        && (!s.pending.is_empty() || !s.deadlines.is_empty())
+        && (!s.pending.is_empty() || deadlines > 0)
     {
         return Err(format!(
             "6: quiet with {} pending and {} deadlines",
             s.pending.len(),
-            s.deadlines.len()
+            deadlines
         ));
     }
 

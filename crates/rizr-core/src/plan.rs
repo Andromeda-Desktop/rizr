@@ -177,7 +177,9 @@ pub fn plan(s: &State) -> Vec<Effect> {
                 )
                 | Machine::Job(Job::Running | Job::Done(_) | Job::Failed(_)),
                 false,
-            ) if s.intents.target == Target::Down || n.spec.is_none() => {
+            ) if id.scope != Scope::Project
+                && (s.intents.target == Target::Down || n.spec.is_none()) =>
+            {
                 let why = if n.spec.is_none() {
                     "no longer in the model"
                 } else {
@@ -187,7 +189,9 @@ pub fn plan(s: &State) -> Vec<Effect> {
             }
             // `live` holds the spec of a container that may remain: an exited job of an older generation.
             (Machine::Service(Service::Absent) | Machine::Job(Job::Pending), false)
-                if n.live.is_some() && (s.intents.target == Target::Down || n.spec.is_none()) =>
+                if id.scope != Scope::Project
+                    && n.live.is_some()
+                    && (s.intents.target == Target::Down || n.spec.is_none()) =>
             {
                 start_stop(
                     Op::Stop(id.clone()),

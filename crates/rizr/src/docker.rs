@@ -129,6 +129,7 @@ pub fn run(stack: &Stack, inputs: Digest, action: Option<Action>) -> Result<Stat
         host: Arc::default(),
         units: crate::supervisor::Units::of(stack),
         unit_events: None,
+        project_lock: Arc::default(),
     };
     let mut s = State::new(stack.project.clone(), stack.instance.clone(), generation);
     s = reduce(
@@ -161,6 +162,8 @@ struct Provider<'a> {
     host: Arc<Mutex<BTreeMap<String, crate::manifest::HostService>>>,
     units: crate::supervisor::Units,
     unit_events: Option<Child>,
+    /// Held while this instance changes a node that all instances share; the OS frees it if rizr dies.
+    project_lock: Arc<Mutex<Option<std::fs::File>>>,
 }
 
 impl Drop for Provider<'_> {
@@ -228,10 +231,33 @@ impl Provider<'_> {
         };
         let st = self.stack;
         match op {
-            Op::AcquireProjectLock => done(Answer::Err {
-                tail: "project-scope nodes come in D1".into(),
-            }),
-            Op::ReleaseProjectLock => {}
+            Op::AcquireProjectLock => {
+                let (held, path) = (
+                    self.project_lock.clone(),
+                    st.dir
+                        .with_file_name(format!("{}.project.lock", st.project.0)),
+                );
+                std::thread::spawn(move || {
+                    let f = std::fs::File::create(&path).and_then(|f| f.lock().map(|()| f));
+                    match (f, held.lock()) {
+                        (Ok(f), Ok(mut h)) => {
+                            *h = Some(f);
+                            done(Answer::Ok);
+                        }
+                        (Err(e), _) => done(Answer::Err {
+                            tail: format!("{}: {e}", path.display()),
+                        }),
+                        (_, Err(e)) => done(Answer::Err {
+                            tail: e.to_string(),
+                        }),
+                    }
+                });
+            }
+            Op::ReleaseProjectLock => {
+                if let Ok(mut h) = self.project_lock.lock() {
+                    *h = None;
+                }
+            }
             Op::SetDeadline { after_ms, .. } => {
                 self.deadlines
                     .insert(id, Instant::now() + Duration::from_millis(after_ms));
@@ -245,11 +271,15 @@ impl Provider<'_> {
                 Err(tail) => Answer::Err { tail },
             }),
             Op::Observe => {
-                let (labels, current) = (self.labels(), self.current.clone());
+                let (labels, current, instance) = (
+                    self.labels(),
+                    self.current.clone(),
+                    self.stack.instance.clone(),
+                );
                 let units = self.units.clone();
                 std::thread::spawn(move || {
                     done(
-                        match observe(&labels, &current).and_then(|mut w| {
+                        match observe(&labels, &instance, &current).and_then(|mut w| {
                             w.seen.extend(crate::supervisor::observe(&units)?);
                             Ok(w)
                         }) {
@@ -433,11 +463,10 @@ impl Provider<'_> {
         self.host.lock().is_ok_and(|h| h.contains_key(&node.0))
     }
 
-    fn labels(&self) -> [String; 2] {
-        [
-            format!("rizr.project={}", self.stack.project.0),
-            format!("rizr.instance={}", self.stack.instance.0),
-        ]
+    /// Docker filters AND their labels, so the filter is the project; `scope_of` keeps this instance's
+    /// containers and the shared ones.
+    fn labels(&self) -> [String; 1] {
+        [format!("rizr.project={}", self.stack.project.0)]
     }
 
     fn container(&self, node: &NodeName) -> Option<String> {
@@ -535,6 +564,7 @@ fn runtime_event(line: &str, instance: &InstanceId, current: &Current) -> Option
     let v: Value = serde_json::from_str(line).ok()?;
     let attrs = &v["Actor"]["Attributes"];
     let (cid, node) = (v["Actor"]["ID"].as_str()?, attrs["rizr.node"].as_str()?);
+    let scope = scope_of(attrs, instance)?;
     let action = v["Action"].as_str()?;
     let kind = match action {
         "start" => RuntimeKind::Start,
@@ -554,7 +584,10 @@ fn runtime_event(line: &str, instance: &InstanceId, current: &Current) -> Option
         return None;
     }
     Some(Event::Runtime {
-        node: node_id(instance, node),
+        node: NodeId {
+            scope,
+            name: NodeName(node.into()),
+        },
         spec: Digest(attrs["rizr.spec"].as_str()?.into()),
         kind,
         at: v["timeNano"].as_u64()?,
@@ -570,14 +603,18 @@ fn health(s: &str) -> Option<Health> {
     }
 }
 
-fn node_id(instance: &InstanceId, name: &str) -> NodeId {
-    NodeId {
-        scope: Scope::Instance(instance.clone()),
-        name: NodeName(name.into()),
+/// The scope of a container from its labels: shared by the project, this instance's, or another instance's (None).
+fn scope_of(labels: &Value, instance: &InstanceId) -> Option<Scope> {
+    if labels["rizr.scope"] == "project" {
+        Some(Scope::Project)
+    } else if labels["rizr.instance"] == instance.0.as_str() {
+        Some(Scope::Instance(instance.clone()))
+    } else {
+        None
     }
 }
 
-fn observe(labels: &[String; 2], current: &Current) -> Result<World, String> {
+fn observe(labels: &[String], instance: &InstanceId, current: &Current) -> Result<World, String> {
     // Events at or before `at` are in this snapshot; the core replays only later ones.
     let at = u64::try_from(
         SystemTime::now()
@@ -610,9 +647,9 @@ fn observe(labels: &[String; 2], current: &Current) -> Result<World, String> {
     let mut cur = current.lock().map_err(|e| e.to_string())?;
     for c in &containers {
         let l = &c["Config"]["Labels"];
-        let (Some(node), Some(inst), Some(spec)) = (
+        let (Some(node), Some(scope), Some(spec)) = (
             l["rizr.node"].as_str(),
-            l["rizr.instance"].as_str(),
+            scope_of(l, instance),
             l["rizr.spec"].as_str(),
         ) else {
             continue;
@@ -638,7 +675,10 @@ fn observe(labels: &[String; 2], current: &Current) -> Result<World, String> {
             cur.insert(node.into(), id.into());
         }
         seen.push(Seen {
-            node: node_id(&InstanceId(inst.into()), node),
+            node: NodeId {
+                scope,
+                name: NodeName(node.into()),
+            },
             spec: Digest(spec.into()),
             generation: Gen(l["rizr.gen"]
                 .as_str()
@@ -744,8 +784,8 @@ pub fn render(stack: &Stack, op: &Op) -> Option<String> {
             node.name.0
         ),
         Op::Subscribe => format!(
-            "docker events --filter label=rizr.project={} --filter label=rizr.instance={}",
-            stack.project.0, stack.instance.0
+            "docker events --filter label=rizr.project={}",
+            stack.project.0
         ),
         Op::Observe => format!(
             "docker ps -aq --filter label=rizr.project={}",
@@ -804,7 +844,8 @@ mod tests {
         let inst = InstanceId("main".into());
         let ev = |action: &str, id: &str| {
             json!({"Action": action, "Actor": {"ID": id, "Attributes":
-                {"rizr.node": "db", "rizr.spec": "s", "exitCode": "1"}}, "timeNano": 5})
+                {"rizr.node": "db", "rizr.instance": "main", "rizr.spec": "s", "exitCode": "1"}},
+                "timeNano": 5})
             .to_string()
         };
         current.lock().unwrap().insert("db".into(), "old".into());

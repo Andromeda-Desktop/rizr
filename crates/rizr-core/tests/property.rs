@@ -441,7 +441,11 @@ fn converge(mut s: State, fake: &mut Fake) -> Result<usize, String> {
             if result.is_ok() && s.intents.target == Target::Up {
                 consistent(&s, fake)?;
             }
-            if result.is_ok() && s.intents.target == Target::Down && !fake.containers.is_empty() {
+            // Shared project nodes outlive one instance's `down`; gc stops them.
+            if result.is_ok()
+                && s.intents.target == Target::Down
+                && fake.containers.keys().any(|id| id.scope != Scope::Project)
+            {
                 return Err(format!(
                     "down left containers: {:?}",
                     fake.containers.keys()
