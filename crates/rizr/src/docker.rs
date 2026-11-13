@@ -127,6 +127,7 @@ pub fn run(stack: &Stack, inputs: Digest, action: Option<Action>) -> Result<Stat
         deadlines: BTreeMap::new(),
         side: Arc::default(),
         host: Arc::default(),
+        pg: Arc::default(),
         units: crate::supervisor::Units::of(stack),
         unit_events: None,
         project_lock: Arc::default(),
@@ -160,6 +161,8 @@ struct Provider<'a> {
     side: Arc<Mutex<BTreeMap<String, compose::Side>>>,
     /// Host-process services from `rizr.toml`, run by the supervisor.
     host: Arc<Mutex<BTreeMap<String, crate::manifest::HostService>>>,
+    /// Shared postgres servers by node name.
+    pg: Arc<Mutex<BTreeMap<String, crate::postgres::Server>>>,
     units: crate::supervisor::Units,
     unit_events: Option<Child>,
     /// Held while this instance changes a node that all instances share; the OS frees it if rizr dies.
@@ -298,7 +301,7 @@ impl Provider<'_> {
                     st.instance.clone(),
                     self.side.clone(),
                 );
-                let host = self.host.clone();
+                let (host, pg) = (self.host.clone(), self.pg.clone());
                 let inputs = match &s.trust {
                     rizr_core::state::Trust::Trusted(d) => d.clone(),
                     _ => Digest(String::new()),
@@ -306,7 +309,10 @@ impl Provider<'_> {
                 std::thread::spawn(move || {
                     done(
                         match import(&root, &files, &name, &dir, &instance, inputs) {
-                            Ok((m, imported, services)) => {
+                            Ok((m, imported, services, servers)) => {
+                                if let Ok(mut r) = pg.lock() {
+                                    *r = servers;
+                                }
                                 if let Ok(mut r) = side.lock() {
                                     *r = imported;
                                 }
@@ -429,6 +435,32 @@ impl Provider<'_> {
                 node,
                 spec,
                 generation,
+            } if node.scope == Scope::Project => {
+                let project = self.stack.project.0.clone();
+                let pg = self
+                    .pg
+                    .lock()
+                    .ok()
+                    .and_then(|p| p.get(&node.name.0).cloned());
+                std::thread::spawn(move || {
+                    done(match pg {
+                        Some(pg) => {
+                            // A changed spec replaces the container; the data volume stays.
+                            let _ = Command::new("docker")
+                                .args(["rm", "--force", &pg.container(&project)])
+                                .output();
+                            exec(pg.run(&project, &spec, generation.0))
+                        }
+                        None => Answer::Err {
+                            tail: format!("{} is not a shared server of this project", node.name.0),
+                        },
+                    })
+                });
+            }
+            Op::Start {
+                node,
+                spec,
+                generation,
             } => {
                 if let Ok(mut c) = self.current.lock() {
                     c.remove(&node.name.0);
@@ -449,6 +481,12 @@ impl Provider<'_> {
             }
             Op::Stop(node) if self.is_host(&node.name) => {
                 let cmd = crate::supervisor::stop(&self.units, &node.name.0);
+                std::thread::spawn(move || done(exec(cmd)));
+            }
+            Op::Stop(node) if node.scope == Scope::Project => {
+                let mut cmd = Command::new("docker");
+                cmd.args(["rm", "--force"])
+                    .arg(format!("rizr-{}-{}", self.stack.project.0, node.name.0));
                 std::thread::spawn(move || done(exec(cmd)));
             }
             Op::Stop(node) => {
@@ -769,6 +807,13 @@ pub fn render(stack: &Stack, op: &Op) -> Option<String> {
     };
     Some(match op {
         Op::Import => format!("{} config --format json", base(stack.compose())),
+        Op::Start { node, .. } if node.scope == Scope::Project => format!(
+            "docker run -d --name rizr-{0}-{1} --volume rizr-{0}-{1}:<data> --publish 127.0.0.1::5432 <image>",
+            stack.project.0, node.name.0
+        ),
+        Op::Stop(node) if node.scope == Scope::Project => {
+            format!("docker rm --force rizr-{}-{}", stack.project.0, node.name.0)
+        }
         Op::Start { node, .. } => format!(
             "{} -f {} up -d --no-deps {}",
             base(stack.compose()),
@@ -810,6 +855,7 @@ fn import(
         rizr_core::model::Model,
         BTreeMap<String, compose::Side>,
         BTreeMap<String, crate::manifest::HostService>,
+        BTreeMap<String, crate::postgres::Server>,
     ),
     String,
 > {
@@ -827,10 +873,11 @@ fn import(
             compose::import(root, files, name, dir, instance, inputs)?
         };
     let host = crate::manifest::merge(root, instance, &mut m)?;
+    let pg = crate::postgres::add(&mut m, &side, &crate::manifest::unshared(root))?;
     if let Some(n) = compose::cycle(&m) {
         return Err(format!("dependency cycle through `{}`", n.name.0));
     }
-    Ok((m, side, host))
+    Ok((m, side, host, pg))
 }
 
 #[cfg(test)]

@@ -22,6 +22,15 @@ struct Manifest {
     /// Readiness of compose services: `[ready] web = { log = "Listening on" }`.
     #[serde(default)]
     ready: BTreeMap<String, ComposeReady>,
+    /// Shared resources: `[resource.db] shared = false` keeps a compose postgres service its own container.
+    #[serde(default)]
+    resource: BTreeMap<String, Resource>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Resource {
+    shared: bool,
 }
 
 #[derive(Deserialize)]
@@ -115,6 +124,11 @@ pub fn merge(
             }
         }
     }
+    if let Some(name) = man.resource.keys().find(|n| !m.nodes.contains_key(&id(n))) {
+        return Err(format!(
+            "rizr.toml: [resource] `{name}` is not a compose service"
+        ));
+    }
     for (name, svc) in &man.service {
         let probe = match &svc.ready {
             Some(Ready { tcp: Some(p), .. }) => Probe::Tcp { ports: vec![*p] },
@@ -158,6 +172,21 @@ pub fn merge(
         );
     }
     Ok(man.service)
+}
+
+/// Compose services that `rizr.toml` keeps out of the shared servers; empty when it is absent or does not parse.
+pub fn unshared(root: &Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_to_string(root.join("rizr.toml"))
+        .ok()
+        .and_then(|t| toml::from_str::<Manifest>(&t).ok())
+        .map(|m| {
+            m.resource
+                .into_iter()
+                .filter(|(_, r)| !r.shared)
+                .map(|(n, _)| n)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Names of the host services in `<root>/rizr.toml`; empty when it is absent or does not parse.

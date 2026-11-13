@@ -14,6 +14,7 @@ mod docker;
 mod exec;
 mod manifest;
 mod ports;
+mod postgres;
 mod supervisor;
 mod trust;
 

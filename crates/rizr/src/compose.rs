@@ -123,6 +123,7 @@ pub fn import(
             let side = Side {
                 restart: !s["restart"].is_null(),
                 ports: s["ports"].as_array().cloned().unwrap_or_default(),
+                pg: crate::postgres::detect(s),
             };
             (n.clone(), side)
         })
@@ -137,6 +138,8 @@ pub struct Side {
     pub restart: bool,
     /// The resolved `ports` list, for taken-port remaps.
     pub ports: Vec<Value>,
+    /// The shared server this service can move to, before `rizr.toml` opts it out.
+    pub pg: Option<crate::postgres::Server>,
 }
 
 /// A dependency that is not a finished job must share a network with its dependent, or its name never resolves.
