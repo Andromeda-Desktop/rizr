@@ -214,7 +214,7 @@ pub fn signal(kind: Option<&NodeKind>) -> String {
     match kind {
         Some(NodeKind::Service { probe }) => match probe {
             Probe::HealthEvent => "healthcheck".into(),
-            Probe::LogLine { pattern } => format!("log line /{pattern}/"),
+            Probe::LogLine { pattern } => format!("log line {pattern:?}"),
             Probe::Tcp { ports } => format!("tcp {ports:?}"),
             Probe::Http { port, path } => format!("http :{port}{path}"),
             Probe::AtStart => "ready at start".into(),

@@ -308,11 +308,23 @@ impl Provider<'_> {
                     Some(NodeKind::Service { probe }) => probe.clone(),
                     _ => Probe::AtStart,
                 };
+                let unit = crate::supervisor::Units::of(self.stack).unit(&node.name.0);
                 std::thread::spawn(move || {
                     let ok = match &probe {
                         Probe::Tcp { ports } => crate::supervisor::probe(ports, None),
                         Probe::Http { port, path } => {
                             crate::supervisor::probe(&[], Some((*port, path)))
+                        }
+                        Probe::LogLine { pattern } => {
+                            let mut show = Command::new("systemctl");
+                            show.args(["--user", "show", "-p", "InvocationID", "--value", &unit]);
+                            let id = show.output().map_or(String::new(), |o| {
+                                String::from_utf8_lossy(&o.stdout).trim().to_owned()
+                            });
+                            let mut c = Command::new("journalctl");
+                            c.args(["--user", "-f", "-o", "cat", "-n", "all"])
+                                .arg(format!("_SYSTEMD_INVOCATION_ID={id}"));
+                            !id.is_empty() && log_line(c, pattern)
                         }
                         _ => true,
                     };
@@ -320,17 +332,28 @@ impl Provider<'_> {
                 });
             }
             Op::Probe(node) => {
-                let ports = match s.loaded().and_then(|m| m.nodes.get(&node)).map(|n| &n.kind) {
+                let kind = s.loaded().and_then(|m| m.nodes.get(&node)).map(|n| &n.kind);
+                let (ports, pattern) = match kind {
                     Some(NodeKind::Service {
                         probe: Probe::Tcp { ports },
-                    }) => ports.clone(),
-                    _ => vec![],
+                    }) => (ports.clone(), None),
+                    Some(NodeKind::Service {
+                        probe: Probe::LogLine { pattern },
+                    }) => (vec![], Some(pattern.clone())),
+                    _ => (vec![], None),
                 };
                 let cid = self.container(&node.name);
                 std::thread::spawn(move || {
-                    done(Answer::Probe {
-                        ok: probe(cid, &ports),
-                    })
+                    let ok = match (pattern, cid) {
+                        (Some(p), Some(c)) => {
+                            let mut cmd = Command::new("sh");
+                            cmd.args(["-c", "exec docker logs -f \"$1\" 2>&1", "sh", &c]);
+                            log_line(cmd, &p)
+                        }
+                        (Some(_), None) => false,
+                        (None, cid) => probe(cid, &ports),
+                    };
+                    done(Answer::Probe { ok })
                 });
             }
             Op::Start {
@@ -644,6 +667,30 @@ fn probe(cid: Option<String>, ports: &[u16]) -> bool {
         && ports.iter().all(|p| {
             TcpStream::connect_timeout(&SocketAddr::new(ip, *p), Duration::from_millis(400)).is_ok()
         })
+}
+
+/// Follows the output of `cmd` until a line contains `pattern` (true) or the output ends (false). The follow
+/// ends after the start timeout, so a node that never prints the line leaves no process behind.
+fn log_line(cmd: Command, pattern: &str) -> bool {
+    let mut t = Command::new("timeout");
+    t.arg((rizr_core::plan::START_TIMEOUT_MS / 1000 + 5).to_string())
+        .arg(cmd.get_program())
+        .args(cmd.get_args())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let Ok(mut child) = t.spawn() else {
+        return false;
+    };
+    let found = child.stdout.take().is_some_and(|out| {
+        BufReader::new(out)
+            .lines()
+            .map_while(Result::ok)
+            .any(|l| l.contains(pattern))
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+    found
 }
 
 fn exec(mut cmd: Command) -> Answer {

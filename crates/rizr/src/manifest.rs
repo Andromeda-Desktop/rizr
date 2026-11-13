@@ -19,6 +19,15 @@ struct Manifest {
     version: u32,
     #[serde(default)]
     service: BTreeMap<String, HostService>,
+    /// Readiness of compose services: `[ready] web = { log = "Listening on" }`.
+    #[serde(default)]
+    ready: BTreeMap<String, ComposeReady>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComposeReady {
+    log: String,
 }
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
@@ -50,6 +59,8 @@ pub struct Ready {
     pub tcp: Option<u16>,
     /// `http://localhost:<port>/<path>`; ready on a 2xx or 3xx reply.
     pub http: Option<String>,
+    /// Ready when a line of the service's output contains this text.
+    pub log: Option<String>,
 }
 
 /// Adds the host services of `<root>/rizr.toml` to `m`. Returns them by name for the supervisor.
@@ -87,6 +98,23 @@ pub fn merge(
             }
         }
     }
+    for (name, r) in &man.ready {
+        match m.nodes.get_mut(&id(name)) {
+            Some(NodeSpec {
+                kind: NodeKind::Service { probe },
+                ..
+            }) => {
+                *probe = Probe::LogLine {
+                    pattern: r.log.clone(),
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "rizr.toml: [ready] `{name}` is not a compose service; a host service sets `ready` in its own table"
+                ));
+            }
+        }
+    }
     for (name, svc) in &man.service {
         let probe = match &svc.ready {
             Some(Ready { tcp: Some(p), .. }) => Probe::Tcp { ports: vec![*p] },
@@ -107,6 +135,7 @@ pub fn merge(
                     path: format!("/{path}"),
                 }
             }
+            Some(Ready { log: Some(l), .. }) => Probe::LogLine { pattern: l.clone() },
             _ => Probe::AtStart,
         };
         let spec = serde_json::to_string(svc).map_err(|e| e.to_string())?;
