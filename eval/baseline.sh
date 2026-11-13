@@ -50,6 +50,24 @@ cleanup() { # remove every compose project started from $ROOT
     jq -r --arg r "$ROOT" '.[] | select(.ConfigFiles | contains($r)) | .Name' |
     while read -r p; do docker compose -p "$p" down -v --remove-orphans >/dev/null 2>&1; done
   docker rm -f "$OTHER" >/dev/null 2>&1
+  # rizr's shared servers of eval repos (every eval repo dir is named repo) and their volumes
+  docker ps -aq --filter name='^rizr-repo-' | xargs -r docker rm -f >/dev/null 2>&1
+  docker volume ls -q --filter name='^rizr-repo-' | xargs -r docker volume rm >/dev/null 2>&1
+}
+
+served_by() { # container: the container that answers DNS name $2 on a network of container $1, by any tool
+  local n c
+  for n in $(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$1"); do
+    for c in $(docker ps -q --filter "network=$n"); do
+      docker inspect -f "{{with index .NetworkSettings.Networks \"$n\"}}{{join .Aliases \" \"}} {{join .DNSNames \" \"}}{{end}}" "$c" |
+        tr ' ' '\n' | grep -qx "$2" && { echo "$c"; return 0; }
+    done
+  done
+  return 1
+}
+
+service_ctr() { # repo service: the running compose container of that service
+  docker ps -q --filter "label=com.docker.compose.project.working_dir=$1" --filter "label=com.docker.compose.service=$2" | head -n1
 }
 
 seal() { # fold a prepared change into the only commit, so `git log` does not show it
@@ -163,8 +181,11 @@ check() { # task -> exit 0 on pass; prints the reason
     6) http_ok http://localhost:8080/ || { echo "vote page fails"; return 1; }
        http_ok http://localhost:8091/ || { echo "result page not on 8091"; return 1; }
        ! http_ok http://localhost:8081/ || { echo "the old result port 8081 still answers"; return 1; }
-       local got # every container started from this repo, by any tool: each compose service once, all running
+       local got w # every container started from this repo, by any tool: each compose service once, all running
        got=$(docker ps -a --filter "label=com.docker.compose.project.working_dir=$d" --format '{{.Label "com.docker.compose.service"}} {{.State}}' | sort | tr '\n' ' ')
+       # a tool may serve db from its own container: count it when the worker reaches a running `db`
+       w=$(service_ctr "$d" worker)
+       [[ $got != *"db "* && -n $w ]] && served_by "$w" db >/dev/null && got=$(printf '%s\n' $got "db running" | paste -d' ' - - | sort | tr '\n' ' ')
        [[ $got == "db running redis running result running vote running worker running " ]] || { echo "containers of this repo: $got"; return 1; }
        echo "stack matches the compose file" ;;
     7) [[ $(docker inspect -f '{{.State.StartedAt}}' "$OTHER" 2>/dev/null) == "$(cat "$OUT/7/other-start")" ]] && http_ok http://localhost:9000/ && grep -qi nginx /tmp/rizr-eval-body || { echo "the other server on 9000 was touched"; return 1; }
@@ -176,19 +197,21 @@ check() { # task -> exit 0 on pass; prints the reason
     8) local i n=0
        for i in 1 2 3; do curl -s -m 10 -o /dev/null -b "voter_id=eval$i" -d "vote=a" http://localhost:8080/; done
        for i in $(seq 10); do
-         n=$(cd "$d" && docker compose exec -T db psql -U postgres -tAc 'select count(*) from votes' 2>/dev/null | tr -dc 0-9)
+         n=$(docker exec "$(served_by "$(service_ctr "$d" worker)" db)" psql -U postgres -tAc 'select count(*) from votes' 2>/dev/null | tr -dc 0-9)
          ((${n:-0} > 0)) && break; sleep 3
        done
        ((${n:-0} > 0)) || { echo "votes do not reach the database"; return 1; }
        [[ $(git -C "$d" diff --name-only HEAD | tr '\n' ' ') == "docker-compose.yml " ]] || { echo "diff touches: $(git -C "$d" diff --name-only HEAD | tr '\n' ' ')"; return 1; }
        echo "votes counted, fix in docker-compose.yml only" ;;
     10) [[ $(docker inspect -f '{{.State.StartedAt}}' $(cat "$OUT/10/first-ids") 2>/dev/null | sort) == "$(cat "$OUT/10/first-start")" ]] && http_ok http://localhost:9000/ || { echo "first copy changed or down"; return 1; }
-       local db q='select count(*) from subscribers where email' n
-       db=$(docker ps --filter ancestor=postgres:17-alpine --format '{{.ID}}' | grep -vxFf <(cut -c1-12 "$OUT/10/first-ids") | head -n1)
-       [[ -n $db ]] || { echo "no second database"; return 1; }
-       n=$(docker exec "$db" psql -U listmonk -tAc "$q = '$MARK'" 2>/dev/null)
+       local app db name q='select count(*) from subscribers where email' n
+       # the second app and the database it uses, wherever a tool runs it
+       app=$(docker ps -q --filter ancestor=listmonk/listmonk:latest | grep -vxFf <(cut -c1-12 "$OUT/10/first-ids") | head -n1)
+       [[ -n $app ]] && db=$(served_by "$app" db) || { echo "no second copy with a database"; return 1; }
+       name=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$app" | sed -n 's/^LISTMONK_db__database=//p')
+       n=$(docker exec "$db" psql -U listmonk -d "${name:-listmonk}" -tAc "$q = '$MARK'" 2>/dev/null)
        [[ $n == 1 ]] || { echo "second copy lacks the first copy's data"; return 1; }
-       docker exec "$db" psql -U listmonk -qc "insert into subscribers (uuid, email, name, status) values (gen_random_uuid(), 'second-$MARK', 'Second', 'enabled')" >/dev/null 2>&1
+       docker exec "$db" psql -U listmonk -d "${name:-listmonk}" -qc "insert into subscribers (uuid, email, name, status) values (gen_random_uuid(), 'second-$MARK', 'Second', 'enabled')" >/dev/null 2>&1
        [[ $(docker exec listmonk_db psql -U listmonk -tAc "$q = 'second-$MARK'") == 0 ]] || { echo "second copy writes into the first"; return 1; }
        for p in $(docker ps --filter ancestor=listmonk/listmonk:latest --format '{{.Ports}}' | grep -oE '0\.0\.0\.0:[0-9]+' | cut -d: -f2 | sort -u); do
          [[ $p != 9000 ]] && http_ok "http://localhost:$p/" && final 10 | grep -q ":$p" && { echo "second copy on $p with the data, isolated"; return 0; }
