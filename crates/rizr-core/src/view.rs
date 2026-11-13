@@ -45,11 +45,17 @@ pub fn instance_status(s: &State) -> InstanceStatus {
             Machine::Service(Service::Absent) | Machine::Job(Job::Pending)
         )
     };
+    // Shared nodes keep running for other instances after this one is down: Down looks only at its own nodes.
     if nodes.iter().any(failed) {
         InstanceStatus::Degraded
     } else if !nodes.is_empty() && nodes.iter().all(fine) {
         InstanceStatus::Up
-    } else if nodes.iter().all(off) {
+    } else if s
+        .nodes
+        .iter()
+        .filter(|(id, n)| id.scope != Scope::Project && n.spec.is_some())
+        .all(|(_, n)| off(&&n.machine))
+    {
         InstanceStatus::Down
     } else {
         InstanceStatus::Starting

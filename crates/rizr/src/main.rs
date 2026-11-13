@@ -317,12 +317,21 @@ fn run(cli: Cli) -> Result<(), Error> {
             }
         }
         Command::Logs { node, follow, tail } => {
-            let mut c = stack.compose();
-            c.args(["logs", "--no-color", "--tail", &tail]);
+            let shared = node
+                .as_deref()
+                .and_then(|n| docker::shared_container(&stack, n));
+            let mut c = match &shared {
+                Some(_) => std::process::Command::new("docker"),
+                None => stack.compose(),
+            };
+            c.args(["logs", "--tail", &tail]);
+            if shared.is_none() {
+                c.arg("--no-color");
+            }
             if follow {
                 c.arg("--follow");
             }
-            c.args(node);
+            c.args(shared.or(node));
             let st = c.status().map_err(|e| runtime_error(&e.to_string()))?;
             if st.success() {
                 Ok(())
@@ -455,7 +464,7 @@ fn health_output(stack: &docker::Stack, node: &str) -> String {
 
 /// The log lines of `node` since `since` (unix seconds), else its last lines; at most 15, colour codes and repeated
 /// lines removed.
-/// A host node reads the journal of its unit; a compose node reads compose logs.
+/// A host node reads the journal of its unit; a shared node its container's logs; a compose node compose logs.
 fn log_lines(stack: &docker::Stack, node: &str, since: u64) -> String {
     let host = manifest::host_names(&stack.root).contains(node);
     let logs = |since: Option<u64>| {
@@ -466,6 +475,14 @@ fn log_lines(stack: &docker::Stack, node: &str, since: u64) -> String {
             if let Some(t) = since {
                 c.arg(format!("--since=@{t}"));
             }
+            c
+        } else if let Some(id) = docker::shared_container(stack, node) {
+            let mut c = std::process::Command::new("docker");
+            c.args(["logs", "--tail", "15"]);
+            if let Some(t) = since {
+                c.args(["--since", &t.to_string()]);
+            }
+            c.arg(id);
             c
         } else {
             let mut c = stack.compose();

@@ -445,11 +445,29 @@ impl Provider<'_> {
                 std::thread::spawn(move || {
                     done(match pg {
                         Some(pg) => {
-                            // A changed spec replaces the container; the data volume stays.
-                            let _ = Command::new("docker")
-                                .args(["rm", "--force", &pg.container(&project)])
-                                .output();
-                            exec(pg.run(&project, &spec, generation.0))
+                            let name = pg.container(&project);
+                            let running = inspect(std::slice::from_ref(&name))
+                                .ok()
+                                .and_then(|v| v.into_iter().next())
+                                .filter(|c| c["State"]["Running"] == true);
+                            // Other instances use a running server: never replace it under them.
+                            if let Some(c) = running {
+                                Answer::Err {
+                                    tail: format!(
+                                        "{name} runs {}, and other worktrees may use it; this one wants {} or other \
+                                         POSTGRES_* values. Make the compose files agree, or set \
+                                         `[resource.<service>] shared = false` in rizr.toml. `docker rm -f \
+                                         {name}` replaces it for all worktrees; its data volume stays.",
+                                        c["Config"]["Image"].as_str().unwrap_or("?"),
+                                        pg.image
+                                    ),
+                                }
+                            } else {
+                                let _ = Command::new("docker")
+                                    .args(["rm", "--force", &name])
+                                    .output();
+                                exec(pg.run(&project, &spec, generation.0))
+                            }
                         }
                         None => Answer::Err {
                             tail: format!("{} is not a shared server of this project", node.name.0),
@@ -794,6 +812,20 @@ fn exec(mut cmd: Command) -> Answer {
             tail: format!("cannot run docker compose: {e}"),
         },
     }
+}
+
+/// The container of a node that all instances of the project share, when it exists.
+pub fn shared_container(stack: &Stack, node: &str) -> Option<String> {
+    let out = Command::new("docker")
+        .args(["ps", "-aq", "--filter", "label=rizr.scope=project"])
+        .arg(format!("--filter=label=rizr.project={}", stack.project.0))
+        .arg(format!("--filter=label=rizr.node={node}"))
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .map(str::to_owned)
 }
 
 /// The real command of an effect, for `plan` and `eject`. `None`: rizr does it itself (timers, prompts).
