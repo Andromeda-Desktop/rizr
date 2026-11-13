@@ -113,11 +113,21 @@ fn run(cli: Cli) -> Result<(), Error> {
         Command::Action(action) => {
             let up = matches!(action, Action::Up { .. });
             let s = docker::run(&stack, i.digest, Some(action))?;
-            let urls = if up {
+            let mut urls = if up {
                 ports::checks(&stack.compose_name())
             } else {
                 Vec::new()
             };
+            for u in &mut urls {
+                let check = u["check"].as_str().unwrap_or_default();
+                if check.starts_with("HTTP 5")
+                    || check.contains("no HTTP reply")
+                    || check.contains("refused")
+                {
+                    let node = u["node"].as_str().unwrap_or_default().to_owned();
+                    u["log_tail"] = log_tail(&stack, &node).into();
+                }
+            }
             if json && up {
                 let mut r = serde_json::to_value(view::receipt(&s)).unwrap_or_default();
                 r["urls"] = urls.into();
@@ -131,6 +141,9 @@ fn run(cli: Cli) -> Result<(), Error> {
                         u["url"].as_str().unwrap_or_default(),
                         u["check"].as_str().unwrap_or_default()
                     );
+                    if let Some(t) = u["log_tail"].as_str() {
+                        println!("    last log lines:\n{t}");
+                    }
                 }
             }
             Ok(())
@@ -259,6 +272,28 @@ fn run(cli: Cli) -> Result<(), Error> {
             eject(&stack, &s, &out)
         }
     }
+}
+
+/// The last 15 log lines of `node`, indented, for a URL check that failed.
+fn log_tail(stack: &docker::Stack, node: &str) -> String {
+    let mut c = stack.compose();
+    c.args([
+        "logs",
+        "--no-color",
+        "--no-log-prefix",
+        "--tail",
+        "15",
+        node,
+    ]);
+    c.output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| format!("      {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
 }
 
 /// Each verb with its one-line help, so an agent needs no `--help` call.
