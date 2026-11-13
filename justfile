@@ -13,3 +13,7 @@ check:
     cargo clippy --locked --all-targets -- -D warnings
     cargo test --locked
     cargo deny check
+
+# Live edge cases against docker (crash loop, slow job, orphans, 5xx, stale credentials, name conflict); about 4 min.
+edge: build
+    tests/edge.sh
