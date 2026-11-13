@@ -5,7 +5,8 @@ use crate::machine::{Job, Machine, ProbeTurn, Service};
 use crate::model::{Dep, EffectId, Gate, NodeId, NodeKind, Scope};
 use crate::state::{DataAxis, Lock, ModelState, State, Sync, Target, Trust};
 
-pub const START_TIMEOUT_MS: u64 = 120_000;
+/// Below the 100 s budget of a verb (rizr docker.rs), so `up` gives a verdict on a stuck start before it returns.
+pub const START_TIMEOUT_MS: u64 = 90_000;
 pub const PROBE_RETRY_MS: u64 = 500;
 /// How long a service with no probe must stay up before it counts as ready; most crashes at start come sooner.
 pub const SETTLE_MS: u64 = 2_000;

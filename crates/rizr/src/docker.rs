@@ -31,6 +31,9 @@ enum Msg {
 /// belongs to a container that a later `Start` replaced (DECISIONS 2026-11-13, step 2 spike).
 type Current = Arc<Mutex<BTreeMap<String, String>>>;
 
+/// A verb returns before an agent's 120 s tool timeout; the runtime keeps starting and the next `up` waits again.
+const BUDGET: Duration = Duration::from_secs(100);
+
 pub struct Attach {
     pub instance: String,
     pub compose_name: String,
@@ -233,6 +236,7 @@ impl Drop for Provider<'_> {
 
 impl Provider<'_> {
     fn drive(&mut self, mut s: State, rx: &Receiver<Msg>) -> Result<State, Error> {
+        let limit = self.progress.as_ref().map(|(t, _)| *t + BUDGET);
         loop {
             for _ in 0..64 {
                 let planned = plan(&s);
@@ -256,8 +260,11 @@ impl Provider<'_> {
                 .iter()
                 .min_by_key(|(_, t)| **t)
                 .map(|(id, t)| (*id, *t));
+            if limit.is_some_and(|l| Instant::now() >= l) {
+                return Err(self.still_starting(&s));
+            }
             let msg = match next {
-                Some((id, at)) => {
+                Some((id, at)) if limit.is_none_or(|l| at <= l) => {
                     match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
                         Err(RecvTimeoutError::Timeout) => {
                             self.deadlines.remove(&id);
@@ -267,7 +274,13 @@ impl Provider<'_> {
                         m => m.ok(),
                     }
                 }
-                None => rx.recv().ok(),
+                _ => match limit {
+                    Some(l) => match rx.recv_timeout(l.saturating_duration_since(Instant::now())) {
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        m => m.ok(),
+                    },
+                    None => rx.recv().ok(),
+                },
             };
             match msg {
                 Some(Msg::Done(id, answer)) => s = reduce(s, Event::Done { id, answer }),
@@ -276,6 +289,61 @@ impl Provider<'_> {
             }
             self.print_progress(&s);
         }
+    }
+
+    /// The budget ran out: each node still on its way, with its last log line, and the command that waits again.
+    fn still_starting(&self, s: &State) -> Error {
+        let ids = self.current.lock().map(|c| c.clone()).unwrap_or_default();
+        let lines: Vec<String> = rizr_core::view::nodes(s)
+            .into_iter()
+            .filter(|n| {
+                !["ready", "done", "started"]
+                    .iter()
+                    .any(|p| n.state.starts_with(p))
+            })
+            .map(|n| {
+                let last = ids
+                    .get(&n.node.name.0)
+                    .and_then(|id| {
+                        Command::new("docker")
+                            .args(["logs", "--tail", "1", id])
+                            .output()
+                            .ok()
+                    })
+                    .map(|o| {
+                        let all = [o.stdout, o.stderr].concat();
+                        String::from_utf8_lossy(&all)
+                            .trim()
+                            .chars()
+                            .take(160)
+                            .collect::<String>()
+                    })
+                    .filter(|l| !l.is_empty())
+                    .map(|l| format!(", last log: {l}"))
+                    .unwrap_or_default();
+                let state = if ["absent", "pending"].contains(&n.state.as_str()) {
+                    "not started yet: it waits for a dependency, or its image pull or build runs"
+                        .into()
+                } else {
+                    n.state.to_string()
+                };
+                format!("{} {state}{last}", n.node.name.0)
+            })
+            .collect();
+        let again = std::iter::once("rizr".to_owned())
+            .chain(std::env::args().skip(1))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Error::new(
+            rizr_core::error::ErrorCode::StillRunning,
+            format!(
+                "not failed, still starting after {} s: {}",
+                BUDGET.as_secs(),
+                lines.join("; ")
+            ),
+            "the containers keep starting in the background; the same command again waits up to 100 s more and restarts nothing",
+            again,
+        )
     }
 
     /// One stderr line per node state change, so a caller with a short timeout sees how far `up` got.
