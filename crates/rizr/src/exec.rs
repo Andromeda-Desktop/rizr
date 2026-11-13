@@ -171,8 +171,11 @@ fn follow(id: &str) -> Result<(), Error> {
         )),
         None => Err(Error::new(
             ErrorCode::StillRunning,
-            format!("job {id} still runs after {} s", BUDGET.as_secs()),
-            "it keeps running in the background; wait again, each call waits up to 100 s",
+            format!(
+                "job {id} has not failed: it still runs after {} s (exit 5 means not done yet; its output so far is above)",
+                BUDGET.as_secs()
+            ),
+            "it keeps running in the background; `rizr wait` waits up to 100 s more and prints its exit code",
             format!("rizr wait {id}"),
         )),
     }

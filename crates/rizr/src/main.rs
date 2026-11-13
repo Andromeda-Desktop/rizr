@@ -201,14 +201,31 @@ fn run(cli: Cli) -> Result<(), Error> {
                     eprintln!("{}", rewind::warning(&e));
                 }
             }
-            let s = s.map_err(|e| with_output(&stack, e, since))?;
+            // A failed up clears them too: an orphan can hold the port or the name that made it fail.
             if up {
-                for n in ports::remove_orphans(&stack.compose_name()) {
+                // After a good up every service runs with rizr's labels; after a failed one, keep the files' services.
+                let services = if s.is_ok() {
+                    Vec::new()
+                } else {
+                    stack
+                        .compose()
+                        .args(["config", "--services"])
+                        .output()
+                        .map(|o| {
+                            String::from_utf8_lossy(&o.stdout)
+                                .lines()
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                for n in ports::remove_orphans(&stack.compose_name(), &services) {
                     eprintln!(
                         "removed container {n}: no compose file here runs it under rizr (as `docker compose up --remove-orphans`); its volumes stay"
                     );
                 }
             }
+            let s = s.map_err(|e| with_output(&stack, e, since))?;
             if down {
                 exec::remove(&stack, true);
                 // compose rm keeps networks; each holds an address pool until removed.
