@@ -1,0 +1,24 @@
+[package]
+name = "rizr-core"
+description = "Pure core of rizr: model, reduce, plan, views and invariants"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap = { version = "4", features = ["derive"], optional = true }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+clap = ["dep:clap"]
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

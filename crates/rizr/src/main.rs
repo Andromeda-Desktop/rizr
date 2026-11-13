@@ -1,14 +1,68 @@
 use std::process::ExitCode;
 
+use clap::{Parser, Subcommand};
+use rizr_core::Action;
+use rizr_core::error::{Error, ErrorCode};
+use rizr_core::view::{Drift, Receipt};
+
+/// One control plane for any project: run a repo's stack with one command and see why it works.
+#[derive(Parser)]
+#[command(name = "rizr", version)]
+struct Cli {
+    /// Print machine-readable JSON.
+    #[arg(long, global = true)]
+    json: bool,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    #[command(flatten)]
+    Action(Action),
+    /// Print the JSON Schema of the API: actions, errors, receipt and drift.
+    Schema,
+}
+
 fn main() -> ExitCode {
-    match std::env::args().nth(1).as_deref() {
-        Some("--version") => {
-            println!("rizr {}", env!("CARGO_PKG_VERSION"));
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Schema => {
+            let schema = serde_json::json!({
+                "action": schemars::schema_for!(Action),
+                "error": schemars::schema_for!(Error),
+                "receipt": schemars::schema_for!(Receipt),
+                "drift": schemars::schema_for!(Drift),
+            });
+            println!("{schema:#}");
             ExitCode::SUCCESS
         }
-        _ => {
-            eprintln!("usage: rizr --version");
-            ExitCode::from(2)
-        }
+        Command::Action(action) => fail(
+            cli.json,
+            &Error::new(
+                ErrorCode::NotBuilt,
+                format!("`{}` is not built yet", verb(&action)),
+                "this verb comes in a later pre-release",
+                "rizr schema",
+            ),
+        ),
     }
+}
+
+fn verb(a: &Action) -> &'static str {
+    match a {
+        Action::Up { .. } => "up",
+        Action::Down => "down",
+        Action::Restart { .. } => "restart",
+        Action::Trust => "trust",
+    }
+}
+
+fn fail(json: bool, e: &Error) -> ExitCode {
+    if json {
+        println!("{}", serde_json::to_string(e).unwrap_or_default());
+    } else {
+        eprintln!("error: {}\nhint: {}\ntry: {}", e.message, e.hint, e.example);
+    }
+    ExitCode::from(e.code.class().exit_code())
 }
