@@ -1,7 +1,7 @@
 //! Taken host ports (VISION section 6): when another program holds a published port, the service gets the next
 //! free one. The choice is stored in the instance data directory, so the port stays the same across runs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -124,9 +124,13 @@ fn taken_by_other(ip: &str, port: u16, root: &Path) -> bool {
     !ours
 }
 
-fn free_after(ip: &str, port: u16, root: &Path) -> Option<u16> {
-    (port.checked_add(1)?..=u16::MAX).find(|p| !taken_by_other(ip, *p, root))
+fn free_after(ip: &str, port: u16, root: &Path, others: &BTreeSet<u16>) -> Option<u16> {
+    (port.checked_add(1)?..=u16::MAX).find(|p| !others.contains(p) && !taken_by_other(ip, *p, root))
 }
+
+/// Host ports each instance of a project holds, in `<data>/<project>.ports.json`. A port is claimed before its
+/// container binds it, so two worktrees that start at once never pick the same one.
+type Claims = BTreeMap<String, BTreeSet<u16>>;
 
 /// Compose projects started from this repo outside rizr (no `rizr.project` label), with their container count.
 /// `own` is rizr's compose name for this repo: `up` adopts those containers, so they are no strays.
@@ -165,12 +169,28 @@ pub fn stray_lines(root: &Path, own: &str) -> Vec<String> {
 
 /// Writes `ports-<svc>.yml` when a published port of `svc` is remapped, and returns it for `-f`.
 /// `ports` is the service's `ports` list from `docker compose config --format json`.
+/// `claims` is the project's claim file; its lock (`<claims>.lock`) is held while ports are chosen and recorded.
 pub fn prepare(
     dir: &Path,
     root: &Path,
     svc: &str,
     ports: &[Value],
+    claims: &Path,
+    instance: &str,
 ) -> Result<Option<PathBuf>, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let lock = std::fs::File::create(claims.with_extension("lock")).map_err(|e| e.to_string())?;
+    lock.lock().map_err(|e| e.to_string())?;
+    let mut held: Claims = std::fs::read(claims)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let others: BTreeSet<u16> = held
+        .iter()
+        .filter(|(i, _)| *i != instance)
+        .flat_map(|(_, p)| p.iter().copied())
+        .collect();
+    let mut mine = BTreeSet::new();
     let mut all = load(dir);
     let mut changed = false;
     let mut out = Vec::new();
@@ -182,8 +202,12 @@ pub fn prepare(
             let known = all.get(svc).and_then(|m| m.get(&want)).copied();
             let host = match known {
                 Some(h) => Some(h),
-                None if taken_by_other(&ip, want, root) => {
-                    let h = free_after(&ip, want, root);
+                // The compose file's own ports belong to the main worktree, also when it is not running.
+                None if instance != "main"
+                    || others.contains(&want)
+                    || taken_by_other(&ip, want, root) =>
+                {
+                    let h = free_after(&ip, want, root, &others);
                     if let Some(h) = h {
                         all.entry(svc.into()).or_default().insert(want, h);
                         changed = true;
@@ -195,10 +219,19 @@ pub fn prepare(
             if let Some(h) = host {
                 p["published"] = json!(h.to_string());
             }
+            mine.insert(host.unwrap_or(want));
         }
         out.push(p);
     }
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let own = held.entry(instance.into()).or_default();
+    if !mine.is_subset(own) {
+        own.extend(mine);
+        std::fs::write(
+            claims,
+            serde_json::to_vec_pretty(&held).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     if changed {
         std::fs::write(
             store(dir),
@@ -234,9 +267,17 @@ mod tests {
         let ports = [
             json!({"target": 80, "published": want.to_string(), "host_ip": "127.0.0.1", "protocol": "tcp"}),
         ];
-        let file = prepare(dir.path(), Path::new("/rizr-test-none"), "app", &ports)
-            .unwrap()
-            .unwrap();
+        let claims = dir.path().join("p.ports.json");
+        let file = prepare(
+            dir.path(),
+            Path::new("/rizr-test-none"),
+            "app",
+            &ports,
+            &claims,
+            "main",
+        )
+        .unwrap()
+        .unwrap();
         let host = load(dir.path())["app"][&want];
         assert_ne!(host, want);
         assert!(
@@ -245,11 +286,56 @@ mod tests {
                 .contains(&format!("\"published\":\"{host}\""))
         );
         drop(other);
-        prepare(dir.path(), Path::new("/rizr-test-none"), "app", &ports).unwrap();
+        prepare(
+            dir.path(),
+            Path::new("/rizr-test-none"),
+            "app",
+            &ports,
+            &claims,
+            "main",
+        )
+        .unwrap();
         assert_eq!(
             load(dir.path())["app"][&want],
             host,
             "the port stays the same across runs"
         );
+    }
+
+    #[test]
+    fn two_instances_that_start_at_once_get_different_ports() {
+        let data = tempfile::tempdir().unwrap();
+        let free = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let want = free.local_addr().unwrap().port();
+        drop(free);
+        let ports = [
+            json!({"target": 80, "published": want.to_string(), "host_ip": "127.0.0.1", "protocol": "tcp"}),
+        ];
+        let claims = data.path().join("p.ports.json");
+        let (a, b) = (data.path().join("p-main"), data.path().join("p-wt2"));
+        prepare(
+            &a,
+            Path::new("/rizr-test-none"),
+            "app",
+            &ports,
+            &claims,
+            "main",
+        )
+        .unwrap();
+        // Neither container has bound the port yet: only the claim tells the second instance it is taken.
+        prepare(
+            &b,
+            Path::new("/rizr-test-none"),
+            "app",
+            &ports,
+            &claims,
+            "wt2",
+        )
+        .unwrap();
+        assert!(
+            !load(&a).contains_key("app"),
+            "the first instance keeps its port"
+        );
+        assert_ne!(load(&b)["app"][&want], want);
     }
 }
