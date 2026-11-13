@@ -32,16 +32,25 @@ pub fn files(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The files given with `-f`, relative to `root`; with none, the files compose itself would pick.
+pub fn resolve(root: &Path, chosen: &[PathBuf]) -> Vec<PathBuf> {
+    if chosen.is_empty() {
+        files(root)
+    } else {
+        chosen.iter().map(|f| root.join(f)).collect()
+    }
+}
+
 /// The command prefix every compose call of this stack uses.
 /// `dir` is rizr's data directory for the instance: the dev env files live there.
-pub fn command(root: &Path, project: &str, dir: &Path) -> Command {
+pub fn command(root: &Path, chosen: &[PathBuf], project: &str, dir: &Path) -> Command {
     let mut c = Command::new("docker");
     c.arg("compose")
         .arg("-p")
         .arg(project)
         .arg("--project-directory")
         .arg(root);
-    for f in files(root) {
+    for f in resolve(root, chosen) {
         c.arg("-f").arg(f);
     }
     c.args(crate::devenv::args(root, dir));
@@ -51,19 +60,20 @@ pub fn command(root: &Path, project: &str, dir: &Path) -> Command {
 /// The model and, per service, whether its compose file sets `restart:`.
 pub fn import(
     root: &Path,
+    chosen: &[PathBuf],
     project: &str,
     dir: &Path,
     instance: &InstanceId,
     inputs: Digest,
 ) -> Result<(Model, BTreeMap<String, bool>), String> {
-    let compose_files = files(root);
+    let compose_files = resolve(root, chosen);
     if compose_files.is_empty() {
         return Err(format!("no compose file in {}", root.display()));
     }
     crate::devenv::prepare(root, dir, &compose_files)?;
     // Compose names one unset required variable per run; each round fills one.
     let out = loop {
-        let out = command(root, project, dir)
+        let out = command(root, chosen, project, dir)
             .args(["config", "--format", "json"])
             .output()
             .map_err(|e| format!("cannot run docker compose: {e}"))?;

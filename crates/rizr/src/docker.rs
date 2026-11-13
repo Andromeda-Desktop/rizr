@@ -32,6 +32,8 @@ type Current = Arc<Mutex<BTreeMap<String, String>>>;
 
 pub struct Stack {
     pub root: PathBuf,
+    /// Compose files given with `-f`; empty means the default names.
+    pub files: Vec<PathBuf>,
     pub project: ProjectId,
     pub instance: InstanceId,
     /// rizr's data directory for this instance: generation and override files. Never inside the repo.
@@ -39,7 +41,7 @@ pub struct Stack {
 }
 
 impl Stack {
-    pub fn new(root: PathBuf, data: &Path) -> Self {
+    pub fn new(root: PathBuf, files: Vec<PathBuf>, data: &Path) -> Self {
         let name: String = root
             .file_name()
             .map(|n| n.to_string_lossy().to_lowercase())
@@ -58,6 +60,7 @@ impl Stack {
         let dir = data.join(format!("{}-{}", project.0, instance.0));
         Self {
             root,
+            files,
             project,
             instance,
             dir,
@@ -70,7 +73,7 @@ impl Stack {
     }
 
     pub fn compose(&self) -> Command {
-        compose::command(&self.root, &self.compose_name(), &self.dir)
+        compose::command(&self.root, &self.files, &self.compose_name(), &self.dir)
     }
 }
 
@@ -191,7 +194,7 @@ impl Provider<'_> {
                     .insert(id, Instant::now() + Duration::from_millis(after_ms));
             }
             Op::PromptTrust { .. } => {
-                let granted = crate::trust::gate(&st.root, true).is_ok();
+                let granted = crate::trust::gate(&st.root, &st.files, true).is_ok();
                 done(Answer::Trust { granted });
             }
             Op::Subscribe => done(match self.subscribe() {
@@ -208,8 +211,9 @@ impl Provider<'_> {
                 });
             }
             Op::Import => {
-                let (root, name, dir, instance, restart_set) = (
+                let (root, files, name, dir, instance, restart_set) = (
                     st.root.clone(),
+                    st.files.clone(),
                     st.compose_name(),
                     st.dir.clone(),
                     st.instance.clone(),
@@ -221,7 +225,7 @@ impl Provider<'_> {
                 };
                 std::thread::spawn(move || {
                     done(
-                        match compose::import(&root, &name, &dir, &instance, inputs) {
+                        match compose::import(&root, &files, &name, &dir, &instance, inputs) {
                             Ok((m, restart)) => {
                                 if let Ok(mut r) = restart_set.lock() {
                                     *r = restart;

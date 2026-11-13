@@ -20,6 +20,9 @@ struct Cli {
     /// Print machine-readable JSON.
     #[arg(long, global = true)]
     json: bool,
+    /// A compose file to use instead of the default names; repeat it as with `docker compose -f`.
+    #[arg(short = 'f', long = "file", global = true)]
+    file: Vec<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -83,11 +86,11 @@ fn run(cli: Cli) -> Result<(), Error> {
         return Ok(());
     }
     if let Command::Action(Action::Trust) = cli.command {
-        let i = trust::gate(Path::new("."), true)?;
+        let i = trust::gate(Path::new("."), &cli.file, true)?;
         eprintln!("trusted {} ({} files)", i.root.display(), i.files.len());
         return Ok(());
     }
-    let i = trust::gate(Path::new("."), !json)?;
+    let i = trust::gate(Path::new("."), &cli.file, !json)?;
     let data = trust::store_path()
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .ok_or_else(|| {
@@ -98,7 +101,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                 "HOME=/home/me rizr up",
             )
         })?;
-    let stack = docker::Stack::new(i.root, &data);
+    let stack = docker::Stack::new(i.root, cli.file.clone(), &data);
     match cli.command {
         Command::Schema | Command::Action(Action::Trust) => Ok(()),
         Command::Action(action) => {
@@ -194,7 +197,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                 "{:#}",
                 json!({
                     "root": stack.root, "project": stack.compose_name(), "data_dir": stack.dir,
-                    "compose_files": compose::files(&stack.root), "status": status,
+                    "compose_files": compose::resolve(&stack.root, &stack.files), "status": status,
                     "generation": s.intents.generation.0, "graph": graph, "nodes": view::nodes(&s),
                     "drift": view::drift(&s), "failed": failed, "next": next,
                 })
@@ -380,7 +383,7 @@ fn eject(stack: &docker::Stack, s: &State, out: &Path) -> Result<(), Error> {
     std::fs::create_dir_all(out).map_err(io)?;
     let out = out.canonicalize().map_err(io)?;
     let mut args: Vec<String> = Vec::new();
-    for f in compose::files(&stack.root) {
+    for f in compose::resolve(&stack.root, &stack.files) {
         args.push(format!("-f '{}'", f.display()));
     }
     let a = devenv::args(&stack.root, &stack.dir);

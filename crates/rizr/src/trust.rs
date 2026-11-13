@@ -32,12 +32,18 @@ pub struct Inputs {
     pub digest: Digest,
 }
 
-pub fn inputs(root: &Path) -> Result<Inputs, Error> {
+/// `chosen`: the compose files given with `-f`; they replace the default names.
+pub fn inputs(root: &Path, chosen: &[PathBuf]) -> Result<Inputs, Error> {
     let root = root.canonicalize().map_err(|e| io_error(root, &e))?;
     let mut seen: BTreeMap<PathBuf, Option<Vec<u8>>> = BTreeMap::new();
-    let mut queue: Vec<(PathBuf, bool)> = COMPOSE
-        .iter()
-        .map(|n| (root.join(n), true))
+    let compose: Vec<PathBuf> = if chosen.is_empty() {
+        COMPOSE.iter().map(|n| root.join(n)).collect()
+    } else {
+        chosen.iter().map(|f| root.join(f)).collect()
+    };
+    let mut queue: Vec<(PathBuf, bool)> = compose
+        .into_iter()
+        .map(|p| (p, true))
         .chain(PLAIN.iter().map(|n| (root.join(n), false)))
         .collect();
     while let Some((path, compose)) = queue.pop() {
@@ -209,8 +215,8 @@ pub fn grant(store: &Path, i: &Inputs) -> std::io::Result<()> {
 }
 
 /// The gate before any verb that reads or runs repo content. Asks on a terminal; refuses without one.
-pub fn gate(root: &Path, ask: bool) -> Result<Inputs, Error> {
-    let i = inputs(root)?;
+pub fn gate(root: &Path, chosen: &[PathBuf], ask: bool) -> Result<Inputs, Error> {
+    let i = inputs(root, chosen)?;
     let store = store_path().ok_or_else(|| {
         Error::new(
             ErrorCode::Usage,
@@ -224,7 +230,7 @@ pub fn gate(root: &Path, ask: bool) -> Result<Inputs, Error> {
     }
     let terminal = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     if !ask || !terminal {
-        return Err(untrusted(&i));
+        return Err(untrusted(&i, chosen));
     }
     eprintln!(
         "rizr has not run {} with these files yet:",
@@ -242,13 +248,18 @@ pub fn gate(root: &Path, ask: bool) -> Result<Inputs, Error> {
     let mut line = String::new();
     let _ = std::io::stdin().lock().read_line(&mut line);
     if !matches!(line.trim(), "y" | "Y" | "yes") {
-        return Err(untrusted(&i));
+        return Err(untrusted(&i, chosen));
     }
     grant(&store, &i).map_err(|e| io_error(&store, &e))?;
     Ok(i)
 }
 
-fn untrusted(i: &Inputs) -> Error {
+fn untrusted(i: &Inputs, chosen: &[PathBuf]) -> Error {
+    let trust: String = chosen
+        .iter()
+        .map(|f| format!("-f {} ", f.display()))
+        .chain(["trust".into()])
+        .collect();
     let files: Vec<_> = i.files.iter().map(|f| f.display().to_string()).collect();
     Error::new(
         ErrorCode::Untrusted,
@@ -261,8 +272,8 @@ fn untrusted(i: &Inputs) -> Error {
                 files.join(", ")
             }
         ),
-        "a human reviews the files, then runs `rizr trust` in a terminal",
-        "rizr trust",
+        format!("a human reviews the files, then runs `rizr {trust}` in a terminal"),
+        format!("rizr {trust}"),
     )
 }
 
@@ -287,8 +298,8 @@ mod tests {
         );
         w("a.env", "A=1\n");
         w("sub/b.env", "B=1\n");
-        grant(&store, &inputs(repo.path()).unwrap()).unwrap();
-        assert!(is_trusted(&store, &inputs(repo.path()).unwrap()));
+        grant(&store, &inputs(repo.path(), &[]).unwrap()).unwrap();
+        assert!(is_trusted(&store, &inputs(repo.path(), &[]).unwrap()));
 
         for (file, text) in [
             ("a.env", "A=2\n"),
@@ -297,8 +308,11 @@ mod tests {
             (".env", "COMPOSE_FILE=evil.yml\n"),
         ] {
             w(file, text);
-            assert!(!is_trusted(&store, &inputs(repo.path()).unwrap()), "{file}");
-            grant(&store, &inputs(repo.path()).unwrap()).unwrap();
+            assert!(
+                !is_trusted(&store, &inputs(repo.path(), &[]).unwrap()),
+                "{file}"
+            );
+            grant(&store, &inputs(repo.path(), &[]).unwrap()).unwrap();
         }
     }
 }
