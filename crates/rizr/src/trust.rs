@@ -204,11 +204,14 @@ pub fn is_trusted(store: &Path, i: &Inputs) -> bool {
 }
 
 pub fn grant(store: &Path, i: &Inputs) -> std::io::Result<()> {
-    let mut map = load(store);
-    map.insert(i.root.to_string_lossy().into_owned(), i.digest.clone());
     if let Some(dir) = store.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    // Two repos trusted at once must not drop each other's entry: read, change and write under one lock.
+    let lock = std::fs::File::create(store.with_extension("lock"))?;
+    lock.lock()?;
+    let mut map = load(store);
+    map.insert(i.root.to_string_lossy().into_owned(), i.digest.clone());
     let tmp = store.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&map)?)?;
     std::fs::rename(tmp, store)
