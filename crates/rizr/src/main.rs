@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use rizr_core::error::{Error, ErrorCode};
 use rizr_core::model::{Gate, NodeKind};
 use rizr_core::view::{self, Drift, InstanceStatus, Receipt};
@@ -60,10 +60,11 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = cli.json;
+    let files = cli.file.clone();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            let e = known_cause(e);
+            let e = known_cause(e, &files);
             if json {
                 println!("{}", serde_json::to_string(&e).unwrap_or_default());
             } else {
@@ -112,13 +113,25 @@ fn run(cli: Cli) -> Result<(), Error> {
         Command::Action(action) => {
             let up = matches!(action, Action::Up { .. });
             let s = docker::run(&stack, i.digest, Some(action))?;
+            let urls = if up {
+                ports::checks(&stack.compose_name())
+            } else {
+                Vec::new()
+            };
             if json && up {
-                println!(
-                    "{}",
-                    serde_json::to_string(&view::receipt(&s)).unwrap_or_default()
-                );
+                let mut r = serde_json::to_value(view::receipt(&s)).unwrap_or_default();
+                r["urls"] = urls.into();
+                println!("{r}");
             } else {
                 print_status(&stack, &s);
+                for u in urls {
+                    println!(
+                        "  {} {} -> {}",
+                        u["node"].as_str().unwrap_or_default(),
+                        u["url"].as_str().unwrap_or_default(),
+                        u["check"].as_str().unwrap_or_default()
+                    );
+                }
             }
             Ok(())
         }
@@ -186,9 +199,9 @@ fn run(cli: Cli) -> Result<(), Error> {
                 .iter()
                 .flat_map(|n| [format!("rizr why {n}"), format!("rizr logs {n}")])
                 .collect();
-            let strays = ports::stray_lines(&stack.root);
+            let strays = ports::stray_lines(&stack.root, &stack.compose_name());
             next.extend(
-                ports::strays(&stack.root)
+                ports::strays(&stack.root, &stack.compose_name())
                     .into_iter()
                     .map(|(p, _)| format!("docker compose -p {p} down --remove-orphans")),
             );
@@ -222,7 +235,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                     "compose_files": compose::resolve(&stack.root, &stack.files), "status": status,
                     "findings": findings(&s), "unverified": unverified, "moved_ports": ports::lines(&stack.dir), "outside_rizr": strays,
                     "generation": s.intents.generation.0, "graph": graph, "nodes": view::nodes(&s),
-                    "drift": view::drift(&s), "failed": failed, "next": next,
+                    "drift": view::drift(&s), "failed": failed, "next": next, "verbs": verbs(),
                 })
             );
             Ok(())
@@ -246,6 +259,45 @@ fn run(cli: Cli) -> Result<(), Error> {
             eject(&stack, &s, &out)
         }
     }
+}
+
+/// Each verb with its one-line help, so an agent needs no `--help` call.
+fn verbs() -> serde_json::Map<String, serde_json::Value> {
+    Cli::command()
+        .get_subcommands()
+        .map(|c| {
+            let about = c.get_about().map(|a| a.to_string()).unwrap_or_default();
+            let args = c
+                .get_arguments()
+                .filter(|a| !a.is_global_set() && a.get_id() != "help");
+            let usage: String = args
+                .map(|a| {
+                    let pv: Vec<String> = a
+                        .get_possible_values()
+                        .iter()
+                        .map(|v| v.get_name().to_owned())
+                        .collect();
+                    let val = if pv.is_empty() {
+                        a.get_value_names()
+                            .map_or_else(|| a.get_id().to_string().to_uppercase(), |v| v.join(" "))
+                    } else {
+                        pv.join("|")
+                    };
+                    let one = match a.get_long() {
+                        None => format!("<{val}>"),
+                        Some(l) if a.get_action().takes_values() => format!("--{l} <{val}>"),
+                        Some(l) => format!("--{l}"),
+                    };
+                    if a.is_required_set() {
+                        format!(" {one}")
+                    } else {
+                        format!(" [{one}]")
+                    }
+                })
+                .collect();
+            (format!("rizr {}{usage}", c.get_name()), about.into())
+        })
+        .collect()
 }
 
 /// Defects of the files that no start fixes (`Model::findings`).
@@ -283,14 +335,14 @@ fn print_status(stack: &docker::Stack, s: &State) {
     }
     for l in ports::lines(&stack.dir)
         .into_iter()
-        .chain(ports::stray_lines(&stack.root))
+        .chain(ports::stray_lines(&stack.root, &stack.compose_name()))
     {
         println!("{l}");
     }
     let unverified: Vec<String> = view::unverified(s).into_iter().map(|n| n.0).collect();
     if !unverified.is_empty() {
         println!(
-            "unverified: {} started, but no healthcheck proves they serve requests; check each one (its URL, or `rizr logs <node>`)",
+            "unverified: {} started, but no healthcheck proves they serve requests; read each URL check below, or `rizr logs <node>`",
             unverified.join(", ")
         );
     }
@@ -503,7 +555,7 @@ fn runtime_error(msg: &str) -> Error {
 }
 
 /// The failure catalog (VISION section 9): a known cause gets its own hint and next command.
-fn known_cause(mut e: Error) -> Error {
+fn known_cause(mut e: Error, files: &[PathBuf]) -> Error {
     let m = e.message.to_ascii_lowercase();
     if m.contains("port is already allocated") || m.contains("address already in use") {
         let port = e.message.rsplit(':').find_map(|p| {
@@ -515,7 +567,7 @@ fn known_cause(mut e: Error) -> Error {
         // rizr moves a port that another program holds (ports.rs); a copy of this repo outside rizr it does not.
         let strays = Path::new(".")
             .canonicalize()
-            .map(|r| ports::strays(&r))
+            .map(|r| ports::strays(&r, &compose::default_name(&r, files)))
             .unwrap_or_default();
         if let Some((p, n)) = strays.first() {
             e.hint = format!(

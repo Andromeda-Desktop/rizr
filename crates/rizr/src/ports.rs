@@ -34,6 +34,74 @@ pub fn lines(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Each published TCP port of compose project `project` with the result of one HTTP GET to it, so an agent
+/// needs no own curl. A report for the agent, not a readiness probe (those never use host ports).
+pub fn checks(project: &str) -> Vec<Value> {
+    let out = Command::new("docker")
+        .args(["ps", "--filter"])
+        .arg(format!("label=com.docker.compose.project={project}"))
+        .args([
+            "--format",
+            "{{.Label \"com.docker.compose.service\"}}\t{{.Ports}}",
+        ])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let mut found = std::collections::BTreeSet::new();
+    for (svc, ports) in out.lines().filter_map(|l| l.split_once('\t')) {
+        for p in ports.split(", ") {
+            let Some((host, _)) = p.split_once("->").filter(|_| p.ends_with("/tcp")) else {
+                continue;
+            };
+            if let Some(port) = host.rsplit(':').next().and_then(|n| n.parse::<u16>().ok()) {
+                found.insert((svc.to_owned(), port));
+            }
+        }
+    }
+    std::thread::scope(|s| {
+        let runs: Vec<_> = found
+            .iter()
+            .map(|(svc, port)| (svc, port, s.spawn(|| http_get(*port))))
+            .collect();
+        runs.into_iter()
+            .map(|(svc, port, h)| {
+                json!({"node": svc, "url": format!("http://localhost:{port}"), "check": h.join().unwrap_or_default()})
+            })
+            .collect()
+    })
+}
+
+/// `GET /` with a 5 s limit: the status line, or why there is none.
+fn http_get(port: u16) -> String {
+    use std::io::{Read, Write};
+    use std::time::Duration;
+    let t = Duration::from_secs(5);
+    let Ok(mut c) = std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), t) else {
+        return "connection refused".into();
+    };
+    let _ = c.set_read_timeout(Some(t));
+    let req = format!("GET / HTTP/1.0\r\nHost: localhost:{port}\r\n\r\n");
+    let mut buf = [0u8; 128];
+    let n = match c.write_all(req.as_bytes()).and_then(|()| c.read(&mut buf)) {
+        Ok(n) => n,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            return "port open, no HTTP reply in 5 s".into();
+        }
+        Err(e) => return format!("port open, {e}"),
+    };
+    let head = String::from_utf8_lossy(&buf[..n]);
+    match head.lines().next() {
+        Some(l) if l.starts_with("HTTP/") => {
+            format!("HTTP {}", l.split_once(' ').map_or("", |x| x.1))
+        }
+        _ if n == 0 => "port open, closed without a reply".into(),
+        _ => "port open, not HTTP".into(),
+    }
+}
+
 /// A port is taken by another program when it cannot be bound and no container started from this repo
 /// publishes it. A container of this repo (this stack, or a copy outside rizr) is not moved around: `strays`
 /// reports a copy outside rizr with the command that stops it.
@@ -60,7 +128,8 @@ fn free_after(ip: &str, port: u16, root: &Path) -> Option<u16> {
 }
 
 /// Compose projects started from this repo outside rizr (no `rizr.project` label), with their container count.
-pub fn strays(root: &Path) -> Vec<(String, usize)> {
+/// `own` is rizr's compose name for this repo: `up` adopts those containers, so they are no strays.
+pub fn strays(root: &Path, own: &str) -> Vec<(String, usize)> {
     let out = Command::new("docker")
         .args(["ps", "-a", "--filter"])
         .arg(format!(
@@ -76,7 +145,7 @@ pub fn strays(root: &Path) -> Vec<(String, usize)> {
         .unwrap_or_default();
     let mut n: BTreeMap<String, usize> = BTreeMap::new();
     for (p, rizr) in out.lines().filter_map(|l| l.split_once(' ')) {
-        if !p.is_empty() && rizr.trim().is_empty() {
+        if !p.is_empty() && p != own && rizr.trim().is_empty() {
             *n.entry(p.into()).or_default() += 1;
         }
     }
@@ -84,8 +153,8 @@ pub fn strays(root: &Path) -> Vec<(String, usize)> {
 }
 
 /// One line per stray project, with the command that stops it; volumes stay.
-pub fn stray_lines(root: &Path) -> Vec<String> {
-    strays(root)
+pub fn stray_lines(root: &Path, own: &str) -> Vec<String> {
+    strays(root, own)
         .into_iter()
         .map(|(p, n)| {
             format!("this repo also runs outside rizr as compose project `{p}` ({n} containers); it can hold ports and confuse checks; stop it, volumes stay: docker compose -p {p} down --remove-orphans")

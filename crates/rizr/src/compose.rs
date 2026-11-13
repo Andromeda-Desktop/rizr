@@ -41,6 +41,35 @@ pub fn resolve(root: &Path, chosen: &[PathBuf]) -> Vec<PathBuf> {
     }
 }
 
+/// The project name plain `docker compose` picks: `COMPOSE_PROJECT_NAME`, else the last top-level `name:`,
+/// else the directory name; normalized as compose does.
+pub fn default_name(root: &Path, chosen: &[PathBuf]) -> String {
+    let from_files = || {
+        resolve(root, chosen).iter().rev().find_map(|f| {
+            let v: serde_norway::Value = serde_norway::from_slice(&std::fs::read(f).ok()?).ok()?;
+            v.get("name")?.as_str().map(str::to_owned)
+        })
+    };
+    let raw = std::env::var("COMPOSE_PROJECT_NAME")
+        .ok()
+        .filter(|n| !n.is_empty())
+        .or_else(from_files)
+        .unwrap_or_else(|| {
+            root.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+    let name: String = raw
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    match name.trim_start_matches(['_', '-']) {
+        "" => "root".into(),
+        n => n.into(),
+    }
+}
+
 /// The command prefix every compose call of this stack uses.
 /// `dir` is rizr's data directory for the instance: the dev env files live there.
 pub fn command(root: &Path, chosen: &[PathBuf], project: &str, dir: &Path) -> Command {

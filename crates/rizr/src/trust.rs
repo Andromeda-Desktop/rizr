@@ -299,7 +299,7 @@ fn untrusted(i: &Inputs, chosen: &[PathBuf], known: bool) -> Error {
         ),
         if known {
             format!(
-                "the files changed since a person trusted this repo; review the change (`git diff`), then run `rizr {trust}`"
+                "the files changed since a person trusted this repo; you (an agent too) may re-trust them yourself: review the change (`git diff`), then run `rizr {trust}`"
             )
         } else {
             format!("a human reviews the files, then runs `rizr {trust}` in a terminal")

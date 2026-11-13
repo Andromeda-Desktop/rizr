@@ -38,6 +38,7 @@ pub struct Stack {
     pub instance: InstanceId,
     /// rizr's data directory for this instance: generation and override files. Never inside the repo.
     pub dir: PathBuf,
+    compose_name: String,
 }
 
 impl Stack {
@@ -58,18 +59,20 @@ impl Stack {
         let project = ProjectId(if name.is_empty() { "root".into() } else { name });
         let instance = InstanceId("main".into());
         let dir = data.join(format!("{}-{}", project.0, instance.0));
+        let compose_name = compose::default_name(&root, &files);
         Self {
             root,
             files,
             project,
             instance,
             dir,
+            compose_name,
         }
     }
 
-    /// The compose project name: `<project>-<instance>` (SPEC-core section 2).
+    /// The compose project name: the one plain `docker compose` uses in this repo, so its volumes carry over.
     pub fn compose_name(&self) -> String {
-        format!("{}-{}", self.project.0, self.instance.0)
+        self.compose_name.clone()
     }
 
     pub fn compose(&self) -> Command {
