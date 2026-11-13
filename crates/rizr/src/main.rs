@@ -113,6 +113,9 @@ fn run(cli: Cli) -> Result<(), Error> {
         Command::Action(action) => {
             let up = matches!(action, Action::Up { .. });
             let s = docker::run(&stack, i.digest, Some(action))?;
+            let since = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
             let mut urls = if up {
                 ports::checks(&stack.compose_name())
             } else {
@@ -125,7 +128,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                     || check.contains("refused")
                 {
                     let node = u["node"].as_str().unwrap_or_default().to_owned();
-                    u["log_tail"] = log_tail(&stack, &node).into();
+                    u["log_tail"] = log_tail(&stack, &node, since).into();
                 }
             }
             if json && up {
@@ -274,26 +277,34 @@ fn run(cli: Cli) -> Result<(), Error> {
     }
 }
 
-/// The last 15 log lines of `node`, indented, for a URL check that failed.
-fn log_tail(stack: &docker::Stack, node: &str) -> String {
-    let mut c = stack.compose();
-    c.args([
-        "logs",
-        "--no-color",
-        "--no-log-prefix",
-        "--tail",
-        "15",
-        node,
-    ]);
-    c.output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|l| format!("      {l}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default()
+/// For a URL check that failed: the log lines of `node` since `since` (unix seconds), else its last lines; at
+/// most 15, indented, colour codes removed.
+fn log_tail(stack: &docker::Stack, node: &str, since: u64) -> String {
+    let logs = |extra: &[&str]| {
+        let mut c = stack.compose();
+        c.args(["logs", "--no-color", "--no-log-prefix", "--tail", "15"])
+            .args(extra)
+            .arg(node);
+        c.output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    let mut text = logs(&["--since", &since.to_string()]);
+    if text.trim().is_empty() {
+        text = logs(&[]);
+    }
+    let mut out = String::new();
+    let mut esc = false;
+    for ch in text.chars() {
+        match (esc, ch) {
+            (false, '\u{1b}') => esc = true,
+            (true, c) if c.is_ascii_alphabetic() => esc = false,
+            (true, _) => {}
+            (false, '\n') => out.push_str("\n      "),
+            (false, c) => out.push(c),
+        }
+    }
+    format!("      {}", out.trim_end())
 }
 
 /// Each verb with its one-line help, so an agent needs no `--help` call.

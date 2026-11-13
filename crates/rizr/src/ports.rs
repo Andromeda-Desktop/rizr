@@ -71,15 +71,16 @@ pub fn checks(project: &str) -> Vec<Value> {
     })
 }
 
-/// `GET /` with a 5 s limit: the status line, or why there is none.
+/// `GET /`: 5 s to connect, 15 s to reply (a hung request often logs its cause late): the status line, or why there is none.
 fn http_get(port: u16) -> String {
     use std::io::{Read, Write};
     use std::time::Duration;
     let t = Duration::from_secs(5);
+    let reply = Duration::from_secs(15);
     let Ok(mut c) = std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), t) else {
         return "connection refused".into();
     };
-    let _ = c.set_read_timeout(Some(t));
+    let _ = c.set_read_timeout(Some(reply));
     let req = format!("GET / HTTP/1.0\r\nHost: localhost:{port}\r\n\r\n");
     let mut buf = [0u8; 128];
     let n = match c.write_all(req.as_bytes()).and_then(|()| c.read(&mut buf)) {
@@ -88,7 +89,7 @@ fn http_get(port: u16) -> String {
             if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut =>
         {
-            return "port open, no HTTP reply in 5 s".into();
+            return "port open, no HTTP reply in 15 s".into();
         }
         Err(e) => return format!("port open, {e}"),
     };
