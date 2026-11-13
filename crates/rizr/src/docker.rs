@@ -346,9 +346,22 @@ impl Provider<'_> {
                 std::thread::spawn(move || {
                     let ok = match (pattern, cid) {
                         (Some(p), Some(c)) => {
+                            // A restarted container keeps its old lines; only this run's lines count.
+                            let since = inspect(std::slice::from_ref(&c))
+                                .ok()
+                                .and_then(|v| {
+                                    v.first()?["State"]["StartedAt"].as_str().map(str::to_owned)
+                                })
+                                .unwrap_or_default();
                             let mut cmd = Command::new("sh");
-                            cmd.args(["-c", "exec docker logs -f \"$1\" 2>&1", "sh", &c]);
-                            log_line(cmd, &p)
+                            cmd.args([
+                                "-c",
+                                "exec docker logs -f --since \"$2\" \"$1\" 2>&1",
+                                "sh",
+                                &c,
+                                &since,
+                            ]);
+                            !since.is_empty() && log_line(cmd, &p)
                         }
                         (Some(_), None) => false,
                         (None, cid) => probe(cid, &ports),

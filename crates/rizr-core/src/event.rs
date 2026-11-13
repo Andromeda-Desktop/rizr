@@ -12,7 +12,8 @@ use crate::model::{Digest, EffectId, Gen, Model, NodeId, NodeName};
 #[cfg_attr(feature = "clap", derive(clap::Subcommand))]
 #[serde(rename_all = "snake_case", tag = "action")]
 pub enum Action {
-    /// Start the stack and return when it is ready, or with the failing node.
+    /// Start the stack and return when it is ready, or with the failing node and its cause. Also the wait: run it
+    /// again while a node restarts; it starts only what is down.
     Up {
         #[cfg_attr(feature = "clap", arg(long, value_enum, default_value = "ready"))]
         wait: Wait,

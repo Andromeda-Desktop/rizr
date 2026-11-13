@@ -486,6 +486,9 @@ fn load(s: &mut State, model: Model) {
                     // The snapshot was mapped without this node's kind; read it again with the model.
                     relabel |= n.live.is_some();
                 }
+                // A snapshot mapped before the model knew this node had no probe: a running service
+                // counted as ready. Read it again with the probe.
+                relabel |= n.spec.is_none() && n.live.is_some();
                 n.spec = Some(spec.clone());
                 n.live.as_ref().is_some_and(|l| l != &spec.spec)
             }

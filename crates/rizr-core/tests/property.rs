@@ -781,3 +781,75 @@ fn service_without_probe_that_dies_at_start_fails_up() {
         "{err:?}"
     );
 }
+
+/// `up` while a service restarts: the snapshot answers before the model loads, so it cannot know the service has a
+/// probe. The running service must not count as ready before its probe passes.
+#[test]
+fn a_snapshot_before_the_model_does_not_skip_the_probe() {
+    let node = NodeId {
+        scope: Scope::Instance(InstanceId::from("main")),
+        name: NodeName::from("web"),
+    };
+    let world = World {
+        at: 1,
+        seen: vec![Seen {
+            node: node.clone(),
+            spec: Digest::from("s"),
+            generation: Gen(3),
+            status: Status::Running { health: None },
+        }],
+    };
+    let model = Model {
+        findings: vec![],
+        inputs: Digest::from("in"),
+        nodes: BTreeMap::from([(
+            node.clone(),
+            NodeSpec {
+                kind: NodeKind::Service {
+                    probe: Probe::Tcp { ports: vec![80] },
+                },
+                deps: vec![],
+                spec: Digest::from("s"),
+                provider: ProviderName::from("fake"),
+            },
+        )]),
+    };
+    let mut s = State::new(ProjectId::from("p"), InstanceId::from("main"), Gen(3));
+    s = reduce(
+        s,
+        Event::Hashed {
+            inputs: Digest::from("in"),
+            trusted: true,
+        },
+    );
+    s = reduce(s, Event::Action(Action::Up { wait: Wait::Ready }));
+    for _ in 0..16 {
+        for e in plan(&s) {
+            s = reduce(s, Event::Sent(e));
+        }
+        let Some(e) = s
+            .pending
+            .values()
+            .find(|e| e.op != Op::Import)
+            .or_else(|| s.pending.values().next())
+            .cloned()
+        else {
+            break;
+        };
+        let answer = match e.op {
+            Op::Observe => Answer::Observed(world.clone()),
+            Op::Import => Answer::Imported(model.clone()),
+            Op::Probe(_) => Answer::Probe { ok: false },
+            _ => Answer::Ok,
+        };
+        s = reduce(s, Event::Done { id: e.id, answer });
+    }
+    assert!(
+        matches!(
+            s.nodes[&node].machine,
+            Machine::Service(Service::Starting(_))
+        ),
+        "{:?}",
+        s.nodes[&node].machine
+    );
+}
