@@ -2,10 +2,11 @@
 //! of a rizr crash come from systemd. Unit `rizr-<project>-<instance>-<node>.service`; its environment carries
 //! `RIZR_SPEC` and `RIZR_GEN`, so `observe` reads the running spec from the unit itself.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rizr_core::event::{Event, RuntimeKind, Seen, Status};
@@ -22,6 +23,8 @@ pub struct Units {
     prefix: String,
     instance: InstanceId,
     root: PathBuf,
+    /// InvocationIDs of runs that a restart replaced, like a compose container that is no longer current.
+    retired: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl Units {
@@ -30,11 +33,24 @@ impl Units {
             prefix: format!("rizr-{}-{}-", stack.project.0, stack.instance.0),
             instance: stack.instance.clone(),
             root: stack.root.clone(),
+            retired: Arc::default(),
         }
     }
 
     pub fn unit(&self, node: &str) -> String {
         format!("{}{node}.service", self.prefix)
+    }
+
+    /// Drops the events of the current run of `unit`, before a restart replaces it.
+    fn retire(&self, unit: &str) {
+        let id = systemctl()
+            .args(["show", "-p", "InvocationID", "--value", unit])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap_or_default();
+        if let (false, Ok(mut r)) = (id.is_empty(), self.retired.lock()) {
+            r.insert(id);
+        }
     }
 }
 
@@ -47,6 +63,7 @@ fn systemctl() -> Command {
 /// The start command; it replaces a failed unit of the same name, which systemd keeps loaded.
 pub fn start(u: &Units, node: &str, svc: &HostService, spec: &Digest, generation: Gen) -> Command {
     let (units, u) = (u, u.unit(node));
+    units.retire(&u);
     let _ = systemctl()
         .args(["stop", &u])
         .stderr(Stdio::null())
@@ -153,10 +170,12 @@ pub fn subscribe(
         .spawn()
         .map_err(|e| format!("cannot run busctl --user: {e}"))?;
     let out = child.stdout.take().ok_or("busctl has no stdout")?;
-    let (pre, instance) = (u.prefix.clone(), u.instance.clone());
+    let (pre, instance, retired) = (u.prefix.clone(), u.instance.clone(), u.retired.clone());
     let escaped = pre.replace('-', "_2d");
     std::thread::spawn(move || {
         let mut last: BTreeMap<String, String> = BTreeMap::new();
+        // InvocationID of a run -> its RIZR_SPEC.
+        let mut runs: BTreeMap<String, String> = BTreeMap::new();
         for line in BufReader::new(out).lines().map_while(Result::ok) {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
@@ -193,21 +212,46 @@ pub fn subscribe(
             let props = Command::new("systemctl")
                 .args(["--user", "--no-pager", "show"])
                 .arg(format!("{pre}{name}.service"))
-                .args(["-p", "ExecMainCode,ExecMainStatus,Environment"])
+                .args(["-p", "InvocationID,ExecMainCode,ExecMainStatus,Environment"])
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
                 .unwrap_or_default();
             let props: BTreeMap<&str, &str> =
                 props.lines().filter_map(|l| l.split_once('=')).collect();
-            let spec = props
-                .get("Environment")
-                .and_then(|e| e.split(' ').find_map(|kv| kv.strip_prefix("RIZR_SPEC=")))
-                .unwrap_or_default()
-                .to_owned();
+            let invocation: String = data[1]["InvocationID"]["data"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_u64)
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            if retired.lock().is_ok_and(|r| r.contains(&invocation)) {
+                continue;
+            }
+            // The props are read after the signal: a restart may have replaced the run by then, or loaded the
+            // next one before it has an InvocationID. Each run's spec and exit come from props of that run.
+            let own = props.get("InvocationID") == Some(&invocation.as_str());
+            let spec = if own {
+                let spec = props
+                    .get("Environment")
+                    .and_then(|e| e.split(' ').find_map(|kv| kv.strip_prefix("RIZR_SPEC=")))
+                    .unwrap_or_default()
+                    .to_owned();
+                runs.insert(invocation.clone(), spec.clone());
+                spec
+            } else if let Some(spec) = runs.get(&invocation) {
+                spec.clone()
+            } else {
+                continue;
+            };
+            if state != "active" {
+                runs.remove(&invocation);
+            }
             let kind = match state {
                 "active" => RuntimeKind::Start,
                 "inactive" | "failed" => RuntimeKind::Die {
-                    code: exit_code(&props),
+                    // systemd unloads a transient unit only after a clean exit.
+                    code: if own { exit_code(&props) } else { 0 },
                 },
                 _ => continue,
             };
