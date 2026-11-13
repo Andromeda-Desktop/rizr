@@ -1,11 +1,10 @@
-//! One-off commands in a running node (`exec`, `wait`). A job outlives the rizr call that starts it,
-//! so no call runs past an agent shell's timeout; `wait` picks the job up again.
+//! One-off commands as compose job containers (`exec`, `wait`). Docker holds each job: its name, exit code and
+//! logs. A job outlives the rizr call that starts it, so no call runs past an agent shell's timeout.
 
-use std::fs;
-use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::io::Read;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rizr_core::error::{Error, ErrorCode};
 
@@ -13,94 +12,91 @@ use crate::docker::Stack;
 
 /// Below the 120 s after which Claude Code moves a foreground call to the background.
 const BUDGET: Duration = Duration::from_secs(100);
-const TAIL_LINES: usize = 30;
+const LABEL: &str = "rizr.job";
 
-#[derive(Debug, PartialEq)]
-enum Job {
-    Running,
-    Exited(i32),
-    /// The process is gone and wrote no exit code (killed, or the machine restarted).
-    Lost,
-}
-
-fn state(dir: &Path) -> Job {
-    let exited = || {
-        fs::read_to_string(dir.join("exit"))
-            .ok()
-            .map(|s| Job::Exited(s.trim().parse().unwrap_or(-1)))
-    };
-    if let Some(j) = exited() {
-        return j;
+/// Remove this stack's job containers: the finished ones, or with `running` also those that still run (`down`).
+pub fn remove(stack: &Stack, running: bool) {
+    let ids = Command::new("docker")
+        .args(["ps", "-aq", "--filter"])
+        .arg(format!("label={LABEL}"))
+        .arg("--filter")
+        .arg(format!(
+            "label=com.docker.compose.project={}",
+            stack.compose_name()
+        ))
+        .args(if running {
+            &[][..]
+        } else {
+            &["--filter", "status=exited"][..]
+        })
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    if !ids.trim().is_empty() {
+        let _ = Command::new("docker")
+            .args(["rm", "--force"])
+            .args(ids.split_whitespace())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
-    let alive = fs::read_to_string(dir.join("pid"))
-        .ok()
-        .and_then(|p| p.trim().parse::<u32>().ok())
-        .is_some_and(|p| Path::new(&format!("/proc/{p}")).exists());
-    // The job writes its exit code just before it ends: read it again once the process is gone.
-    if alive {
-        Job::Running
-    } else {
-        exited().unwrap_or(Job::Lost)
-    }
-}
-
-fn jobs(stack: &Stack) -> PathBuf {
-    stack.dir.join("jobs")
-}
-
-fn io(e: std::io::Error) -> Error {
-    Error::new(
-        ErrorCode::RuntimeUnavailable,
-        format!("cannot start the job: {e}"),
-        "rizr keeps job output in its data directory; check that it is writable",
-        "rizr status",
-    )
 }
 
 pub fn start(stack: &Stack, node: &str, cmd: &[String]) -> Result<(), Error> {
-    let id = SystemTime::now()
+    // Earlier jobs stay until the next `exec`, so `docker logs` keeps their full output.
+    remove(stack, false);
+    let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis())
-        .to_string();
-    let dir = jobs(stack).join(&id);
-    fs::create_dir_all(&dir).map_err(io)?;
-    let compose = stack.compose();
-    let mut sh = Command::new("sh");
-    sh.arg("-c")
-        .arg(r#"d=$1; shift; "$@" >"$d/log" 2>&1 </dev/null; echo $? >"$d/exit.tmp"; mv "$d/exit.tmp" "$d/exit""#)
-        .arg("sh")
-        .arg(&dir)
-        .arg(compose.get_program())
-        .args(compose.get_args())
-        .args(["exec", "-T", node])
+        .map_or(0, |d| d.as_millis());
+    let id = format!("{}-job-{node}-{millis}", stack.compose_name());
+    let out = stack
+        .compose()
+        .args(["run", "-d", "--no-deps", "--name", &id, "--label"])
+        .arg(format!("{LABEL}={node}"))
+        .arg(node)
         .args(cmd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        // Its own process group: a signal to the agent's shell does not stop the job.
-        .process_group(0);
-    for (k, v) in compose.get_envs() {
-        match v {
-            Some(v) => sh.env(k, v),
-            None => sh.env_remove(k),
-        };
+        .output()
+        .map_err(|e| runtime(&e.to_string()))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(Error::new(
+            ErrorCode::JobFailed,
+            format!(
+                "cannot start a job in {node}: {}",
+                err.trim()
+                    .lines()
+                    .last()
+                    .unwrap_or("docker compose run failed")
+            ),
+            "the node must be a service of this stack; `rizr up` builds its image and starts its dependencies",
+            "rizr status",
+        ));
     }
-    if let Some(d) = compose.get_current_dir() {
-        sh.current_dir(d);
-    }
-    let child = sh.spawn().map_err(io)?;
-    fs::write(dir.join("pid"), child.id().to_string()).map_err(io)?;
-    fs::write(jobs(stack).join("last"), &id).map_err(io)?;
     println!("job {id}: {node} $ {}", cmd.join(" "));
-    follow(&dir, &id)
+    follow(&id)
 }
 
 pub fn wait(stack: &Stack, job: Option<&str>) -> Result<(), Error> {
     let id = match job {
         Some(j) => j.to_owned(),
-        None => fs::read_to_string(jobs(stack).join("last"))
-            .map(|s| s.trim().to_owned())
-            .map_err(|_| {
+        None => Command::new("docker")
+            .args(["ps", "-a", "--format", "{{.Names}}", "--filter"])
+            .arg(format!("label={LABEL}"))
+            .arg("--filter")
+            .arg(format!(
+                "label=com.docker.compose.project={}",
+                stack.compose_name()
+            ))
+            .output()
+            .ok()
+            .and_then(|o| {
+                // `docker ps` lists the newest container first.
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .next()
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| {
                 Error::new(
                     ErrorCode::Usage,
                     "no job to wait for",
@@ -109,56 +105,71 @@ pub fn wait(stack: &Stack, job: Option<&str>) -> Result<(), Error> {
                 )
             })?,
     };
-    let dir = jobs(stack).join(&id);
-    if !dir.is_dir() {
-        return Err(Error::new(
-            ErrorCode::Usage,
-            format!("no job {id}"),
-            "omit the job id to wait for the last `rizr exec`",
-            "rizr wait",
-        ));
-    }
-    follow(&dir, &id)
+    follow(&id)
 }
 
-fn follow(dir: &Path, id: &str) -> Result<(), Error> {
-    let start = Instant::now();
-    let job = loop {
-        match state(dir) {
-            Job::Running if start.elapsed() < BUDGET => {
-                std::thread::sleep(Duration::from_millis(200))
+fn runtime(e: &str) -> Error {
+    Error::new(
+        ErrorCode::RuntimeUnavailable,
+        format!("cannot run docker: {e}"),
+        "start the docker daemon",
+        "docker info",
+    )
+}
+
+/// Block on `docker wait` until the job ends or the budget passes, then print its last log lines.
+fn follow(id: &str) -> Result<(), Error> {
+    let mut child = Command::new("docker")
+        .args(["wait", id])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| runtime(&e.to_string()))?;
+    let mut stdout = child.stdout.take();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(o) = stdout.as_mut() {
+            let _ = o.read_to_string(&mut s);
+        }
+        let _ = tx.send(s);
+    });
+    let code = match rx.recv_timeout(BUDGET) {
+        Ok(s) => {
+            let _ = child.wait();
+            match s.trim().parse::<i32>() {
+                Ok(c) => Some(c),
+                Err(_) => {
+                    return Err(Error::new(
+                        ErrorCode::Usage,
+                        format!("no job {id}"),
+                        "omit the job name to wait for the last `rizr exec`",
+                        "rizr wait",
+                    ));
+                }
             }
-            j => break j,
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            None
         }
     };
-    let log = dir.join("log");
-    let text = fs::read_to_string(&log).unwrap_or_default();
-    let lines: Vec<_> = text.lines().collect();
-    let skip = lines.len().saturating_sub(TAIL_LINES);
-    if skip > 0 {
-        println!("({skip} earlier lines in {})", log.display());
-    }
-    for l in &lines[skip..] {
-        println!("  {l}");
-    }
-    match job {
-        Job::Exited(0) => {
+    let _ = Command::new("docker")
+        .args(["logs", "--tail", "30", id])
+        .status();
+    match code {
+        Some(0) => {
             println!("job {id}: exit 0");
             Ok(())
         }
-        Job::Exited(c) => Err(Error::new(
+        Some(c) => Err(Error::new(
             ErrorCode::JobFailed,
             format!("job {id} exited with code {c}"),
             "the output above shows why",
-            format!("cat {}", log.display()),
+            format!("docker logs {id}"),
         )),
-        Job::Lost => Err(Error::new(
-            ErrorCode::JobFailed,
-            format!("job {id} ended without an exit code"),
-            "the job was killed; start it again",
-            "rizr exec <node> -- <command>",
-        )),
-        Job::Running => Err(Error::new(
+        None => Err(Error::new(
             ErrorCode::StillRunning,
             format!("job {id} still runs after {} s", BUDGET.as_secs()),
             "it keeps running in the background; wait again, each call waits up to 100 s",

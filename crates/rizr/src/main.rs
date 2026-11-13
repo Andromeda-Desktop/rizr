@@ -54,13 +54,14 @@ enum Command {
         #[arg(long, default_value = "rizr-eject")]
         out: PathBuf,
     },
-    /// Run a one-off command in a running node, such as a migration. Returns within 100 s; a longer command keeps running.
+    /// Run a one-off command, such as a migration, in a new container of a node with its env and network. Returns
+    /// within 100 s; a longer command keeps running.
     Exec {
         node: String,
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
-    /// Wait up to 100 s more for the last `exec` (or the given job) and print its new output and exit code.
+    /// Wait up to 100 s more for the last `exec` (or the named job), then print its last output and exit code.
     Wait { job: Option<String> },
     /// Print the JSON Schema of the API: actions, errors, receipt and drift.
     Schema,
@@ -121,7 +122,11 @@ fn run(cli: Cli) -> Result<(), Error> {
         Command::Schema | Command::Action(Action::Trust { .. }) => Ok(()),
         Command::Action(action) => {
             let up = matches!(action, Action::Up { .. });
+            let down = matches!(action, Action::Down);
             let s = docker::run(&stack, i.digest, Some(action))?;
+            if down {
+                exec::remove(&stack, true);
+            }
             let since = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
