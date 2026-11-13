@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Fair comparison: ROUNDS rounds, each runs every task with the bare arm and then the rizr arm on the same build.
+# Usage: eval/rounds.sh [task-number...]   Output: $BASE/<arm>-r<round>/ and $BASE/median.json.
+set -uo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+BASE=${BASE:-$here/../.agent/scratch/eval-rounds}
+ROUNDS=${ROUNDS:-3}
+tasks=("${@:-1 2 3 4 5 6 7 8 9 10}")
+
+for r in $(seq "$ROUNDS"); do
+  for arm in bare rizr; do
+    ARM=$arm OUT="$BASE/$arm-r$r" "$here/baseline.sh" "${tasks[@]}"
+  done
+done
+
+# Per arm and task: median calls, tokens, seconds; pass count.
+jq -s '
+  group_by([.arm, .task]) | map({
+    arm: .[0].arm, task: .[0].task, runs: length,
+    passes: (map(select(.verdict == "pass")) | length),
+    calls: (map(.tool_calls) | sort | .[length / 2 | floor]),
+    tokens: (map(.tokens) | sort | .[length / 2 | floor]),
+    seconds: (map(.seconds) | sort | .[length / 2 | floor]) })
+' "$BASE"/*-r*/*/result.json >"$BASE/median.json"
+echo "median: $BASE/median.json"
