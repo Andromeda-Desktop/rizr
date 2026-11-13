@@ -9,6 +9,17 @@ pub struct Error {
     pub message: String,
     pub hint: String,
     pub example: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<Box<Cause>>,
+}
+
+/// The node an error is about, with runtime evidence.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Cause {
+    pub node: String,
+    /// The last healthcheck output, else the node's last log lines.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -88,6 +99,15 @@ impl Error {
             message: message.into(),
             hint: hint.into(),
             example: example.into(),
+            cause: None,
         }
+    }
+
+    pub fn on(mut self, node: &str) -> Self {
+        self.cause = Some(Box::new(Cause {
+            node: node.to_owned(),
+            output: String::new(),
+        }));
+        self
     }
 }

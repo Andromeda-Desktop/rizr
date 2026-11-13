@@ -201,6 +201,9 @@ impl State {
                     ) | (
                         DeadlineKind::ProbeRetry,
                         Some(Machine::Service(Service::Starting(ProbeTurn::Wait)))
+                    ) | (
+                        DeadlineKind::Settle,
+                        Some(Machine::Service(Service::Starting(ProbeTurn::Settle)))
                     )
                 )
         });
@@ -252,6 +255,7 @@ pub fn reduce(mut s: State, event: Event) -> State {
                 let input = match d.kind {
                     DeadlineKind::StartTimeout => Input::StartTimeout,
                     DeadlineKind::ProbeRetry => Input::RetryDue,
+                    DeadlineKind::Settle => Input::Settled,
                 };
                 s.step(&d.node, input);
             }

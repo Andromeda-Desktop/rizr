@@ -120,6 +120,7 @@ pub struct Effect {
 pub enum DeadlineKind {
     StartTimeout,
     ProbeRetry,
+    Settle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

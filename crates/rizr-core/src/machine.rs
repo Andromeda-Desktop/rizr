@@ -28,6 +28,8 @@ pub enum ProbeTurn {
     Due,
     /// The last probe failed; the next one waits for the retry deadline.
     Wait,
+    /// The service has no probe: it is ready when it is still up at the settle deadline.
+    Settle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +78,7 @@ pub enum Input {
     Health(Health),
     ProbeResult(bool),
     RetryDue,
+    Settled,
     Inspected {
         restarting: bool,
     },
@@ -143,7 +146,7 @@ fn service(s: &Service, input: &Input, ctx: Ctx) -> Result<Service, Rejected> {
     use Service as S;
     let started = || {
         if ctx.ready_on_start {
-            S::Ready
+            S::Starting(ProbeTurn::Settle)
         } else {
             S::Starting(ProbeTurn::Due)
         }
@@ -158,6 +161,7 @@ fn service(s: &Service, input: &Input, ctx: Ctx) -> Result<Service, Rejected> {
         (S::Starting(_), I::ProbeResult(true) | I::Health(Health::Healthy)) => S::Ready,
         (S::Starting(_), I::ProbeResult(false)) => S::Starting(ProbeTurn::Wait),
         (S::Starting(ProbeTurn::Wait), I::RetryDue) => S::Starting(ProbeTurn::Due),
+        (S::Starting(ProbeTurn::Settle), I::Settled) => S::Ready,
         (S::Starting(_) | S::Ready, I::Health(Health::Unhealthy)) => S::Unhealthy,
         (S::Unhealthy, I::Health(Health::Healthy)) => S::Ready,
         (S::Starting(_), I::StartTimeout) => S::Failed(Failure::StartTimeout),

@@ -492,7 +492,7 @@ fn first_deadline(s: &State) -> Option<EffectId> {
     let retry = s
         .deadlines
         .iter()
-        .find(|(_, d)| d.kind == DeadlineKind::ProbeRetry);
+        .find(|(_, d)| d.kind != DeadlineKind::StartTimeout);
     retry
         .or_else(|| s.deadlines.iter().next())
         .map(|(id, _)| *id)
@@ -642,6 +642,8 @@ fn stale_buffered_event_does_not_undo_the_snapshot() {
             s = reduce(s, Event::Done { id: e.id, answer });
         } else if let Some(e) = fake.deliver(0) {
             s = reduce(s, e);
+        } else if let Some(id) = first_deadline(&s) {
+            s = reduce(s, Event::DeadlineHit(id));
         }
         s = settle(s, &mut fake).expect("settle");
     }
@@ -744,4 +746,38 @@ fn a_snapshot_before_the_model_keeps_a_finished_job_done() {
         s = reduce(s, Event::Done { id: e.id, answer });
     }
     assert_eq!(s.nodes[&node].machine, Machine::Job(Job::Done(Gen(3))));
+}
+
+#[test]
+fn service_without_probe_that_dies_at_start_fails_up() {
+    let mut fake = Fake::new(vec![NodeGen {
+        project: false,
+        kind: 0,
+        deps: vec![],
+    }]);
+    let mut s = start(&mut fake).expect("start");
+    let mut crashes = 0;
+    for _ in 0..200 {
+        if outcome(&s).is_some() {
+            break;
+        }
+        if let Some(e) = s.pending.values().next().cloned() {
+            let answer = fake.answer(&e, true);
+            s = reduce(s, Event::Done { id: e.id, answer });
+        } else if let Some(e) = fake.deliver(0) {
+            s = reduce(s, e);
+        } else if crashes < 10 {
+            crashes += 1;
+            fake.crash(0);
+        } else if let Some(id) = first_deadline(&s) {
+            s = reduce(s, Event::DeadlineHit(id));
+        }
+        s = settle(s, &mut fake).expect("settle");
+    }
+    let err = outcome(&s).expect("outcome").expect_err("up must fail");
+    assert_eq!(
+        err.code,
+        rizr_core::error::ErrorCode::StartFailed,
+        "{err:?}"
+    );
 }

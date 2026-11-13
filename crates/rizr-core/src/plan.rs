@@ -7,6 +7,8 @@ use crate::state::{DataAxis, Lock, ModelState, State, Sync, Target, Trust};
 
 pub const START_TIMEOUT_MS: u64 = 120_000;
 pub const PROBE_RETRY_MS: u64 = 500;
+/// How long a service with no probe must stay up before it counts as ready; most crashes at start come sooner.
+pub const SETTLE_MS: u64 = 2_000;
 
 pub fn plan(s: &State) -> Vec<Effect> {
     let mut ops: Vec<(Op, String)> = Vec::new();
@@ -142,6 +144,15 @@ pub fn plan(s: &State) -> Vec<Effect> {
                                 after_ms: PROBE_RETRY_MS,
                             },
                             "retry the probe".into(),
+                        )),
+                    ProbeTurn::Settle if !s.has_deadline(id, &DeadlineKind::Settle) => node_ops
+                        .push((
+                            Op::SetDeadline {
+                                node: id.clone(),
+                                kind: DeadlineKind::Settle,
+                                after_ms: SETTLE_MS,
+                            },
+                            "ready if it is still up then".into(),
                         )),
                     _ => {}
                 }

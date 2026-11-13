@@ -140,7 +140,7 @@ fn node_problem(s: &State, order: &[NodeId]) -> Option<Error> {
         let n = s.nodes.get(id)?;
         let name = &id.name.0;
         let logs = format!("rizr logs {name}");
-        Some(match &n.machine {
+        let e = match &n.machine {
             Machine::Service(Service::Failed(Failure::StartTimeout)) => Error::new(
                 ErrorCode::StartTimeout,
                 format!("{name} did not become ready in time"),
@@ -176,7 +176,8 @@ fn node_problem(s: &State, order: &[NodeId]) -> Option<Error> {
                 )
             }
             _ => return None,
-        })
+        };
+        Some(e.on(name))
     })
 }
 

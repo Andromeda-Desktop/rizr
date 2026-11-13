@@ -81,7 +81,11 @@ fn main() -> ExitCode {
             if json {
                 println!("{}", serde_json::to_string(&e).unwrap_or_default());
             } else {
-                eprintln!("error: {}\nhint: {}\ntry: {}", e.message, e.hint, e.example);
+                eprintln!("error: {}", e.message);
+                if let Some(c) = e.cause.as_ref().filter(|c| !c.output.is_empty()) {
+                    eprintln!("output:\n{}", indent(&c.output));
+                }
+                eprintln!("hint: {}\ntry: {}", e.hint, e.example);
             }
             ExitCode::from(e.code.class().exit_code())
         }
@@ -134,13 +138,14 @@ fn run(cli: Cli) -> Result<(), Error> {
                     format!("ls -l {}", stack.dir.display()),
                 )
             })?;
-            let s = docker::run(&stack, i.digest, Some(action))?;
-            if down {
-                exec::remove(&stack, true);
-            }
             let since = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
+            let s = docker::run(&stack, i.digest, Some(action))
+                .map_err(|e| with_output(&stack, e, since))?;
+            if down {
+                exec::remove(&stack, true);
+            }
             let mut urls = if up {
                 ports::checks(&stack.compose_name())
             } else {
@@ -153,7 +158,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                     || check.contains("refused")
                 {
                     let node = u["node"].as_str().unwrap_or_default().to_owned();
-                    u["log_tail"] = log_tail(&stack, &node, since).into();
+                    u["log_tail"] = indent(&log_lines(&stack, &node, since)).into();
                 }
             }
             let failed = urls
@@ -395,21 +400,88 @@ fn server_error(u: &serde_json::Value) -> Error {
     )
 }
 
-/// For a URL check that failed: the log lines of `node` since `since` (unix seconds), else its last lines; at
-/// most 15, indented, colour codes removed.
-fn log_tail(stack: &docker::Stack, node: &str, since: u64) -> String {
-    let logs = |extra: &[&str]| {
-        let mut c = stack.compose();
-        c.args(["logs", "--no-color", "--no-log-prefix", "--tail", "15"])
-            .args(extra)
-            .arg(node);
+/// Adds runtime evidence to a node failure: the last healthcheck output for an unhealthy node, else its log lines.
+fn with_output(stack: &docker::Stack, mut e: Error, since: u64) -> Error {
+    let Some(cause) = e.cause.as_deref_mut() else {
+        return e;
+    };
+    if !matches!(
+        e.code,
+        ErrorCode::StartFailed
+            | ErrorCode::StartTimeout
+            | ErrorCode::Unhealthy
+            | ErrorCode::JobFailed
+    ) {
+        return e;
+    }
+    if e.code == ErrorCode::Unhealthy {
+        cause.output = health_output(stack, &cause.node);
+    }
+    if cause.output.trim().is_empty() {
+        cause.output = log_lines(stack, &cause.node, since);
+    }
+    e
+}
+
+/// The output of the last healthcheck run of a compose node, at most 15 lines.
+fn health_output(stack: &docker::Stack, node: &str) -> String {
+    let out = |mut c: std::process::Command| {
+        c.output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap_or_default()
+    };
+    let mut ps = stack.compose();
+    ps.args(["ps", "-aq", node]);
+    let Some(id) = out(ps).lines().next().map(str::to_owned) else {
+        return String::new();
+    };
+    let mut c = std::process::Command::new("docker");
+    c.args(["inspect", "--format", "{{json .State.Health.Log}}", &id]);
+    let log: serde_json::Value = serde_json::from_str(&out(c)).unwrap_or_default();
+    let last = log.as_array().and_then(|a| a.last());
+    let text = last.and_then(|l| l["Output"].as_str()).unwrap_or_default();
+    let lines: Vec<&str> = text.trim_end().lines().collect();
+    let code = last.map_or(String::new(), |l| {
+        format!("healthcheck exit {}\n", l["ExitCode"])
+    });
+    format!(
+        "{code}{}",
+        lines[lines.len().saturating_sub(15)..].join("\n")
+    )
+    .trim_end()
+    .to_owned()
+}
+
+/// The log lines of `node` since `since` (unix seconds), else its last lines; at most 15, colour codes and repeated
+/// lines removed.
+/// A host node reads the journal of its unit; a compose node reads compose logs.
+fn log_lines(stack: &docker::Stack, node: &str, since: u64) -> String {
+    let host = manifest::host_names(&stack.root).contains(node);
+    let logs = |since: Option<u64>| {
+        let mut c = if host {
+            let mut c = std::process::Command::new("journalctl");
+            c.args(["--user", "-o", "cat", "--no-pager", "-n", "15", "-u"])
+                .arg(supervisor::Units::of(stack).unit(node));
+            if let Some(t) = since {
+                c.arg(format!("--since=@{t}"));
+            }
+            c
+        } else {
+            let mut c = stack.compose();
+            c.args(["logs", "--no-color", "--no-log-prefix", "--tail", "15"]);
+            if let Some(t) = since {
+                c.args(["--since", &t.to_string()]);
+            }
+            c.arg(node);
+            c
+        };
         c.output()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .unwrap_or_default()
     };
-    let mut text = logs(&["--since", &since.to_string()]);
+    let mut text = logs(Some(since));
     if text.trim().is_empty() {
-        text = logs(&[]);
+        text = logs(None);
     }
     let mut out = String::new();
     let mut esc = false;
@@ -418,11 +490,26 @@ fn log_tail(stack: &docker::Stack, node: &str, since: u64) -> String {
             (false, '\u{1b}') => esc = true,
             (true, c) if c.is_ascii_alphabetic() => esc = false,
             (true, _) => {}
-            (false, '\n') => out.push_str("\n      "),
             (false, c) => out.push(c),
         }
     }
-    format!("      {}", out.trim_end())
+    let mut seen = std::collections::HashSet::new();
+    let lines: Vec<&str> = out.lines().filter(|l| seen.insert(*l)).collect();
+    let repeated = out.lines().count() - lines.len();
+    let mut text = lines.join("\n").trim_end().to_owned();
+    if repeated > 0 {
+        text.push_str(&format!(
+            "\n({repeated} repeated lines left out; a restart loop repeats them)"
+        ));
+    }
+    text
+}
+
+fn indent(text: &str) -> String {
+    text.lines()
+        .map(|l| format!("      {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Each verb with its one-line help, so an agent needs no `--help` call.
