@@ -126,6 +126,9 @@ pub fn run(stack: &Stack, inputs: Digest, action: Option<Action>) -> Result<Stat
         events: None,
         deadlines: BTreeMap::new(),
         side: Arc::default(),
+        host: Arc::default(),
+        units: crate::supervisor::Units::of(stack),
+        unit_events: None,
     };
     let mut s = State::new(stack.project.clone(), stack.instance.clone(), generation);
     s = reduce(
@@ -154,11 +157,18 @@ struct Provider<'a> {
     deadlines: BTreeMap<EffectId, Instant>,
     /// Per service data from the import that the model does not carry.
     side: Arc<Mutex<BTreeMap<String, compose::Side>>>,
+    /// Host-process services from `rizr.toml`, run by the supervisor.
+    host: Arc<Mutex<BTreeMap<String, crate::manifest::HostService>>>,
+    units: crate::supervisor::Units,
+    unit_events: Option<Child>,
 }
 
 impl Drop for Provider<'_> {
     fn drop(&mut self) {
-        if let Some(c) = &mut self.events {
+        for c in [&mut self.events, &mut self.unit_events]
+            .into_iter()
+            .flatten()
+        {
             let _ = c.kill();
             let _ = c.wait();
         }
@@ -236,11 +246,17 @@ impl Provider<'_> {
             }),
             Op::Observe => {
                 let (labels, current) = (self.labels(), self.current.clone());
+                let units = self.units.clone();
                 std::thread::spawn(move || {
-                    done(match observe(&labels, &current) {
-                        Ok(w) => Answer::Observed(w),
-                        Err(tail) => Answer::Err { tail },
-                    });
+                    done(
+                        match observe(&labels, &current).and_then(|mut w| {
+                            w.seen.extend(crate::supervisor::observe(&units)?);
+                            Ok(w)
+                        }) {
+                            Ok(w) => Answer::Observed(w),
+                            Err(tail) => Answer::Err { tail },
+                        },
+                    );
                 });
             }
             Op::Import => {
@@ -252,16 +268,20 @@ impl Provider<'_> {
                     st.instance.clone(),
                     self.side.clone(),
                 );
+                let host = self.host.clone();
                 let inputs = match &s.trust {
                     rizr_core::state::Trust::Trusted(d) => d.clone(),
                     _ => Digest(String::new()),
                 };
                 std::thread::spawn(move || {
                     done(
-                        match compose::import(&root, &files, &name, &dir, &instance, inputs) {
-                            Ok((m, imported)) => {
+                        match import(&root, &files, &name, &dir, &instance, inputs) {
+                            Ok((m, imported, services)) => {
                                 if let Ok(mut r) = side.lock() {
                                     *r = imported;
+                                }
+                                if let Ok(mut r) = host.lock() {
+                                    *r = services;
                                 }
                                 Answer::Imported(m)
                             }
@@ -269,6 +289,9 @@ impl Provider<'_> {
                         },
                     );
                 });
+            }
+            Op::Inspect(node) if self.is_host(&node.name) => {
+                done(Answer::Inspected { restarting: false })
             }
             Op::Inspect(node) => {
                 let cid = self.container(&node.name);
@@ -278,6 +301,22 @@ impl Provider<'_> {
                         .and_then(|v| v.first()?["State"]["Restarting"].as_bool())
                         .unwrap_or(false);
                     done(Answer::Inspected { restarting });
+                });
+            }
+            Op::Probe(node) if self.is_host(&node.name) => {
+                let probe = match s.loaded().and_then(|m| m.nodes.get(&node)).map(|n| &n.kind) {
+                    Some(NodeKind::Service { probe }) => probe.clone(),
+                    _ => Probe::AtStart,
+                };
+                std::thread::spawn(move || {
+                    let ok = match &probe {
+                        Probe::Tcp { ports } => crate::supervisor::probe(ports, None),
+                        Probe::Http { port, path } => {
+                            crate::supervisor::probe(&[], Some((*port, path)))
+                        }
+                        _ => true,
+                    };
+                    done(Answer::Probe { ok })
                 });
             }
             Op::Probe(node) => {
@@ -291,6 +330,32 @@ impl Provider<'_> {
                 std::thread::spawn(move || {
                     done(Answer::Probe {
                         ok: probe(cid, &ports),
+                    })
+                });
+            }
+            Op::Start {
+                node,
+                spec,
+                generation,
+            } if self.is_host(&node.name) => {
+                let svc = self
+                    .host
+                    .lock()
+                    .ok()
+                    .and_then(|h| h.get(&node.name.0).cloned());
+                let units = self.units.clone();
+                std::thread::spawn(move || {
+                    done(match svc {
+                        Some(svc) => exec(crate::supervisor::start(
+                            &units,
+                            &node.name.0,
+                            &svc,
+                            &spec,
+                            generation,
+                        )),
+                        None => Answer::Err {
+                            tail: format!("{} is not in rizr.toml", node.name.0),
+                        },
                     })
                 });
             }
@@ -316,12 +381,20 @@ impl Provider<'_> {
                     });
                 });
             }
+            Op::Stop(node) if self.is_host(&node.name) => {
+                let cmd = crate::supervisor::stop(&self.units, &node.name.0);
+                std::thread::spawn(move || done(exec(cmd)));
+            }
             Op::Stop(node) => {
                 let mut cmd = self.stack.compose();
                 cmd.args(["rm", "--stop", "--force"]).arg(&node.name.0);
                 std::thread::spawn(move || done(exec(cmd)));
             }
         }
+    }
+
+    fn is_host(&self, node: &NodeName) -> bool {
+        self.host.lock().is_ok_and(|h| h.contains_key(&node.0))
     }
 
     fn labels(&self) -> [String; 2] {
@@ -373,10 +446,18 @@ impl Provider<'_> {
     }
 
     fn subscribe(&mut self) -> Result<(), String> {
-        if let Some(mut c) = self.events.take() {
+        for c in [self.events.take(), self.unit_events.take()]
+            .into_iter()
+            .flatten()
+        {
+            let mut c = c;
             let _ = c.kill();
             let _ = c.wait();
         }
+        let tx = self.tx.clone();
+        self.unit_events = Some(crate::supervisor::subscribe(&self.units, move |e| {
+            tx.send(Msg::Event(e)).is_ok()
+        })?);
         // `--since` replays from before the call: no event is lost between the stream start and the observe.
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -613,6 +694,43 @@ pub fn render(stack: &Stack, op: &Op) -> Option<String> {
         Op::Inspect(n) | Op::Probe(n) => format!("docker inspect <{} container>", n.name.0),
         _ => return None,
     })
+}
+
+/// The compose import (or an empty model for a repo with only `rizr.toml`), with the host services merged in.
+#[allow(clippy::type_complexity, reason = "one call site")]
+fn import(
+    root: &Path,
+    files: &[PathBuf],
+    name: &str,
+    dir: &Path,
+    instance: &InstanceId,
+    inputs: Digest,
+) -> Result<
+    (
+        rizr_core::model::Model,
+        BTreeMap<String, compose::Side>,
+        BTreeMap<String, crate::manifest::HostService>,
+    ),
+    String,
+> {
+    let (mut m, side) =
+        if compose::resolve(root, files).is_empty() && root.join("rizr.toml").is_file() {
+            (
+                rizr_core::model::Model {
+                    inputs,
+                    nodes: BTreeMap::new(),
+                    findings: Vec::new(),
+                },
+                BTreeMap::new(),
+            )
+        } else {
+            compose::import(root, files, name, dir, instance, inputs)?
+        };
+    let host = crate::manifest::merge(root, instance, &mut m)?;
+    if let Some(n) = compose::cycle(&m) {
+        return Err(format!("dependency cycle through `{}`", n.name.0));
+    }
+    Ok((m, side, host))
 }
 
 #[cfg(test)]

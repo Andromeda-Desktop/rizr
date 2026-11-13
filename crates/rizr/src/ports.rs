@@ -303,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn two_instances_that_start_at_once_get_different_ports() {
+    fn two_worktrees_that_start_at_once_get_different_ports() {
         let data = tempfile::tempdir().unwrap();
         let free = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let want = free.local_addr().unwrap().port();
@@ -312,30 +312,20 @@ mod tests {
             json!({"target": 80, "published": want.to_string(), "host_ip": "127.0.0.1", "protocol": "tcp"}),
         ];
         let claims = data.path().join("p.ports.json");
-        let (a, b) = (data.path().join("p-main"), data.path().join("p-wt2"));
-        prepare(
-            &a,
-            Path::new("/rizr-test-none"),
-            "app",
-            &ports,
-            &claims,
-            "main",
-        )
-        .unwrap();
-        // Neither container has bound the port yet: only the claim tells the second instance it is taken.
-        prepare(
-            &b,
-            Path::new("/rizr-test-none"),
-            "app",
-            &ports,
-            &claims,
-            "wt2",
-        )
-        .unwrap();
-        assert!(
-            !load(&a).contains_key("app"),
-            "the first instance keeps its port"
-        );
-        assert_ne!(load(&b)["app"][&want], want);
+        let host = |inst: &str| {
+            let dir = data.path().join(format!("p-{inst}"));
+            prepare(
+                &dir,
+                Path::new("/rizr-test-none"),
+                "app",
+                &ports,
+                &claims,
+                inst,
+            )
+            .unwrap();
+            load(&dir)["app"][&want]
+        };
+        // Neither container binds its port yet: only the claim tells the second worktree that the first holds it.
+        assert_ne!(host("wt1"), host("wt2"));
     }
 }

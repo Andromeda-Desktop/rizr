@@ -1,0 +1,6 @@
+version = 1
+
+[service.api]
+cmd = "echo api starting; exec python3 -m http.server 18301 --bind 127.0.0.1"
+depends_on = ["db"]
+ready = { http = "http://localhost:18301/" }

@@ -280,7 +280,7 @@ fn probe(svc: &Value) -> Probe {
     }
 }
 
-fn cycle(m: &Model) -> Option<NodeId> {
+pub fn cycle(m: &Model) -> Option<NodeId> {
     fn visit(m: &Model, id: &NodeId, path: &mut Vec<NodeId>, done: &mut BTreeSet<NodeId>) -> bool {
         if path.contains(id) {
             return true;
