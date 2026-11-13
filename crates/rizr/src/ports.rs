@@ -157,6 +157,40 @@ pub fn strays(root: &Path, own: &str) -> Vec<(String, usize)> {
     n.into_iter().collect()
 }
 
+/// Containers of rizr's own compose project that `up` did not start: a service gone from the compose files, or one
+/// rizr serves elsewhere (a shared database). `up` recreates every service it runs with its labels, so after `up`
+/// an unlabelled one is an orphan, as for `docker compose up --remove-orphans`. One-off `exec` jobs are kept.
+pub fn remove_orphans(own: &str) -> Vec<String> {
+    let out = Command::new("docker")
+        .args(["ps", "-a", "--filter"])
+        .arg(format!("label=com.docker.compose.project={own}"))
+        .args([
+            "--format",
+            "{{.Names}} {{.Label \"com.docker.compose.oneoff\"}} {{.Label \"rizr.project\"}}",
+        ])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let names: Vec<String> = out
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split(' ');
+            let (name, oneoff, rizr) = (f.next()?, f.next()?, f.next().unwrap_or(""));
+            (oneoff != "True" && rizr.trim().is_empty()).then(|| name.to_owned())
+        })
+        .collect();
+    if names.is_empty()
+        || !Command::new("docker")
+            .args(["rm", "-f"])
+            .args(&names)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    {
+        return Vec::new();
+    }
+    names
+}
+
 /// One line per stray project, with the command that stops it; volumes stay.
 pub fn stray_lines(root: &Path, own: &str) -> Vec<String> {
     strays(root, own)

@@ -202,6 +202,13 @@ fn run(cli: Cli) -> Result<(), Error> {
                 }
             }
             let s = s.map_err(|e| with_output(&stack, e, since))?;
+            if up {
+                for n in ports::remove_orphans(&stack.compose_name()) {
+                    eprintln!(
+                        "removed container {n}: no compose file here runs it under rizr (as `docker compose up --remove-orphans`); its volumes stay"
+                    );
+                }
+            }
             if down {
                 exec::remove(&stack, true);
                 // compose rm keeps networks; each holds an address pool until removed.
