@@ -164,7 +164,9 @@ fn service(s: &Service, input: &Input, ctx: Ctx) -> Result<Service, Rejected> {
         (S::Starting(ProbeTurn::Settle), I::Settled) => S::Ready,
         (S::Starting(_) | S::Ready, I::Health(Health::Unhealthy)) => S::Unhealthy,
         (S::Unhealthy, I::Health(Health::Healthy)) => S::Ready,
-        (S::Starting(_), I::StartTimeout) => S::Failed(Failure::StartTimeout),
+        (S::Starting(_) | S::Exited { .. } | S::Restarting, I::StartTimeout) => {
+            S::Failed(Failure::StartTimeout)
+        }
         (S::Starting(_) | S::Ready | S::Unhealthy | S::Restarting, I::Died { code }) => {
             S::Exited { code: *code }
         }

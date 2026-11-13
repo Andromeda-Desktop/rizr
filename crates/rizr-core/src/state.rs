@@ -195,9 +195,12 @@ impl State {
             &d.node != id
                 || matches!(
                     (&d.kind, &machine),
+                    // A restart loop keeps the first start's deadline, so a crash loop fails in time.
                     (
                         DeadlineKind::StartTimeout,
-                        Some(Machine::Service(Service::Starting(_)))
+                        Some(Machine::Service(
+                            Service::Starting(_) | Service::Exited { .. } | Service::Restarting
+                        ))
                     ) | (
                         DeadlineKind::ProbeRetry,
                         Some(Machine::Service(Service::Starting(ProbeTurn::Wait)))

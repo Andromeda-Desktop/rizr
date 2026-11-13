@@ -857,3 +857,52 @@ fn a_snapshot_before_the_model_does_not_skip_the_probe() {
         s.nodes[&node].machine
     );
 }
+
+/// `restart: always` with a crash at start: each restart must not renew the start deadline, or `up` never returns.
+#[test]
+fn a_crash_loop_keeps_the_first_start_deadline() {
+    use rizr_core::event::DeadlineKind;
+    let mut fake = Fake::new(vec![NodeGen {
+        project: false,
+        kind: 0,
+        deps: vec![],
+    }]);
+    let mut s = start(&mut fake).expect("start");
+    let node = fake.id(0);
+    let timeout = |s: &State| {
+        s.deadlines
+            .iter()
+            .find(|(_, d)| d.kind == DeadlineKind::StartTimeout)
+            .map(|(id, _)| *id)
+    };
+    let drain = |mut s: State, fake: &mut Fake| {
+        for _ in 0..100 {
+            if let Some(e) = s.pending.values().next().cloned() {
+                let answer = fake.answer(&e, true);
+                s = reduce(s, Event::Done { id: e.id, answer });
+            } else if let Some(e) = fake.deliver(0) {
+                s = reduce(s, e);
+            } else {
+                break;
+            }
+            s = settle(s, fake).expect("settle");
+        }
+        s
+    };
+    s = drain(s, &mut fake);
+    let first = timeout(&s).expect("a start deadline");
+    for _ in 0..3 {
+        if let Some(c) = fake.containers.get_mut(&node) {
+            c.restarts_left = u8::MAX;
+        }
+        fake.crash(0);
+        s = drain(s, &mut fake);
+        assert_eq!(timeout(&s), Some(first), "{:?}", s.nodes[&node].machine);
+    }
+    s = reduce(s, Event::DeadlineHit(first));
+    assert!(
+        matches!(s.nodes[&node].machine, Machine::Service(Service::Failed(_))),
+        "{:?}",
+        s.nodes[&node].machine
+    );
+}
