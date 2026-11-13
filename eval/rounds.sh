@@ -16,9 +16,12 @@ done
 
 # Per arm and task: median calls, tokens, seconds; pass count.
 jq -s '
-  group_by([.arm, .task]) | map({
+  map(select(.verdict != "prep_failed")) | group_by([.arm, .task]) | map({
     arm: .[0].arm, task: .[0].task, runs: length,
     passes: (map(select(.verdict == "pass")) | length),
+    timeouts: (map(select(.agent_exit == 124)) | length),
+    uncached: (map(.uncached // 0) | sort | .[length / 2 | floor]),
+    cost_usd: (map(.cost_usd // 0) | sort | .[length / 2 | floor]),
     calls: (map(.tool_calls) | sort | .[length / 2 | floor]),
     tokens: (map(.tokens) | sort | .[length / 2 | floor]),
     seconds: (map(.seconds) | sort | .[length / 2 | floor]) })

@@ -141,8 +141,10 @@ arm() { # task: give the agent rizr the way a user would: on PATH, trusted once,
   for dir in "$ROOT/$1/repo" "$ROOT/$1/wt2"; do
     [[ -d $dir ]] || continue
     echo 'This stack runs with rizr (on PATH). `rizr up` starts it and prints each URL with a check result and the cause of a failure; `rizr context --json` gives the graph, the state and every verb.' >"$dir/CLAUDE.md"
-    (cd "$dir" && script -qec "$ROOT/bin/rizr ${COMPOSE[$1]:-} trust" /dev/null <<<y) >>"$OUT/$1/prep.log" 2>&1 || log "task $1: rizr trust failed in $dir"
+    (cd "$dir" && script -qec "$ROOT/bin/rizr ${COMPOSE[$1]:-} trust" /dev/null <<<y) >>"$OUT/$1/prep.log" 2>&1 || { log "task $1: rizr trust failed in $dir"; return 1; }
   done
+  # preflight: the agent must start with the task's files trusted, as a user who ran them once
+  (cd "$ROOT/$1/repo" && "$ROOT/bin/rizr" ${COMPOSE[$1]:-} plan) >>"$OUT/$1/prep.log" 2>&1 || { log "task $1: rizr plan fails before the agent"; return 1; }
 }
 
 prompt() {
@@ -167,7 +169,8 @@ check() { # task -> exit 0 on pass; prints the reason
     2) jq -se 'any(.[] | select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") | .input.command? // ""; test("pytest|tests-start|test\\.sh"))' "$OUT/2/transcript.jsonl" >/dev/null || { echo "no test command run"; return 1; }
        [[ $(docker ps -a --filter label=com.docker.compose.service=prestart --format '{{.Status}}' | head -n1) == Exited\ \(0\)* ]] || { echo "prestart did not exit 0"; return 1; }
        (cd "$d" && docker compose exec -T backend bash scripts/tests-start.sh) >"$OUT/2/check-tests.log" 2>&1 && echo "tests pass" ;;
-    3) [[ $(docker inspect -f '{{.State.StartedAt}}' $(cat "$OUT/3/first-ids") 2>/dev/null | sort) == "$(cat "$OUT/3/first-start")" ]] || { echo "first copy changed"; return 1; }
+    3) [[ -s $OUT/3/first-ids ]] || { echo "no first copy"; return 1; }
+       [[ $(docker inspect -f '{{.State.StartedAt}}' $(cat "$OUT/3/first-ids") 2>/dev/null | sort) == "$(cat "$OUT/3/first-start")" ]] || { echo "first copy changed"; return 1; }
        http_ok http://localhost:9000/ || { echo "first copy down"; return 1; }
        local p
        for p in $(docker ps --filter ancestor=listmonk/listmonk:latest --format '{{.Ports}}' | grep -oE '0\.0\.0\.0:[0-9]+' | cut -d: -f2 | sort -u); do
@@ -185,7 +188,7 @@ check() { # task -> exit 0 on pass; prints the reason
        got=$(docker ps -a --filter "label=com.docker.compose.project.working_dir=$d" --format '{{.Label "com.docker.compose.service"}} {{.State}}' | sort | tr '\n' ' ')
        # a tool may serve db from its own container: count it when the worker reaches a running `db`
        w=$(service_ctr "$d" worker)
-       [[ $got != *"db "* && -n $w ]] && served_by "$w" db >/dev/null && got=$(printf '%s\n' $got "db running" | paste -d' ' - - | sort | tr '\n' ' ')
+       [[ $got != *"db "* && -n $w ]] && served_by "$w" db >/dev/null && got=$(printf '%s\n' $got db running | paste -d' ' - - | sort | tr '\n' ' ')
        [[ $got == "db running redis running result running vote running worker running " ]] || { echo "containers of this repo: $got"; return 1; }
        echo "stack matches the compose file" ;;
     7) [[ $(docker inspect -f '{{.State.StartedAt}}' "$OTHER" 2>/dev/null) == "$(cat "$OUT/7/other-start")" ]] && http_ok http://localhost:9000/ && grep -qi nginx /tmp/rizr-eval-body || { echo "the other server on 9000 was touched"; return 1; }
@@ -203,7 +206,8 @@ check() { # task -> exit 0 on pass; prints the reason
        ((${n:-0} > 0)) || { echo "votes do not reach the database"; return 1; }
        [[ $(git -C "$d" diff --name-only HEAD | tr '\n' ' ') == "docker-compose.yml " ]] || { echo "diff touches: $(git -C "$d" diff --name-only HEAD | tr '\n' ' ')"; return 1; }
        echo "votes counted, fix in docker-compose.yml only" ;;
-    10) [[ $(docker inspect -f '{{.State.StartedAt}}' $(cat "$OUT/10/first-ids") 2>/dev/null | sort) == "$(cat "$OUT/10/first-start")" ]] && http_ok http://localhost:9000/ || { echo "first copy changed or down"; return 1; }
+    10) [[ -s $OUT/10/first-ids ]] || { echo "no first copy"; return 1; }
+       [[ $(docker inspect -f '{{.State.StartedAt}}' $(cat "$OUT/10/first-ids") 2>/dev/null | sort) == "$(cat "$OUT/10/first-start")" ]] && http_ok http://localhost:9000/ || { echo "first copy changed or down"; return 1; }
        local app db name q='select count(*) from subscribers where email' n
        # the second app and the database it uses, wherever a tool runs it
        app=$(docker ps -q --filter ancestor=listmonk/listmonk:latest | grep -vxFf <(cut -c1-12 "$OUT/10/first-ids") | head -n1)
@@ -226,7 +230,11 @@ run() {
   local t=$1 start rc
   mkdir -p "$OUT/$t"
   log "task $t: clone + prep"
-  cleanup; clone "$t" && prep "$t" && arm "$t" || { log "task $t: prep failed"; return; }
+  cleanup; clone "$t" && prep "$t" && arm "$t" || {
+    log "task $t: prep failed"
+    jq -n --arg arm "$ARM" --argjson t "$t" '{arm: $arm, task: $t, verdict: "prep_failed"}' >"$OUT/$t/result.json"
+    return
+  }
   log "task $t: agent ($MODEL, limit ${LIMIT}s)"
   start=$SECONDS
   # NOAGENT=1 runs prep and check only: each check must fail on the prepared state.
@@ -238,7 +246,10 @@ run() {
   rc=$?
   local secs=$((SECONDS - start)) verdict reason
   reason=$(check "$t") && verdict=pass || verdict=fail
-  jq -s --arg arm "$ARM" --arg t "$t" --arg v "$verdict" --arg r "$reason" --argjson rc "$rc" --argjson s "$secs" '
+  # held-out tasks are judged from this state, never from their transcripts
+  [[ $verdict == fail ]] && { docker ps -a --format '{{.Names}} {{.Status}}'; [[ $ARM == rizr ]] &&
+    (cd "$ROOT/$t/repo" && "$ROOT/bin/rizr" ${COMPOSE[$t]:-} status); } >"$OUT/$t/check.log" 2>&1
+  jq -s --arg arm "$ARM" --arg t "$t" --arg v "$verdict" --arg r "$reason" --argjson rc "$rc" --argjson s "$secs" --arg bin "$([[ $ARM == rizr ]] && sha256sum "$RIZR" | cut -c1-12)" '
     (map(select(.type=="result")) | last) as $res
     | ([.[] | select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") | {id, cmd: (.input.command? // "")}]) as $calls
     | ([.[] | select(.type=="user") | .message.content[]? | select(.type=="tool_result" and .is_error==true) | .tool_use_id]) as $errs
@@ -249,6 +260,7 @@ run() {
         compose_calls: ([$calls[] | select(.cmd | test("docker"))] | length), reason: $r, agent_exit: $rc, seconds: $s,
         tool_calls: ([.[] | select(.type=="assistant") | .message.content[]? | select(.type=="tool_use")] | length),
         turns: $res.num_turns, cost_usd: $res.total_cost_usd,
+        rizr_sha: $bin, uncached: (($res.usage.input_tokens // 0) + ($res.usage.output_tokens // 0) + ($res.usage.cache_creation_input_tokens // 0)),
         tokens: (($res.usage.input_tokens // 0) + ($res.usage.output_tokens // 0) + ($res.usage.cache_read_input_tokens // 0) + ($res.usage.cache_creation_input_tokens // 0)),
         final: ($res.result // "" | .[0:400]) }' "$OUT/$t/transcript.jsonl" >"$OUT/$t/result.json"
   log "task $t: $verdict ($reason) $(jq -c '{tool_calls,seconds,cost_usd}' "$OUT/$t/result.json")"
