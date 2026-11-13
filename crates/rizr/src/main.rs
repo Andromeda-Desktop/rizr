@@ -392,8 +392,9 @@ fn run(cli: Cli) -> Result<(), Error> {
                 })
                 .unwrap_or_default();
             let databases = databases(&stack);
+            // One line: an agent's `| head -n 100` must not cut the graph or the next commands off.
             println!(
-                "{:#}",
+                "{}",
                 json!({
                     "databases": databases,
                     "root": stack.root, "project": stack.compose_name(), "data_dir": stack.dir,
