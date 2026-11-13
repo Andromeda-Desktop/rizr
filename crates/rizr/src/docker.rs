@@ -327,7 +327,7 @@ impl Provider<'_> {
         // JSON is YAML: compose reads it, and no value needs YAML quoting.
         std::fs::write(&path, json!({"services": {&node.name.0: svc}}).to_string())
             .map_err(|e| e.to_string())?;
-        let ports = crate::ports::prepare(&st.dir, &st.compose_name(), &node.name.0, &side.ports)?;
+        let ports = crate::ports::prepare(&st.dir, &st.root, &node.name.0, &side.ports)?;
         Ok([Some(path), ports].into_iter().flatten().collect())
     }
 

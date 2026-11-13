@@ -34,8 +34,10 @@ pub fn lines(dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// A port is taken when it cannot be bound and no container of this compose project publishes it.
-fn taken_by_other(ip: &str, port: u16, project: &str) -> bool {
+/// A port is taken by another program when it cannot be bound and no container started from this repo
+/// publishes it. A container of this repo (this stack, or a copy outside rizr) is not moved around: `strays`
+/// reports a copy outside rizr with the command that stops it.
+fn taken_by_other(ip: &str, port: u16, root: &Path) -> bool {
     if TcpListener::bind((ip, port)).is_ok() {
         return false;
     }
@@ -43,22 +45,59 @@ fn taken_by_other(ip: &str, port: u16, project: &str) -> bool {
         .args(["ps", "-q", "--filter"])
         .arg(format!("publish={port}"))
         .arg("--filter")
-        .arg(format!("label=com.docker.compose.project={project}"))
+        .arg(format!(
+            "label=com.docker.compose.project.working_dir={}",
+            root.display()
+        ))
         .output()
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false);
     !ours
 }
 
-fn free_after(ip: &str, port: u16, project: &str) -> Option<u16> {
-    (port.checked_add(1)?..=u16::MAX).find(|p| !taken_by_other(ip, *p, project))
+fn free_after(ip: &str, port: u16, root: &Path) -> Option<u16> {
+    (port.checked_add(1)?..=u16::MAX).find(|p| !taken_by_other(ip, *p, root))
+}
+
+/// Compose projects started from this repo outside rizr (no `rizr.project` label), with their container count.
+pub fn strays(root: &Path) -> Vec<(String, usize)> {
+    let out = Command::new("docker")
+        .args(["ps", "-a", "--filter"])
+        .arg(format!(
+            "label=com.docker.compose.project.working_dir={}",
+            root.display()
+        ))
+        .args([
+            "--format",
+            "{{.Label \"com.docker.compose.project\"}} {{.Label \"rizr.project\"}}",
+        ])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let mut n: BTreeMap<String, usize> = BTreeMap::new();
+    for (p, rizr) in out.lines().filter_map(|l| l.split_once(' ')) {
+        if !p.is_empty() && rizr.trim().is_empty() {
+            *n.entry(p.into()).or_default() += 1;
+        }
+    }
+    n.into_iter().collect()
+}
+
+/// One line per stray project, with the command that stops it; volumes stay.
+pub fn stray_lines(root: &Path) -> Vec<String> {
+    strays(root)
+        .into_iter()
+        .map(|(p, n)| {
+            format!("this repo also runs outside rizr as compose project `{p}` ({n} containers); it can hold ports and confuse checks; stop it, volumes stay: docker compose -p {p} down --remove-orphans")
+        })
+        .collect()
 }
 
 /// Writes `ports-<svc>.yml` when a published port of `svc` is remapped, and returns it for `-f`.
 /// `ports` is the service's `ports` list from `docker compose config --format json`.
 pub fn prepare(
     dir: &Path,
-    project: &str,
+    root: &Path,
     svc: &str,
     ports: &[Value],
 ) -> Result<Option<PathBuf>, String> {
@@ -73,8 +112,8 @@ pub fn prepare(
             let known = all.get(svc).and_then(|m| m.get(&want)).copied();
             let host = match known {
                 Some(h) => Some(h),
-                None if taken_by_other(&ip, want, project) => {
-                    let h = free_after(&ip, want, project);
+                None if taken_by_other(&ip, want, root) => {
+                    let h = free_after(&ip, want, root);
                     if let Some(h) = h {
                         all.entry(svc.into()).or_default().insert(want, h);
                         changed = true;
@@ -125,7 +164,7 @@ mod tests {
         let ports = [
             json!({"target": 80, "published": want.to_string(), "host_ip": "127.0.0.1", "protocol": "tcp"}),
         ];
-        let file = prepare(dir.path(), "rizr-test-none", "app", &ports)
+        let file = prepare(dir.path(), Path::new("/rizr-test-none"), "app", &ports)
             .unwrap()
             .unwrap();
         let host = load(dir.path())["app"][&want];
@@ -136,7 +175,7 @@ mod tests {
                 .contains(&format!("\"published\":\"{host}\""))
         );
         drop(other);
-        prepare(dir.path(), "rizr-test-none", "app", &ports).unwrap();
+        prepare(dir.path(), Path::new("/rizr-test-none"), "app", &ports).unwrap();
         assert_eq!(
             load(dir.path())["app"][&want],
             host,

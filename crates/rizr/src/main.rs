@@ -186,6 +186,12 @@ fn run(cli: Cli) -> Result<(), Error> {
                 .iter()
                 .flat_map(|n| [format!("rizr why {n}"), format!("rizr logs {n}")])
                 .collect();
+            let strays = ports::stray_lines(&stack.root);
+            next.extend(
+                ports::strays(&stack.root)
+                    .into_iter()
+                    .map(|(p, _)| format!("docker compose -p {p} down --remove-orphans")),
+            );
             let unverified = view::unverified(&s);
             next.extend(unverified.iter().map(|n| format!("rizr logs {}", n.0)));
             next.push(match status {
@@ -214,7 +220,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                 json!({
                     "root": stack.root, "project": stack.compose_name(), "data_dir": stack.dir,
                     "compose_files": compose::resolve(&stack.root, &stack.files), "status": status,
-                    "findings": findings(&s), "unverified": unverified, "moved_ports": ports::lines(&stack.dir),
+                    "findings": findings(&s), "unverified": unverified, "moved_ports": ports::lines(&stack.dir), "outside_rizr": strays,
                     "generation": s.intents.generation.0, "graph": graph, "nodes": view::nodes(&s),
                     "drift": view::drift(&s), "failed": failed, "next": next,
                 })
@@ -275,7 +281,10 @@ fn print_status(stack: &docker::Stack, s: &State) {
             .unwrap_or_default();
         println!("  {:<20} {:<16} {}{next}", n.node.name.0, n.state, n.signal);
     }
-    for l in ports::lines(&stack.dir) {
+    for l in ports::lines(&stack.dir)
+        .into_iter()
+        .chain(ports::stray_lines(&stack.root))
+    {
         println!("{l}");
     }
     let unverified: Vec<String> = view::unverified(s).into_iter().map(|n| n.0).collect();
@@ -497,9 +506,22 @@ fn known_cause(mut e: Error) -> Error {
                 .parse::<u16>()
                 .ok()
         });
-        e.hint =
-            "another process or stack holds the port; stop it, or change the published port".into();
-        e.example = port.map_or("ss -ltnp".into(), |p| format!("ss -ltnp 'sport = :{p}'"));
+        // rizr moves a port that another program holds (ports.rs); a copy of this repo outside rizr it does not.
+        let strays = Path::new(".")
+            .canonicalize()
+            .map(|r| ports::strays(&r))
+            .unwrap_or_default();
+        if let Some((p, n)) = strays.first() {
+            e.hint = format!(
+                "this repo also runs outside rizr as compose project `{p}` ({n} containers) and holds the port; stop it, volumes stay"
+            );
+            e.example = format!("docker compose -p {p} down --remove-orphans");
+        } else {
+            e.hint =
+                "another process or stack holds the port; stop it, or change the published port"
+                    .into();
+            e.example = port.map_or("ss -ltnp".into(), |p| format!("ss -ltnp 'sport = :{p}'"));
+        }
     } else if [
         "pull access denied",
         "manifest unknown",
