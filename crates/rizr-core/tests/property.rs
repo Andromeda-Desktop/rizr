@@ -610,6 +610,21 @@ fn clean_up_reaches_up() {
         rizr_core::view::instance_status(&s),
         rizr_core::view::InstanceStatus::Up
     );
+    // The receipt calls only a node with real proof ready; an open port or a plain start stays unverified.
+    let r = rizr_core::view::receipt(&s);
+    for n in &r.nodes {
+        let weak = n.signal.starts_with("tcp") || n.signal == "ready at start";
+        assert_eq!(weak, r.unverified.contains(&n.node.name), "{n:?}");
+        if weak {
+            assert_eq!(n.state, "started (unverified)");
+        }
+    }
+    assert!(
+        r.nodes
+            .iter()
+            .any(|n| n.signal == "healthcheck" && n.state == "ready")
+    );
+    assert!(!r.unverified.is_empty());
 }
 
 /// A `die` buffered during a resync, older than the snapshot, must not undo the snapshot.

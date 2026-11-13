@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, ErrorCode};
 use crate::event::Wait;
 use crate::machine::{Failure, Job, Machine, Service, failure_label};
-use crate::model::{Gate, NodeId, NodeKind, Probe};
+use crate::model::{Gate, NodeId, NodeKind, NodeName, Probe};
 use crate::plan::{gate_holds, plan};
 use crate::state::{ModelState, State, Sync, Target, Trust};
 
@@ -203,6 +203,8 @@ pub struct Receipt {
     pub generation: u64,
     pub status: InstanceStatus,
     pub nodes: Vec<NodeView>,
+    /// Started nodes whose readiness rests on an open port or the start alone: nothing proves they serve requests.
+    pub unverified: Vec<NodeName>,
     /// FNV-1a 64 over the model inputs, generation and node states.
     pub hash: String,
 }
@@ -221,12 +223,35 @@ pub fn signal(kind: Option<&NodeKind>) -> String {
     }
 }
 
+/// A ready service whose signal is an open port or the start alone: the app behind it may still fail.
+fn unproven(n: &crate::state::Node) -> bool {
+    n.machine == Machine::Service(Service::Ready)
+        && matches!(
+            n.spec.as_ref().map(|x| &x.kind),
+            Some(NodeKind::Service {
+                probe: Probe::Tcp { .. } | Probe::AtStart
+            })
+        )
+}
+
+pub fn unverified(s: &State) -> Vec<NodeName> {
+    s.nodes
+        .iter()
+        .filter(|(_, n)| unproven(n))
+        .map(|(id, _)| id.name.clone())
+        .collect()
+}
+
 pub fn nodes(s: &State) -> Vec<NodeView> {
     s.nodes
         .iter()
         .map(|(id, n)| NodeView {
             node: id.clone(),
-            state: n.machine.label(),
+            state: if unproven(n) {
+                "started (unverified)".into()
+            } else {
+                n.machine.label()
+            },
             signal: signal(n.spec.as_ref().map(|x| &x.kind)),
         })
         .collect()
@@ -279,6 +304,7 @@ pub fn receipt(s: &State) -> Receipt {
         generation: s.intents.generation.0,
         status: instance_status(s),
         nodes,
+        unverified: unverified(s),
         hash: format!("{h:016x}"),
     }
 }

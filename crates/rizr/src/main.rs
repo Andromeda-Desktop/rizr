@@ -185,6 +185,8 @@ fn run(cli: Cli) -> Result<(), Error> {
                 .iter()
                 .flat_map(|n| [format!("rizr why {n}"), format!("rizr logs {n}")])
                 .collect();
+            let unverified = view::unverified(&s);
+            next.extend(unverified.iter().map(|n| format!("rizr logs {}", n.0)));
             next.push(match status {
                 InstanceStatus::Up => "rizr status".into(),
                 _ => "rizr up --wait ready".into(),
@@ -211,7 +213,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                 json!({
                     "root": stack.root, "project": stack.compose_name(), "data_dir": stack.dir,
                     "compose_files": compose::resolve(&stack.root, &stack.files), "status": status,
-                    "findings": findings(&s),
+                    "findings": findings(&s), "unverified": unverified,
                     "generation": s.intents.generation.0, "graph": graph, "nodes": view::nodes(&s),
                     "drift": view::drift(&s), "failed": failed, "next": next,
                 })
@@ -271,6 +273,13 @@ fn print_status(stack: &docker::Stack, s: &State) {
             .map(|x| format!("  next: {x}"))
             .unwrap_or_default();
         println!("  {:<20} {:<16} {}{next}", n.node.name.0, n.state, n.signal);
+    }
+    let unverified: Vec<String> = view::unverified(s).into_iter().map(|n| n.0).collect();
+    if !unverified.is_empty() {
+        println!(
+            "unverified: {} started, but no healthcheck proves they serve requests; check each one (its URL, or `rizr logs <node>`)",
+            unverified.join(", ")
+        );
     }
 }
 
