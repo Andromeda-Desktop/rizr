@@ -451,8 +451,11 @@ fn converge(mut s: State, fake: &mut Fake) -> Result<usize, String> {
         if let Some(e) = s.pending.values().next().cloned() {
             let answer = fake.answer(&e, true);
             s = reduce(s, Event::Done { id: e.id, answer });
-        } else if let Some(e) = fake.deliver(0) {
-            s = reduce(s, e);
+        } else if !fake.notes.is_empty() {
+            // `deliver` may only drop stale restart notes; that is progress too.
+            if let Some(e) = fake.deliver(0) {
+                s = reduce(s, e);
+            }
         } else if (0..fake.gens.len()).any(|i| fake.health(i, true)) {
         } else if let Some(id) = first_deadline(&s) {
             s = reduce(s, Event::DeadlineHit(id));
