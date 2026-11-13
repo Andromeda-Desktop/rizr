@@ -81,6 +81,8 @@ pub struct Shared {
     /// The compose project name and the service's networks as (compose key, docker name).
     pub project: String,
     pub networks: Vec<(String, String)>,
+    /// The data mount the compose file gives the service, as (volume name or host path, target).
+    pub old_data: Option<(String, String)>,
 }
 
 /// The database of one instance on a shared server; the compose service name resolves to the server.
@@ -316,6 +318,154 @@ impl Db {
         Ok(())
     }
 
+    /// Copies the old compose data of the service into its database once: roles first, then the database. It
+    /// runs only while the database has no tables and no import mark. The old data is read, never changed.
+    /// On a failure it drops the database, so the next start tries again. Returns true when it copied data.
+    pub fn import(
+        &self,
+        project: &str,
+        instance: &str,
+        old: &(String, String),
+    ) -> Result<bool, String> {
+        let server = self.shared.server.container(project);
+        let user = self.shared.server.user();
+        let q = |db: &str, sql: &str| -> Result<String, String> {
+            let o = Command::new("docker")
+                .args(["exec", &server, "psql", "-U", user, "-d", db, "-tAc", sql])
+                .output()
+                .map_err(|e| e.to_string())?;
+            if o.status.success() {
+                Ok(String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            } else {
+                Err(crate::compose::tail(&o.stderr))
+            }
+        };
+        let d = &self.database;
+        let mark = format!("COMMENT ON DATABASE \"{d}\" IS '{IMPORTED}'");
+        let comment = q(
+            "postgres",
+            &format!(
+                "select coalesce(shobj_description(oid, 'pg_database'), '') from pg_database where datname = '{d}'"
+            ),
+        )?;
+        let tables = q(
+            d,
+            "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in \
+             ('r', 'p') and n.nspname not in ('pg_catalog', 'information_schema') and n.nspname not like 'pg_toast%'",
+        )?;
+        if comment == IMPORTED || tables != "0" {
+            return q("postgres", &mark).map(|_| false);
+        }
+        let tmp = format!("rizr-{project}-import-{instance}");
+        let _ = Command::new("docker")
+            .args(["rm", "--force", &tmp])
+            .output();
+        let r = self.copy(&server, &tmp, old);
+        let _ = Command::new("docker")
+            .args(["rm", "--force", &tmp])
+            .output();
+        match r {
+            Ok(copied) => q("postgres", &mark).map(|_| copied),
+            Err(e) => {
+                let _ = Command::new("docker")
+                    .args([
+                        "exec",
+                        &server,
+                        "dropdb",
+                        "-U",
+                        user,
+                        "--maintenance-db=template1",
+                        d,
+                    ])
+                    .output();
+                Err(format!("import of the old data from {}: {e}", old.0))
+            }
+        }
+    }
+
+    fn copy(&self, server: &str, tmp: &str, old: &(String, String)) -> Result<bool, String> {
+        let user = self.shared.server.user();
+        // Health events end the wait; the old data needs no init, so the server starts as soon as it recovers.
+        let mut events = Command::new("timeout")
+            .args(["120", "docker", "events", "--format", "{{.Action}}"])
+            .arg(format!("--filter=container={tmp}"))
+            .arg("--filter=event=health_status")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let started = run(Command::new("docker")
+            .args(["run", "-d", "--name", tmp, "--network", "none"])
+            .arg(format!("--volume={}:{}", old.0, old.1))
+            .arg(format!("--health-cmd=pg_isready -U {user}"))
+            .args([
+                "--health-interval=30s",
+                "--health-start-period=120s",
+                "--health-start-interval=300ms",
+            ])
+            .args(
+                self.shared
+                    .server
+                    .env
+                    .iter()
+                    .map(|(k, v)| format!("--env={k}={v}")),
+            )
+            .arg(&self.shared.server.image));
+        let healthy = started.is_ok()
+            && events.stdout.take().is_some_and(|out| {
+                std::io::BufRead::lines(std::io::BufReader::new(out))
+                    .map_while(Result::ok)
+                    .any(|l| l.ends_with(": healthy"))
+            });
+        let _ = events.kill();
+        let _ = events.wait();
+        started?;
+        if !healthy {
+            return Err("the old data did not start within 120 s".into());
+        }
+        let exists = Command::new("docker")
+            .args(["exec", tmp, "psql", "-U", user, "-d", "postgres", "-tAc"])
+            .arg(format!(
+                "select 1 from pg_database where datname = '{}'",
+                self.shared.db
+            ))
+            .output()
+            .map_err(|e| e.to_string())?;
+        if String::from_utf8_lossy(&exists.stdout).trim() != "1" {
+            return Ok(false);
+        }
+        // Roles that already exist on the server fail alone; psql goes on with the rest.
+        pipe(
+            Command::new("docker").args(["exec", tmp, "pg_dumpall", "-U", user, "--globals-only"]),
+            Command::new("docker").args([
+                "exec", "-i", server, "psql", "-U", user, "-d", "postgres", "-q",
+            ]),
+        )?;
+        pipe(
+            Command::new("docker").args([
+                "exec",
+                tmp,
+                "pg_dump",
+                "-U",
+                user,
+                "-Fc",
+                &self.shared.db,
+            ]),
+            Command::new("docker").args([
+                "exec",
+                "-i",
+                server,
+                "pg_restore",
+                "-U",
+                user,
+                "-d",
+                &self.database,
+                "--exit-on-error",
+            ]),
+        )?;
+        Ok(true)
+    }
+
     /// Takes the service name off the server; the database stays.
     pub fn detach(&self, project: &str) -> Result<(), String> {
         let server = self.shared.server.container(project);
@@ -354,6 +504,33 @@ fn aliases(state: &Value, net: &str) -> Option<Vec<String>> {
     )
 }
 
+/// The comment that marks a database as imported, so a later start never imports into it again.
+const IMPORTED: &str = "rizr: old compose data imported";
+
+/// Runs `from | to`; fails when either side fails.
+fn pipe(from: &mut Command, to: &mut Command) -> Result<(), String> {
+    let mut a = from
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let out = a.stdout.take().ok_or("no stdout")?;
+    let b = to
+        .stdin(out)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| e.to_string())?;
+    let a = a.wait_with_output().map_err(|e| e.to_string())?;
+    if !a.status.success() {
+        return Err(crate::compose::tail(&a.stderr));
+    }
+    if !b.status.success() {
+        return Err(crate::compose::tail(&b.stderr));
+    }
+    Ok(())
+}
+
 fn ok(c: &mut Command) -> bool {
     c.output().is_ok_and(|o| o.status.success())
 }
@@ -386,7 +563,25 @@ pub fn shared(svc: &Value, config: &Value) -> Option<Shared> {
         })
         .collect::<Option<_>>()?;
     let env = |k: &str| svc["environment"][k].as_str().filter(|v| !v.is_empty());
+    let old_data = svc["volumes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|v| {
+            let target = v["target"].as_str()?;
+            let source = v["source"].as_str()?;
+            if !target.starts_with("/var/lib/postgresql") {
+                return None;
+            }
+            let source = match v["type"].as_str()? {
+                "volume" => config["volumes"][source]["name"].as_str().unwrap_or(source),
+                "bind" => source,
+                _ => return None,
+            };
+            Some((source.to_owned(), target.to_owned()))
+        });
     Some(Shared {
+        old_data,
         db: env("POSTGRES_DB")
             .or_else(|| env("POSTGRES_USER"))
             .unwrap_or("postgres")

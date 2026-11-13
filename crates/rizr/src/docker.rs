@@ -492,12 +492,42 @@ impl Provider<'_> {
             Op::Start { node, spec, .. } if self.db(&node).is_some() => {
                 let db = self.db(&node);
                 let (project, tx) = (self.stack.project.0.clone(), self.tx.clone());
+                let instance = self.stack.instance.0.clone();
                 let mut old = self.stack.compose();
                 old.args(["rm", "--stop", "--force"]).arg(&node.name.0);
+                let mut ps = self.stack.compose();
+                ps.args(["ps", "-aq"]).arg(&node.name.0);
                 std::thread::spawn(move || {
                     let r = db.ok_or_else(String::new).and_then(|db| {
+                        // The old container's mount holds the data, even an anonymous volume; it must stop
+                        // before another postgres opens the same data.
+                        let mount = ps
+                            .output()
+                            .ok()
+                            .and_then(|o| {
+                                String::from_utf8_lossy(&o.stdout)
+                                    .lines()
+                                    .next()
+                                    .map(str::to_owned)
+                            })
+                            .and_then(|id| inspect_one(&id).ok())
+                            .and_then(|c| {
+                                c["Mounts"].as_array()?.iter().find_map(|m| {
+                                    let target = m["Destination"].as_str()?;
+                                    let source =
+                                        m["Name"].as_str().or_else(|| m["Source"].as_str())?;
+                                    target
+                                        .starts_with("/var/lib/postgresql")
+                                        .then(|| (source.to_owned(), target.to_owned()))
+                                })
+                            })
+                            .or_else(|| db.shared.old_data.clone());
                         let _ = old.output();
-                        db.attach(&project, &node.name.0)
+                        db.attach(&project, &node.name.0)?;
+                        match mount {
+                            Some(m) => db.import(&project, &instance, &m).map(|_| ()),
+                            None => Ok(()),
+                        }
                     });
                     if r.is_ok() {
                         // The database exists and the name resolves: that is its health check.
