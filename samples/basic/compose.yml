@@ -1,0 +1,20 @@
+# rizr sample: a database with a healthcheck, a migration job and a web service with a port.
+services:
+  db:
+    image: busybox:latest
+    command: ["sh", "-c", "sleep 2; touch /tmp/ready; exec sleep infinity"]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 1s
+      retries: 20
+  migrate:
+    image: busybox:latest
+    command: ["sh", "-c", "sleep 1; echo migrated"]
+    depends_on:
+      db: {condition: service_healthy}
+  web:
+    image: busybox:latest
+    command: ["httpd", "-f", "-p", "8000"]
+    expose: ["8000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}

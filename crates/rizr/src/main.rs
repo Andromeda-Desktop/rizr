@@ -6,6 +6,8 @@ use rizr_core::Action;
 use rizr_core::error::{Error, ErrorCode};
 use rizr_core::view::{Drift, Receipt};
 
+mod compose;
+mod docker;
 mod trust;
 
 /// One control plane for any project: run a repo's stack with one command and see why it works.
@@ -48,18 +50,26 @@ fn main() -> ExitCode {
             Err(e) => fail(cli.json, &e),
         },
         Command::Action(action) => {
-            if let Err(e) = trust::gate(Path::new("."), !cli.json) {
-                return fail(cli.json, &e);
+            let i = match trust::gate(Path::new("."), !cli.json) {
+                Ok(i) => i,
+                Err(e) => return fail(cli.json, &e),
+            };
+            let Some(data) = trust::store_path().and_then(|p| p.parent().map(Path::to_path_buf))
+            else {
+                return fail(
+                    cli.json,
+                    &Error::new(ErrorCode::Usage, "HOME is not set", "set HOME", "rizr up"),
+                );
+            };
+            let name = verb(&action);
+            let stack = docker::Stack::new(i.root, &data);
+            match docker::run(&stack, i.digest, action) {
+                Ok(_) => {
+                    eprintln!("{name}: done ({})", stack.dir.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(cli.json, &e),
             }
-            fail(
-                cli.json,
-                &Error::new(
-                    ErrorCode::NotBuilt,
-                    format!("`{}` is not built yet", verb(&action)),
-                    "this verb comes in a later pre-release",
-                    "rizr schema",
-                ),
-            )
         }
     }
 }
