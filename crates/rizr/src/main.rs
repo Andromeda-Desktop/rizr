@@ -228,6 +228,12 @@ fn run(cli: Cli) -> Result<(), Error> {
             let s = s.map_err(|e| with_output(&stack, e, since))?;
             if down {
                 exec::remove(&stack, true);
+                // As `docker compose down`: containers a plain compose run left in this project go too.
+                for n in ports::remove_orphans(&stack.compose_name(), &[]) {
+                    eprintln!(
+                        "removed container {n}: compose started it outside rizr in this project; its volumes stay"
+                    );
+                }
                 // compose rm keeps networks; each holds an address pool until removed.
                 let filter = format!("label=com.docker.compose.project={}", stack.compose_name());
                 if let Ok(o) = std::process::Command::new("docker")
