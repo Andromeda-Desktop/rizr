@@ -115,7 +115,7 @@ arm() { # task: give the agent rizr the way a user would: on PATH, trusted once,
   chmod +x "$ROOT/bin/rizr"
   for dir in "$ROOT/$1/repo" "$ROOT/$1/wt2"; do
     [[ -d $dir ]] || continue
-    echo 'This stack runs with rizr (on PATH). Run `rizr context --json` first; `rizr --help` lists the verbs.' >"$dir/CLAUDE.md"
+    echo 'This stack runs with rizr (on PATH). Run `rizr context --json` first.' >"$dir/CLAUDE.md"
     (cd "$dir" && script -qec "$ROOT/bin/rizr trust" /dev/null <<<y) >>"$OUT/$1/prep.log" 2>&1 || log "task $1: rizr trust failed in $dir"
   done
 }
