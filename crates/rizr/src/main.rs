@@ -11,6 +11,7 @@ use serde_json::json;
 mod compose;
 mod devenv;
 mod docker;
+mod doctor;
 mod exec;
 mod manifest;
 mod ports;
@@ -81,6 +82,9 @@ enum Command {
     /// Empty each shared database (or the named one), so the next `up` reruns migrate and seed jobs. The current
     /// data becomes a rewind point first.
     Reset { db: Option<String> },
+    /// Check the host for problems that break a stack: docker, network pools, disk, stale installs, database
+    /// access. Each problem names its fix. Runs no repo tool, so it works before trust.
+    Doctor,
     /// Print the JSON Schema of the API: actions, errors, receipt and drift.
     Schema,
 }
@@ -128,7 +132,6 @@ fn run(cli: Cli) -> Result<(), Error> {
         eprintln!("trusted {} ({} files)", i.root.display(), i.files.len());
         return Ok(());
     }
-    let i = trust::gate(Path::new("."), &cli.file, !json)?;
     let data = trust::store_path()
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .ok_or_else(|| {
@@ -139,9 +142,14 @@ fn run(cli: Cli) -> Result<(), Error> {
                 "HOME=/home/me rizr up",
             )
         })?;
+    if let Command::Doctor = cli.command {
+        let i = trust::inputs(Path::new("."), &cli.file)?;
+        return doctor::run(&docker::Stack::new(i.root, cli.file.clone(), &data), json);
+    }
+    let i = trust::gate(Path::new("."), &cli.file, !json)?;
     let stack = docker::Stack::new(i.root, cli.file.clone(), &data);
     match cli.command {
-        Command::Schema | Command::Action(Action::Trust { .. }) => Ok(()),
+        Command::Schema | Command::Doctor | Command::Action(Action::Trust { .. }) => Ok(()),
         Command::Action(action) => {
             let up = matches!(action, Action::Up { .. });
             let down = matches!(action, Action::Down);
