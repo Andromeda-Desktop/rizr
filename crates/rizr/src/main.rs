@@ -246,25 +246,11 @@ fn run(cli: Cli) -> Result<(), Error> {
                     }
                 }
             }
-            let mut urls = if up {
-                ports::checks(&stack.compose_name())
+            let (urls, failed) = if up {
+                url_checks(&stack, since)
             } else {
-                Vec::new()
+                (Vec::new(), None)
             };
-            for u in &mut urls {
-                let check = u["check"].as_str().unwrap_or_default();
-                if check.starts_with("HTTP 5")
-                    || check.contains("no HTTP reply")
-                    || check.contains("refused")
-                {
-                    let node = u["node"].as_str().unwrap_or_default().to_owned();
-                    u["log_tail"] = indent(&log_lines(&stack, &node, since)).into();
-                }
-            }
-            let failed = urls
-                .iter()
-                .find(|u| u["check"].as_str().is_some_and(|c| c.starts_with("HTTP 5")))
-                .map(server_error);
             if json && up {
                 let mut r = serde_json::to_value(view::receipt(&s)).unwrap_or_default();
                 r["urls"] = urls.into();
@@ -275,18 +261,8 @@ fn run(cli: Cli) -> Result<(), Error> {
                 }
                 println!("{r}");
             } else {
-                print_status(&stack, &s);
-                for u in urls {
-                    println!(
-                        "  {} {} -> {}",
-                        u["node"].as_str().unwrap_or_default(),
-                        u["url"].as_str().unwrap_or_default(),
-                        u["check"].as_str().unwrap_or_default()
-                    );
-                    if let Some(t) = u["log_tail"].as_str() {
-                        println!("    last log lines:\n{t}");
-                    }
-                }
+                print_status(&stack, &s, status_of(&s, failed.is_some()));
+                print_urls(&urls);
             }
             failed.map_or(Ok(()), Err)
         }
@@ -328,13 +304,20 @@ fn run(cli: Cli) -> Result<(), Error> {
         }
         Command::Status => {
             let s = docker::run(&stack, i.digest, None)?;
+            let (urls, failed) = url_checks(&stack, 0);
+            let status = status_of(&s, failed.is_some());
             if json {
                 println!(
                     "{}",
-                    json!({"status": view::instance_status(&s), "nodes": view::nodes(&s), "drift": view::drift(&s), "findings": findings(&s)})
+                    json!({"status": status, "nodes": view::nodes(&s), "drift": view::drift(&s), "findings": findings(&s),
+                           "urls": urls, "error": failed})
                 );
             } else {
-                print_status(&stack, &s);
+                print_status(&stack, &s, status);
+                print_urls(&urls);
+                if let Some(e) = &failed {
+                    println!("error: {}\nhint: {}\ntry: {}", e.message, e.hint, e.example);
+                }
             }
             Ok(())
         }
@@ -344,21 +327,33 @@ fn run(cli: Cli) -> Result<(), Error> {
         }
         Command::Context => {
             let s = docker::run(&stack, i.digest, None)?;
-            let status = view::instance_status(&s);
+            let (urls, url_error) = url_checks(&stack, 0);
+            let status = status_of(&s, url_error.is_some());
             let mut failed: Vec<String> = view::nodes(&s)
                 .into_iter()
                 .filter(|n| n.state.starts_with("failed") || n.state == "unhealthy")
                 .map(|n| n.node.name.0)
                 .collect();
+            let url_failed = urls
+                .iter()
+                .filter(|u| url_failed(u))
+                .filter_map(|u| u["node"].as_str());
+            for n in url_failed {
+                if !failed.iter().any(|f| f == n) {
+                    failed.push(n.to_owned());
+                }
+            }
             for f in findings(&s) {
                 if !failed.contains(&f.node.name.0) {
                     failed.push(f.node.name.0.clone());
                 }
             }
-            let mut next: Vec<String> = failed
-                .iter()
-                .flat_map(|n| [format!("rizr why {n}"), format!("rizr logs {n}")])
-                .collect();
+            let mut next: Vec<String> = url_error.iter().map(|e| e.example.clone()).collect();
+            next.extend(
+                failed
+                    .iter()
+                    .flat_map(|n| [format!("rizr why {n}"), format!("rizr logs {n}")]),
+            );
             let strays = ports::stray_lines(&stack.root, &stack.compose_name());
             next.extend(
                 ports::strays(&stack.root, &stack.compose_name())
@@ -367,6 +362,8 @@ fn run(cli: Cli) -> Result<(), Error> {
             );
             let unverified = view::unverified(&s);
             next.extend(unverified.iter().map(|n| format!("rizr logs {}", n.0)));
+            let mut seen = std::collections::BTreeSet::new();
+            next.retain(|n| seen.insert(n.clone()));
             next.push(match status {
                 InstanceStatus::Up => "rizr status".into(),
                 _ => "rizr up --wait ready".into(),
@@ -399,7 +396,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                     "rewind": rewind::entries(&stack.dir).iter().rev().take(10).collect::<Vec<_>>(),
                     "findings": findings(&s), "unverified": unverified, "moved_ports": ports::lines(&stack.dir), "outside_rizr": strays,
                     "generation": s.intents.generation.0, "graph": graph, "nodes": view::nodes(&s),
-                    "drift": view::drift(&s), "failed": failed, "next": next, "verbs": verbs(),
+                    "drift": view::drift(&s), "failed": failed, "urls": urls, "error": url_error, "next": next, "verbs": verbs(),
                 })
             );
             Ok(())
@@ -737,12 +734,55 @@ fn print_findings(s: &State) {
     }
 }
 
-fn print_status(stack: &docker::Stack, s: &State) {
+/// `Up` from the containers alone, `Degraded` when a published URL answers 5xx.
+fn status_of(s: &State, url_failed: bool) -> InstanceStatus {
+    match view::instance_status(s) {
+        InstanceStatus::Up if url_failed => InstanceStatus::Degraded,
+        st => st,
+    }
+}
+
+fn url_failed(u: &serde_json::Value) -> bool {
+    u["check"].as_str().is_some_and(|c| c.starts_with("HTTP 5"))
+}
+
+/// One GET per published port; a failing URL carries its node's log tail since `since` (unix seconds, 0 for all).
+fn url_checks(stack: &docker::Stack, since: u64) -> (Vec<serde_json::Value>, Option<Error>) {
+    let mut urls = ports::checks(&stack.compose_name());
+    for u in &mut urls {
+        let check = u["check"].as_str().unwrap_or_default();
+        if check.starts_with("HTTP 5")
+            || check.contains("no HTTP reply")
+            || check.contains("refused")
+        {
+            let node = u["node"].as_str().unwrap_or_default().to_owned();
+            u["log_tail"] = indent(&log_lines(stack, &node, since)).into();
+        }
+    }
+    let failed = urls.iter().find(|u| url_failed(u)).map(server_error);
+    (urls, failed)
+}
+
+fn print_urls(urls: &[serde_json::Value]) {
+    for u in urls {
+        println!(
+            "  {} {} -> {}",
+            u["node"].as_str().unwrap_or_default(),
+            u["url"].as_str().unwrap_or_default(),
+            u["check"].as_str().unwrap_or_default()
+        );
+        if let Some(t) = u["log_tail"].as_str() {
+            println!("    last log lines:\n{t}");
+        }
+    }
+}
+
+fn print_status(stack: &docker::Stack, s: &State, status: InstanceStatus) {
     print_findings(s);
     println!(
         "{}: {:?} (generation {})",
         stack.compose_name(),
-        view::instance_status(s),
+        status,
         s.intents.generation.0
     );
     let drift = view::drift(s);
@@ -856,6 +896,20 @@ fn why(stack: &docker::Stack, s: &State, name: &str, json: bool) -> Result<(), E
         .filter(|f| f.node == v.node)
         .map(|f| &f.error)
         .collect();
+    let (urls, url_error) = url_checks(stack, 0);
+    let urls: Vec<_> = urls.into_iter().filter(|u| u["node"] == name).collect();
+    let url_error = url_error.filter(|_| urls.iter().any(url_failed));
+    // An unexplained node: its recent log is the evidence, never "nothing".
+    let next = next
+        .or_else(|| url_error.as_ref().map(|e| e.example.clone()))
+        .or_else(|| (!v.state.starts_with("ready")).then(|| format!("rizr logs {name}")));
+    let recent = if (v.state.starts_with("ready") && url_error.is_none())
+        || urls.iter().any(|u| u["log_tail"].is_string())
+    {
+        String::new()
+    } else {
+        log_lines(stack, name, 0)
+    };
     let generated = std::fs::read_to_string(stack.dir.join("dev.env")).unwrap_or_default();
     let generated: Vec<&str> = generated
         .lines()
@@ -866,14 +920,16 @@ fn why(stack: &docker::Stack, s: &State, name: &str, json: bool) -> Result<(), E
             "{}",
             json!({"node": name, "state": v.state, "kind": kind, "signal": v.signal, "deps": deps,
                    "needed_by": needed_by, "next": next, "runtime": runtime_line(stack, name),
-                   "generated_env": generated, "problems": problems, "databases": databases(stack)})
+                   "generated_env": generated, "problems": problems, "databases": databases(stack),
+                   "urls": urls, "error": url_error, "recent_log": recent})
         );
         return Ok(());
     }
     println!("{name}: {}", v.state);
-    for e in &problems {
+    for e in problems.iter().copied().chain(url_error.as_ref()) {
         println!("  problem: {}\n    fix: {}", e.message, e.hint);
     }
+    print_urls(&urls);
     println!("  kind: {kind}");
     println!("  ready when: {}", v.signal);
     for d in &deps {
@@ -914,6 +970,9 @@ fn why(stack: &docker::Stack, s: &State, name: &str, json: bool) -> Result<(), E
             generated.join(", "),
             stack.dir.join("dev.env").display()
         );
+    }
+    if !recent.is_empty() {
+        println!("  recent log:\n{}", indent(&recent));
     }
     println!("  next: {}", next.as_deref().unwrap_or("nothing"));
     Ok(())
