@@ -1099,6 +1099,42 @@ fn known_cause(mut e: Error, files: &[PathBuf]) -> Error {
     {
         e.hint = "the image does not exist or needs a login; check its name and tag".into();
         e.example = "docker login".into();
+    } else if m.contains("permission denied") && m.contains("docker") && m.contains("sock") {
+        e.hint = "docker runs, but this user may not use its socket; add the user to the docker group, then log in again".into();
+        e.example = "sudo usermod -aG docker $USER".into();
+    } else if let Some(name) = e
+        .message
+        .split("is already in use by container")
+        .next()
+        .filter(|_| m.contains("is already in use by container"))
+        .and_then(|h| h.rsplit('"').nth(1))
+    {
+        let name = name.trim_start_matches('/').to_owned();
+        e.hint = format!(
+            "a container outside this stack holds the name `{name}` (container_name in the compose file); remove it, its volumes stay"
+        );
+        e.example = format!("docker rm -f {name}");
+    } else if let Some(c) = e.cause.as_ref().filter(|c| {
+        let o = c.output.to_ascii_lowercase();
+        [
+            "access denied for user",
+            "password authentication failed",
+            "authentication failed",
+        ]
+        .iter()
+        .any(|k| o.contains(k))
+    }) {
+        let p = Path::new(".")
+            .canonicalize()
+            .map(|r| compose::default_name(&r, files))
+            .unwrap_or_default();
+        e.hint = format!(
+            "{} cannot log in to its database: a database volume keeps the user and password it was first made with, and a changed password in the compose or env files does not reach it; put the old password back, or delete the volumes (their data goes) and start again",
+            c.node
+        );
+        e.example = format!(
+            "rizr down && docker volume rm $(docker volume ls -q --filter label=com.docker.compose.project={p}) && rizr up"
+        );
     }
     e
 }
