@@ -1,9 +1,12 @@
+use std::path::Path;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use rizr_core::Action;
 use rizr_core::error::{Error, ErrorCode};
 use rizr_core::view::{Drift, Receipt};
+
+mod trust;
 
 /// One control plane for any project: run a repo's stack with one command and see why it works.
 #[derive(Parser)]
@@ -37,15 +40,27 @@ fn main() -> ExitCode {
             println!("{schema:#}");
             ExitCode::SUCCESS
         }
-        Command::Action(action) => fail(
-            cli.json,
-            &Error::new(
-                ErrorCode::NotBuilt,
-                format!("`{}` is not built yet", verb(&action)),
-                "this verb comes in a later pre-release",
-                "rizr schema",
-            ),
-        ),
+        Command::Action(Action::Trust) => match trust::gate(Path::new("."), true) {
+            Ok(i) => {
+                eprintln!("trusted {} ({} files)", i.root.display(), i.files.len());
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(cli.json, &e),
+        },
+        Command::Action(action) => {
+            if let Err(e) = trust::gate(Path::new("."), !cli.json) {
+                return fail(cli.json, &e);
+            }
+            fail(
+                cli.json,
+                &Error::new(
+                    ErrorCode::NotBuilt,
+                    format!("`{}` is not built yet", verb(&action)),
+                    "this verb comes in a later pre-release",
+                    "rizr schema",
+                ),
+            )
+        }
     }
 }
 
