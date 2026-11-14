@@ -1,7 +1,7 @@
 //! Dev env input for a repo that does not run on a fresh clone (scratch/d0-repos.md, finding). Everything goes
 //! in rizr's data directory for the instance, never in the repo:
 //! - `dotenv`: a copy of `.env.example` (or a sibling name) when the repo has no `.env`;
-//! - `env-override.yml`: marks a missing `env_file` optional and adds its example copy;
+//! - `env-override.yml`: marks a missing `env_file` that has an example optional and adds the example copy;
 //! - `dev.env`: generated values for unset required variables. Values stay once written: a database keeps its
 //!   password across runs.
 
@@ -65,7 +65,6 @@ pub fn prepare(root: &Path, dir: &Path, compose_files: &[PathBuf]) -> Result<(),
                 if raw.contains('$') || path.is_file() {
                     continue;
                 }
-                entries.push(json!({"path": raw, "required": false}));
                 let copy = if path.file_name().is_some_and(|n| n == ".env") && dotenv.is_file() {
                     Some(dotenv.clone())
                 } else if let Some(ex) = example(&path) {
@@ -77,7 +76,9 @@ pub fn prepare(root: &Path, dir: &Path, compose_files: &[PathBuf]) -> Result<(),
                 } else {
                     None
                 };
+                // Without an example rizr cannot know the values: compose stops on the missing file (catalog).
                 if let Some(c) = copy {
+                    entries.push(json!({"path": raw, "required": false}));
                     entries.push(json!({"path": c}));
                 }
             }

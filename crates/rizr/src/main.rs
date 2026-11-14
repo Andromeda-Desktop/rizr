@@ -1103,6 +1103,52 @@ fn known_cause(mut e: Error, files: &[PathBuf]) -> Error {
     {
         e.hint = "the image does not exist or needs a login; check its name and tag".into();
         e.example = "docker login".into();
+    } else if m.contains("fully subnetted") || m.contains("non-overlapping ipv4 address pool") {
+        e.hint = "docker has no free address pool for another network: each compose project takes one or more; remove unused networks, or give docker more pools (\"default-address-pools\" in /etc/docker/daemon.json, see `rizr doctor`)".into();
+        e.example = "docker network prune".into();
+    } else if let Some((a, b)) = e
+        .message
+        .split_once("service \"")
+        .and_then(|(_, r)| r.split_once("\" depends on undefined service \""))
+        .and_then(|(a, r)| Some((a.to_owned(), r.split_once('"')?.0.to_owned())))
+    {
+        e.hint = format!(
+            "{a} depends on {b}, which no compose file in use defines; add {b}, remove it from {a}.depends_on, or pick the compose file that has it with `rizr -f`"
+        );
+        e.example = "docker compose config --services".into();
+    } else if let Some(cmd) = e
+        .message
+        .split("exec: \"")
+        .nth(1)
+        .and_then(|r| r.split('"').next())
+        .filter(|_| m.contains("executable file not found") && e.code != ErrorCode::Unhealthy)
+        .map(str::to_owned)
+    {
+        let node = e.cause.as_ref().map_or("", |c| c.node.as_str()).to_owned();
+        e.hint = format!(
+            "{node} starts with {cmd}, which its image does not have; fix `command`/`entrypoint` in the compose file, or the image tag"
+        );
+        e.example = format!(
+            "docker compose run --rm --entrypoint sh {node} -c 'command -v {cmd}; echo $PATH'"
+        );
+    } else if m.contains("failed to solve") {
+        let node = e.cause.as_ref().map_or("", |c| c.node.as_str()).to_owned();
+        e.hint = format!(
+            "the image build of {node} failed at the Dockerfile step above; fix that step (or the files it copies), then run up again"
+        );
+        e.example = format!("docker compose build {node}");
+    } else if let Some(file) = e
+        .message
+        .split("env file ")
+        .nth(1)
+        .and_then(|r| r.split(" not found").next())
+        .filter(|_| m.contains(" not found"))
+        .map(str::to_owned)
+    {
+        e.hint = format!(
+            "the compose file needs {file}, and the repo has no example of it to copy; create it with the variables the service reads (see the README)"
+        );
+        e.example = format!("touch {file}");
     } else if m.contains("permission denied") && m.contains("docker") && m.contains("sock") {
         e.hint = "docker runs, but this user may not use its socket; add the user to the docker group, then log in again".into();
         e.example = "sudo usermod -aG docker $USER".into();
@@ -1139,6 +1185,77 @@ fn known_cause(mut e: Error, files: &[PathBuf]) -> Error {
         e.example = format!(
             "rizr down && docker volume rm $(docker volume ls -q --filter label=com.docker.compose.project={p}) && rizr up"
         );
+    } else if let Some(c) = e.cause.as_ref().filter(|c| {
+        let o = c.output.to_ascii_lowercase();
+        o.contains("executable file not found") || o.contains(": not found")
+    }) && e.code == ErrorCode::Unhealthy
+    {
+        let tool = c
+            .output
+            .split("exec: \"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .unwrap_or("its command")
+            .to_owned();
+        e.hint = format!(
+            "the healthcheck of {} runs {tool}, which the image does not have; change the healthcheck to a tool the image has (wget, nc, the app's own binary) or install {tool} in the image",
+            c.node
+        );
+        e.example = format!(
+            "docker compose exec {} sh -c 'command -v curl wget nc'",
+            c.node
+        );
+    } else if let Some(c) = e.cause.as_ref().filter(|c| {
+        c.output
+            .to_ascii_lowercase()
+            .contains("no space left on device")
+    }) {
+        e.hint = format!(
+            "{} ran out of disk space: the docker disk, a volume or a tmpfs mount is full; free space or raise the tmpfs size",
+            c.node
+        );
+        e.example = "docker system df".into();
+    } else if let Some(c) = e.cause.as_ref().filter(|_| m.ends_with("exit 137")) {
+        let p = Path::new(".")
+            .canonicalize()
+            .map(|r| compose::default_name(&r, files))
+            .unwrap_or_default();
+        let ctr = format!("{p}-{}-1", c.node);
+        let oom = std::process::Command::new("docker")
+            .args(["inspect", "-f", "{{.State.OOMKilled}}", &ctr])
+            .output()
+            .is_ok_and(|o| o.stdout.starts_with(b"true"));
+        e.hint = if oom {
+            format!(
+                "{} ran out of memory and the kernel killed it; raise its mem_limit (or deploy.resources.limits.memory), or make it use less",
+                c.node
+            )
+        } else {
+            format!(
+                "{} got SIGKILL (exit 137) from outside: kill -9, docker kill, or the host ran out of memory",
+                c.node
+            )
+        };
+        e.example = format!("docker inspect -f '{{{{.State.OOMKilled}}}}' {ctr}");
     }
     e
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exhausting docker's address pools on a dev machine breaks its other stacks, so this cause has no live case.
+    #[test]
+    fn no_free_address_pool_names_the_network_fix() {
+        let e = Error::new(
+            ErrorCode::StartFailed,
+            "a failed: start error: Error response from daemon: all predefined address pools have been fully subnetted",
+            "read its logs",
+            "rizr logs a",
+        );
+        let e = known_cause(e, &[]);
+        assert!(e.hint.contains("address pool"), "{}", e.hint);
+        assert_eq!(e.example, "docker network prune");
+    }
 }

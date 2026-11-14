@@ -112,8 +112,130 @@ socket() { # this user may not use the docker socket: up names the docker group 
   expect socket out 'usermod -aG docker'
 }
 
-cases=("${@:-orphan crashloop slowjob server500 credentials namecheck downplain socket}")
-for c in ${cases[*]}; do ("$c") >"$WORK/$c.log" 2>&1 & done
+up_rc() { # case: up with a time limit; the exit code goes into out
+  timeout 120 "$RIZR" up >out 2>&1; echo "rc=$?" >>out
+}
+
+portstray() { # a plain compose copy of the same repo holds the port
+  stack portstray 'services:
+  a: {image: busybox:1.36-musl, command: [httpd, -f, -p, "80"], ports: ["18097:80"]}'
+  docker compose -p portstray-old up -d >/dev/null 2>&1
+  up_rc
+  expect portstray out 'try: docker compose -p portstray-old down --remove-orphans'
+  docker compose -p portstray-old down >/dev/null 2>&1
+  done_case portstray
+}
+
+image() { # the image does not exist
+  stack image 'services:
+  a: {image: "rizr-no-such-image:1", command: sleep 600}'
+  up_rc
+  expect image out 'try: docker login'
+  done_case image
+}
+
+daemon() { # docker does not run
+  stack daemon 'services:
+  a: {image: alpine, command: sleep 600}'
+  DOCKER_HOST=unix://$WORK/none.sock up_rc
+  expect daemon out 'rc=4'
+  expect daemon out 'try: systemctl start docker'
+}
+
+variable() { # a required compose variable has no value: rizr names it and where to set it
+  stack variable 'services:
+  a: {image: alpine, command: sleep 600, environment: {X: "${RIZR_EDGE_NEEDED:?set it}"}}'
+  up_rc
+  expect variable out 'add `RIZR_EDGE_NEEDED=<value>` to'
+  done_case variable
+}
+
+yaml() { # the compose file is not valid YAML
+  mkdir -p "$WORK/yaml" && cd "$WORK/yaml" && printf 'services:\n  a: {image: alpine\n' >compose.yaml
+  script -qec "$RIZR trust" /dev/null <<<y >out 2>&1
+  expect yaml out 'is not valid YAML'
+}
+
+job() { # a migration job fails: its output and the fix
+  stack job 'services:
+  migrate: {image: alpine, command: [sh, -c, "echo relation users does not exist; exit 3"], restart: "no"}
+  app: {image: alpine, command: sleep 600, depends_on: {migrate: {condition: service_completed_successfully}}}'
+  up_rc
+  expect job out 'relation users does not exist'
+  expect job out 'try: rizr logs migrate'
+  done_case job
+}
+
+health() { # a dependency never turns healthy: its healthcheck output
+  stack health 'services:
+  db: {image: alpine, command: sleep 600, healthcheck: {test: [CMD, sh, -c, "echo db not ready; exit 1"], interval: 1s, retries: 2}}
+  app: {image: alpine, command: sleep 600, depends_on: {db: {condition: service_healthy}}}'
+  up_rc
+  expect health out 'db not ready'
+  done_case health
+}
+
+build() { # a Dockerfile step fails
+  stack build 'services:
+  a: {build: ., command: sleep 600}'
+  printf 'FROM alpine\nRUN echo compiling; exit 2\n' >Dockerfile
+  up_rc
+  expect build out 'try: docker compose build a'
+  done_case build
+}
+
+disk() { # a tmpfs mount fills up
+  stack disk 'services:
+  a: {image: alpine, command: [sh, -c, "dd if=/dev/zero of=/data/x bs=1M count=8 && sleep 600"], restart: "no", tmpfs: ["/data:size=1m"]}'
+  up_rc
+  expect disk out 'ran out of disk space'
+  done_case disk
+}
+
+oom() { # the kernel kills a service at its memory limit
+  stack oom 'services:
+  a: {image: alpine, command: [sh, -c, "x=$$(head -c 64000000 /dev/zero | tr \"\\000\" a); sleep 600"], mem_limit: 16m, memswap_limit: 16m}'
+  up_rc
+  expect oom out 'ran out of memory'
+  done_case oom
+}
+
+tool() { # the healthcheck calls a tool the image does not have
+  stack tool 'services:
+  a: {image: alpine, command: sleep 600, healthcheck: {test: [CMD, curl, -f, "http://localhost/"], interval: 1s, retries: 2}}'
+  up_rc
+  expect tool out 'runs curl, which the image does not have'
+  done_case tool
+}
+
+nocmd() { # the start command is not in the image
+  stack nocmd 'services:
+  a: {image: alpine, command: [httpd, -f]}'
+  up_rc
+  expect nocmd out 'starts with httpd, which its image does not have'
+  done_case nocmd
+}
+
+envfile() { # an env_file with no example to copy
+  stack envfile 'services:
+  a: {image: alpine, command: sleep 600, env_file: [./secrets.env]}'
+  up_rc
+  expect envfile out 'try: touch .*secrets.env'
+}
+
+undefined() { # depends_on names a service no file defines
+  stack undefined 'services:
+  a: {image: alpine, command: sleep 600, depends_on: [nosuch]}'
+  up_rc
+  expect undefined out 'a depends on nosuch, which no compose file in use defines'
+}
+
+cases=("${@:-orphan crashloop slowjob server500 credentials namecheck downplain socket portstray image daemon variable yaml job health build disk oom tool nocmd envfile undefined}")
+# Each case takes a docker network; docker has about 30 address pools for every stack on the machine.
+for c in ${cases[*]}; do
+  while (($(jobs -rp | wc -l) >= 4)); do wait -n; done
+  ("$c") >"$WORK/$c.log" 2>&1 &
+done
 wait
 cat "$WORK"/*.log
 grep -q '^FAIL' "$WORK"/*.log && { echo "edge: failures (work dir $WORK)"; exit 1; }

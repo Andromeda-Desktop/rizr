@@ -14,6 +14,6 @@ check:
     cargo test --locked
     cargo deny check
 
-# Live edge cases against docker (crash loop, slow job, orphans, 5xx, stale credentials, name conflict); about 4 min.
+# Live edge cases against docker: the failure catalog, one small stack per cause; 4 at once.
 edge: build
     tests/edge.sh
