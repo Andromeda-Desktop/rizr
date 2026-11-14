@@ -66,8 +66,11 @@ pub fn instance_status(s: &State) -> InstanceStatus {
         InstanceStatus::Down
     } else if !nodes.is_empty() && nodes.iter().all(fine) {
         InstanceStatus::Up
-    } else {
+    } else if s.intents.target == Target::Up || nodes.iter().any(|(_, m)| m.is_waiting()) {
         InstanceStatus::Starting
+    } else {
+        // Part of the stack stopped (`docker compose stop`) and nothing starts it: `rizr up` brings it back.
+        InstanceStatus::Down
     }
 }
 

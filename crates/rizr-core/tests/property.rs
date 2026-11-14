@@ -835,6 +835,90 @@ fn service_that_exits_0_without_restart_completes_up() {
     );
 }
 
+/// `docker compose stop` on part of a stack whose database rizr serves: nothing starts, so status is Down, not Starting.
+#[test]
+fn a_partly_stopped_stack_is_down() {
+    let id = |name: &str| NodeId {
+        scope: Scope::Instance(InstanceId::from("main")),
+        name: NodeName::from(name),
+    };
+    let seen = |name: &str, status: Status| Seen {
+        node: id(name),
+        spec: Digest::from(name),
+        generation: Gen(1),
+        status,
+    };
+    let world = World {
+        at: 1,
+        seen: vec![
+            seen(
+                "db",
+                Status::Running {
+                    health: Some(Health::Healthy),
+                },
+            ),
+            seen("web", Status::Exited { code: 0 }),
+            seen("proxy", Status::Exited { code: 0 }),
+        ],
+    };
+    let spec = |name: &str, deps: &[&str]| {
+        (
+            id(name),
+            NodeSpec {
+                kind: NodeKind::Service {
+                    probe: Probe::HealthEvent,
+                },
+                deps: deps
+                    .iter()
+                    .map(|d| Dep {
+                        node: id(d),
+                        gate: Gate::Ready,
+                    })
+                    .collect(),
+                spec: Digest::from(name),
+                provider: ProviderName::from("fake"),
+            },
+        )
+    };
+    let model = Model {
+        findings: vec![],
+        inputs: Digest::from("in"),
+        nodes: BTreeMap::from([
+            spec("db", &[]),
+            spec("web", &["db"]),
+            spec("proxy", &["web"]),
+        ]),
+    };
+    let mut s = State::new(ProjectId::from("p"), InstanceId::from("main"), Gen(1));
+    s = reduce(
+        s,
+        Event::Hashed {
+            inputs: Digest::from("in"),
+            trusted: true,
+        },
+    );
+    for _ in 0..16 {
+        for e in plan(&s) {
+            s = reduce(s, Event::Sent(e));
+        }
+        let Some(e) = s.pending.values().next().cloned() else {
+            break;
+        };
+        let answer = match e.op {
+            Op::Observe => Answer::Observed(world.clone()),
+            Op::Import => Answer::Imported(model.clone()),
+            _ => Answer::Ok,
+        };
+        s = reduce(s, Event::Done { id: e.id, answer });
+    }
+    assert_eq!(
+        rizr_core::view::instance_status(&s),
+        rizr_core::view::InstanceStatus::Down,
+        "{:?}",
+        rizr_core::view::nodes(&s)
+    );
+}
+
 /// `up` while a service restarts: the snapshot answers before the model loads, so it cannot know the service has a
 /// probe. The running service must not count as ready before its probe passes.
 #[test]
