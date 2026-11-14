@@ -178,8 +178,9 @@ fn log_path(data: &Path, name: TaskName, dir: &str) -> PathBuf {
 /// Where a task runs: the host, or the compose service whose build context is the package dir.
 enum Place {
     Host,
-    /// The service, and a bind mount `dir:workdir` when the service does not mount its build context.
-    Service(String, Option<String>),
+    /// The service, and the volumes to add when the service does not mount its build context: `dir:workdir`, and
+    /// for Node an anonymous `workdir/node_modules` that keeps the image's installed modules visible.
+    Service(String, Vec<String>),
 }
 
 impl std::fmt::Display for Place {
@@ -215,7 +216,7 @@ fn place(stack: &docker::Stack, pkg: &Package) -> Place {
             .flatten()
             .any(|v| v["type"] == "bind" && v["source"].as_str().is_some_and(same));
         if mounted {
-            return Place::Service(name.clone(), None);
+            return Place::Service(name.clone(), Vec::new());
         }
         let synced = svc["develop"]["watch"]
             .as_array()
@@ -234,7 +235,11 @@ fn place(stack: &docker::Stack, pkg: &Package) -> Place {
                 .and_then(|t| workdir(&t))
         });
         if let Some(t) = target {
-            return Place::Service(name.clone(), Some(format!("{}:{t}", dir.display())));
+            let mut volumes = vec![format!("{}:{t}", dir.display())];
+            if matches!(pkg.kind, Kind::Node { .. }) {
+                volumes.push(format!("{}/node_modules", t.trim_end_matches('/')));
+            }
+            return Place::Service(name.clone(), volumes);
         }
     }
     Place::Host
@@ -481,7 +486,7 @@ pub fn run(
                 Place::Service(svc, mount) => {
                     let mut c = stack.compose();
                     c.args(["run", "--rm", "--no-deps", "-T"]);
-                    if let Some(m) = mount {
+                    for m in mount {
                         c.args(["-v", m]);
                     }
                     c.args([svc.as_str(), "sh"]);
