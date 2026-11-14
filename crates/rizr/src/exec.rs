@@ -42,6 +42,54 @@ pub fn remove(stack: &Stack, running: bool) {
     }
 }
 
+/// A compose `entrypoint` runs first in a job and gets the command as its arguments (t8: nodemon ran
+/// `server.js sh -c ...`). Names it, and the running container where the command runs alone.
+fn entrypoint_note(stack: &Stack, node: &str, cmd: &[String]) -> Option<String> {
+    let config: serde_json::Value = serde_json::from_slice(
+        &stack
+            .compose()
+            .args(["config", "--format", "json"])
+            .output()
+            .ok()?
+            .stdout,
+    )
+    .ok()?;
+    let entry: Vec<&str> = config["services"][node]["entrypoint"]
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    if entry.is_empty() {
+        return None;
+    }
+    let running = Command::new("docker")
+        .args(["ps", "--format", "{{.Names}}"])
+        .arg(format!(
+            "--filter=label=com.docker.compose.project={}",
+            stack.compose_name()
+        ))
+        .arg(format!("--filter=label=com.docker.compose.service={node}"))
+        .arg("--filter=label=com.docker.compose.oneoff=False")
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .map(str::to_owned)
+        });
+    let alone = running.map_or(String::new(), |c| {
+        format!(
+            "; to run it alone in the running container: docker exec {c} {}",
+            cmd.join(" ")
+        )
+    });
+    Some(format!(
+        "note: the compose entrypoint `{}` of {node} runs first and gets this command as arguments{alone}",
+        entry.join(" ")
+    ))
+}
+
 pub fn start(stack: &Stack, node: &str, cmd: &[String]) -> Result<(), Error> {
     // Earlier jobs stay until the next `exec`, so `docker logs` keeps their full output.
     remove(stack, false);
@@ -97,6 +145,9 @@ pub fn start(stack: &Stack, node: &str, cmd: &[String]) -> Result<(), Error> {
         ));
     }
     println!("job {id}: {node} $ {}", cmd.join(" "));
+    if let Some(note) = entrypoint_note(stack, node, cmd) {
+        println!("{note}");
+    }
     follow(&id).map_err(|e| unsynced(stack, node, cmd, &id, e))
 }
 
