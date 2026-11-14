@@ -153,6 +153,9 @@ grant() { # an agent runs rizr through a daemon grant: host verbs and -f refused
   wait %%
   cmp -s s1 s2 && grep -q '"a"' s1 && echo "ok   grant: two clients, one answer" ||
     { echo "FAIL grant: clients differ"; sed 's/^/     /' s1 s2; fails=$((fails + 1)); }
+  "$RIZR" status --json >direct 2>&1
+  cmp -s s1 direct && echo "ok   grant: same answer as the CLI" ||
+    { echo "FAIL grant: grant and CLI differ"; diff s1 direct | sed 's/^/     /'; fails=$((fails + 1)); }
   "$RIZR" agent revoke "$id" >/dev/null 2>&1
   agent status >gone.out 2>&1
   expect grant gone.out 'cannot reach the rizr daemon'
