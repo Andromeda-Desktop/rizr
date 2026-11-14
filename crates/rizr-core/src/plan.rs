@@ -20,8 +20,11 @@ pub fn plan(s: &State) -> Vec<Effect> {
             Op::Subscribe,
             "watch runtime events before reading state".into(),
         )),
-        // A snapshot taken while a start or stop runs can miss its container; wait for it to answer.
-        Sync::Subscribed if !pending(&|op| matches!(op, Op::Start { .. } | Op::Stop(_))) => {
+        // A snapshot taken while a start or stop runs can miss its container; wait for it to answer. The
+        // import names the shared databases the snapshot checks; without it they read as absent.
+        Sync::Subscribed
+            if !pending(&|op| matches!(op, Op::Start { .. } | Op::Stop(_) | Op::Import)) =>
+        {
             ops.push((Op::Observe, "read what the runtime holds now".into()))
         }
         _ => {}
