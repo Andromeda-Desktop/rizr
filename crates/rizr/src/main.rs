@@ -9,6 +9,7 @@ use rizr_core::{Action, Event, State, plan, reduce};
 use serde_json::json;
 
 mod compose;
+mod daemon;
 mod detect;
 mod devenv;
 mod docker;
@@ -117,16 +118,35 @@ enum Command {
     Gc,
     /// Print the JSON Schema of the API: actions, errors, receipt and drift.
     Schema,
+    /// Serve agent grants in the foreground: each grant is a socket that runs rizr in one worktree.
+    Daemon,
+    /// Open, close or list the agent grants of the running daemon.
+    Agent {
+        #[command(subcommand)]
+        op: daemon::AgentOp,
+    },
 }
 
 fn main() -> ExitCode {
     // `rizr status | head` must end quietly, as other unix tools do, not panic on the closed pipe.
     // SAFETY: runs before any thread starts; SIG_DFL is a valid handler.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    if let Some(socket) = std::env::var_os("RIZR_SOCKET") {
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        if !daemon::local(&argv) {
+            return daemon::forward(&socket, argv);
+        }
+    }
     let cli = Cli::parse();
     let json = cli.json;
     let files = cli.file.clone();
-    let engine = runtime::select().map_err(|m| {
+    let host_only = matches!(cli.command, Command::Daemon | Command::Agent { .. });
+    let engine = if host_only {
+        Ok(())
+    } else {
+        runtime::select().map(drop)
+    }
+    .map_err(|m| {
         Error::new(
             ErrorCode::RuntimeUnavailable,
             m,
@@ -183,6 +203,11 @@ fn run(cli: Cli) -> Result<(), Error> {
                 "HOME=/home/me rizr up",
             )
         })?;
+    match &cli.command {
+        Command::Daemon => return daemon::serve(&data),
+        Command::Agent { op } => return daemon::agent(op, json),
+        _ => {}
+    }
     if let Command::Doctor | Command::Footprint | Command::Gc = cli.command {
         let i = trust::inputs(Path::new("."), &cli.file)?;
         let stack = docker::Stack::new(i.root, cli.file.clone(), &data);
@@ -199,6 +224,8 @@ fn run(cli: Cli) -> Result<(), Error> {
         | Command::Doctor
         | Command::Footprint
         | Command::Gc
+        | Command::Daemon
+        | Command::Agent { .. }
         | Command::Action(Action::Trust { .. }) => Ok(()),
         Command::Action(action) => {
             let up = matches!(action, Action::Up { .. });

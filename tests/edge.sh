@@ -128,6 +128,38 @@ refuse() { # gateway mode: options that give a service the host are refused unti
   done_case refuse
 }
 
+grant() { # an agent runs rizr through a daemon grant: host verbs and -f refused, two clients get one answer
+  stack grant 'services:
+  a:
+    image: alpine
+    command: sleep 600'
+  export XDG_RUNTIME_DIR=$WORK/run-grant && mkdir -p "$XDG_RUNTIME_DIR"
+  "$RIZR" daemon 2>daemon.log & local pid=$!
+  timeout 5 bash -c "until [ -S $XDG_RUNTIME_DIR/rizr/daemon.sock ]; do sleep 0.05; done"
+  "$RIZR" agent grant >grant.out 2>&1
+  expect grant grant.out '^bwrap --bind .*/grants/[0-9a-f]{16}\.sock .* --setenv RIZR_SOCKET '
+  local sock id
+  sock=$(awk '/^bwrap/ {print $3}' grant.out) id=$(awk '/^grant/ {print $2}' grant.out)
+  agent() { (cd / && RIZR_SOCKET=$sock "$RIZR" "$@"); } # the grant runs in its worktree, not the caller cwd
+  agent gc >gc.out 2>&1; echo "exit $?" >>gc.out
+  expect grant gc.out '`rizr gc` is not open to an agent grant'
+  expect grant gc.out 'exit 3'
+  agent -f /etc/compose.yaml status >f.out 2>&1; echo "exit $?" >>f.out
+  expect grant f.out 'f is not allowed through a grant'
+  expect grant f.out 'exit 2'
+  agent up >up.out 2>&1
+  expect grant up.out 'grant: Up'
+  agent status --json >s1 2>&1 & agent status --json >s2 2>&1
+  wait %%
+  cmp -s s1 s2 && grep -q '"a"' s1 && echo "ok   grant: two clients, one answer" ||
+    { echo "FAIL grant: clients differ"; sed 's/^/     /' s1 s2; fails=$((fails + 1)); }
+  "$RIZR" agent revoke "$id" >/dev/null 2>&1
+  agent status >gone.out 2>&1
+  expect grant gone.out 'cannot reach the rizr daemon'
+  kill "$pid"
+  done_case grant
+}
+
 namecheck() { # container_name held by a container outside the stack
   docker run -d --name rizr-edge-fixed alpine sleep 600 >/dev/null
   stack namecheck 'services:
@@ -338,7 +370,7 @@ subnet() { # two worktrees of a repo that pins a subnet and a fixed address run 
   done_case subnet
 }
 
-cases=("${@:-orphan crashloop slowjob server500 credentials loginfail refuse namecheck downplain socket portstray image daemon variable yaml job health build disk oom tool nocmd envfile undefined redis otherfile unsynced subnet}")
+cases=("${@:-orphan crashloop slowjob server500 credentials loginfail refuse grant namecheck downplain socket portstray image daemon variable yaml job health build disk oom tool nocmd envfile undefined redis otherfile unsynced subnet}")
 # Each case takes a docker network; docker has about 30 address pools for every stack on the machine.
 for c in ${cases[*]}; do
   while (($(jobs -rp | wc -l) >= 4)); do wait -n; done

@@ -174,7 +174,7 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-fn random_hex() -> Result<String, String> {
+pub(crate) fn random_hex() -> Result<String, String> {
     let mut b = [0u8; 24];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut b))
