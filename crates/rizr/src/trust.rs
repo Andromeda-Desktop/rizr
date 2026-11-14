@@ -192,7 +192,54 @@ pub fn store_path() -> Option<PathBuf> {
     Some(data.join("rizr/trust.json"))
 }
 
-fn load(store: &Path) -> BTreeMap<String, Digest> {
+/// A trusted repo: the digest a person (or `trust --yes`) accepted, and the git commit checked out then.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum Entry {
+    Pinned { digest: Digest, head: String },
+    Digest(Digest),
+}
+
+impl Entry {
+    fn digest(&self) -> &Digest {
+        match self {
+            Entry::Pinned { digest, .. } | Entry::Digest(digest) => digest,
+        }
+    }
+}
+
+/// The commit the worktree has checked out, read from `.git` files: running git before trust could start a
+/// program the repo's git config names (fsmonitor, hooks).
+fn git_head(root: &Path) -> Option<String> {
+    let dot = root.join(".git");
+    let gitdir = if dot.is_file() {
+        let t = std::fs::read_to_string(&dot).ok()?;
+        root.join(t.strip_prefix("gitdir:")?.trim())
+    } else {
+        dot
+    };
+    let head = std::fs::read_to_string(gitdir.join("HEAD")).ok()?;
+    let Some(name) = head.trim().strip_prefix("ref:").map(str::trim) else {
+        return Some(head.trim().to_owned());
+    };
+    let common = std::fs::read_to_string(gitdir.join("commondir"))
+        .map_or_else(|_| gitdir.clone(), |c| gitdir.join(c.trim()));
+    for d in [&gitdir, &common] {
+        if let Ok(sha) = std::fs::read_to_string(d.join(name)) {
+            return Some(sha.trim().to_owned());
+        }
+    }
+    std::fs::read_to_string(common.join("packed-refs"))
+        .ok()?
+        .lines()
+        .find_map(|l| {
+            l.split_once(' ')
+                .filter(|(_, r)| *r == name)
+                .map(|(sha, _)| sha.to_owned())
+        })
+}
+
+fn load(store: &Path) -> BTreeMap<String, Entry> {
     std::fs::read(store)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -200,7 +247,15 @@ fn load(store: &Path) -> BTreeMap<String, Digest> {
 }
 
 pub fn is_trusted(store: &Path, i: &Inputs) -> bool {
-    load(store).get(&*i.root.to_string_lossy()) == Some(&i.digest)
+    load(store)
+        .get(&*i.root.to_string_lossy())
+        .is_some_and(|e| *e.digest() == i.digest)
+}
+
+/// The files differ from the trusted ones, but the commit is the one a person trusted: the change was made in
+/// this worktree (by the user or their agent), not pulled or checked out from elsewhere (user, 2026-11-14).
+fn local_edit(store: &Path, i: &Inputs) -> bool {
+    matches!(load(store).get(&*i.root.to_string_lossy()), Some(Entry::Pinned { head, .. }) if git_head(&i.root).as_ref() == Some(head))
 }
 
 pub fn grant(store: &Path, i: &Inputs) -> std::io::Result<()> {
@@ -211,7 +266,14 @@ pub fn grant(store: &Path, i: &Inputs) -> std::io::Result<()> {
     let lock = std::fs::File::create(store.with_extension("lock"))?;
     lock.lock()?;
     let mut map = load(store);
-    map.insert(i.root.to_string_lossy().into_owned(), i.digest.clone());
+    let entry = match git_head(&i.root) {
+        Some(head) => Entry::Pinned {
+            digest: i.digest.clone(),
+            head,
+        },
+        None => Entry::Digest(i.digest.clone()),
+    };
+    map.insert(i.root.to_string_lossy().into_owned(), entry);
     let tmp = store.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&map)?)?;
     std::fs::rename(tmp, store)
@@ -253,6 +315,18 @@ pub fn gate(root: &Path, chosen: &[PathBuf], ask: bool) -> Result<Inputs, Error>
         )
     })?;
     if is_trusted(&store, &i) {
+        return Ok(i);
+    }
+    if local_edit(&store, &i) {
+        grant(&store, &i).map_err(|e| io_error(&store, &e))?;
+        eprintln!(
+            "note: running local edits to the trusted files ({}); the git commit is the one trusted",
+            i.files
+                .iter()
+                .map(|f| f.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         return Ok(i);
     }
     let known = known(&store, &i);

@@ -128,3 +128,59 @@ fn trust_yes_works_only_after_a_first_trust() {
     );
     assert!(!std::fs::read_to_string(&store).unwrap().contains("stale"));
 }
+
+/// Local edits at the commit a person trusted run without a re-trust; after HEAD moves (pull, checkout) rizr asks.
+#[test]
+fn local_edits_run_but_a_moved_head_asks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("repo"), tmp.path().join("home"));
+    std::fs::create_dir_all(repo.join(".git/refs/heads")).unwrap();
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(repo.join(".git/refs/heads/main"), "aaa\n").unwrap();
+    std::fs::write(
+        repo.join("compose.yml"),
+        "services:\n  x:\n    image: alpine\n",
+    )
+    .unwrap();
+    let store = home.join(".local/share/rizr/trust.json");
+    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+    let root = repo.canonicalize().unwrap();
+    let pin = |head: &str| {
+        std::fs::write(
+            &store,
+            format!(
+                "{{\"{}\": {{\"digest\": \"before-the-edit\", \"head\": \"{head}\"}}}}",
+                root.display()
+            ),
+        )
+        .unwrap();
+    };
+    let plan = || {
+        let o = Command::new(env!("CARGO_BIN_EXE_rizr"))
+            .args(["plan", "--json"])
+            .current_dir(&repo)
+            .env_clear()
+            .env("HOME", &home)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+    };
+    pin("aaa");
+    let out = plan();
+    assert!(!out.contains("untrusted"), "{out}");
+    assert!(
+        !std::fs::read_to_string(&store)
+            .unwrap()
+            .contains("before-the-edit"),
+        "the edit is now the trusted digest"
+    );
+    pin("aaa");
+    std::fs::write(repo.join(".git/refs/heads/main"), "bbb\n").unwrap();
+    let out = plan();
+    assert!(out.contains("untrusted"), "{out}");
+}
