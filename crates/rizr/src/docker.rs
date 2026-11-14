@@ -2,7 +2,7 @@
 //! events. The core decides; this file only renders and runs (SPEC-core section 6).
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, IsTerminal};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -180,6 +180,7 @@ pub fn run(stack: &Stack, inputs: Digest, action: Option<Action>) -> Result<Stat
         unit_events: None,
         project_lock: Arc::default(),
         progress: action.is_some().then(|| (Instant::now(), BTreeMap::new())),
+        quiet: (!std::io::stderr().is_terminal()).then(Instant::now),
         budget: match &action {
             Some(Action::Up {
                 timeout: Some(t), ..
@@ -228,6 +229,9 @@ struct Provider<'a> {
     project_lock: Arc<Mutex<Option<std::fs::File>>>,
     /// For a verb that changes the stack: its start and the last state printed per node.
     progress: Option<(Instant, BTreeMap<String, String>)>,
+    /// Set when stderr is no terminal (an agent or a log): the time of the last line. Then only problem
+    /// states and a heartbeat print, so the result is near the top of the output.
+    quiet: Option<Instant>,
     /// How long a verb waits before it returns "still starting": `up --timeout`, else 100 s.
     budget: Duration,
 }
@@ -265,6 +269,12 @@ impl Provider<'_> {
             if let Some(r) = rizr_core::view::outcome(&s) {
                 return r.map(|()| s);
             }
+            self.print_progress(&s);
+            // In quiet mode no message may arrive for minutes: wake up for the heartbeat.
+            let wake = |t: Instant| match self.quiet {
+                Some(_) => t.min(Instant::now() + Duration::from_secs(10)),
+                None => t,
+            };
             let next = self
                 .deadlines
                 .iter()
@@ -275,7 +285,8 @@ impl Provider<'_> {
             }
             let msg = match next {
                 Some((id, at)) if limit.is_none_or(|l| at <= l) => {
-                    match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                    match rx.recv_timeout(wake(at).saturating_duration_since(Instant::now())) {
+                        Err(RecvTimeoutError::Timeout) if Instant::now() < at => continue,
                         Err(RecvTimeoutError::Timeout) => {
                             self.deadlines.remove(&id);
                             s = reduce(s, Event::DeadlineHit(id));
@@ -285,10 +296,12 @@ impl Provider<'_> {
                     }
                 }
                 _ => match limit {
-                    Some(l) => match rx.recv_timeout(l.saturating_duration_since(Instant::now())) {
-                        Err(RecvTimeoutError::Timeout) => continue,
-                        m => m.ok(),
-                    },
+                    Some(l) => {
+                        match rx.recv_timeout(wake(l).saturating_duration_since(Instant::now())) {
+                            Err(RecvTimeoutError::Timeout) => continue,
+                            m => m.ok(),
+                        }
+                    }
                     None => rx.recv().ok(),
                 },
             };
@@ -296,7 +309,7 @@ impl Provider<'_> {
                 Some(Msg::Done(id, answer)) => s = reduce(s, Event::Done { id, answer }),
                 Some(Msg::Event(e)) => s = reduce(s, e),
                 Some(Msg::Progress(node, step)) => {
-                    if let Some((start, _)) = &self.progress {
+                    if let (Some((start, _)), None) = (&self.progress, self.quiet) {
                         eprintln!("[{:>3}s] {node} {step}", start.elapsed().as_secs());
                     }
                 }
@@ -376,19 +389,54 @@ impl Provider<'_> {
         )
     }
 
-    /// One stderr line per node state change, so a caller with a short timeout sees how far `up` got.
+    /// One stderr line per node state change (in quiet mode: problems and a 30 s heartbeat), so a caller with a
+    /// short timeout sees how far `up` got.
     fn print_progress(&mut self, s: &State) {
         let Some((start, last)) = &mut self.progress else {
             return;
         };
-        for n in rizr_core::view::nodes(s) {
-            let state = n.state.to_string();
-            if last.get(&n.node.name.0) != Some(&state) {
+        let nodes = rizr_core::view::nodes(s);
+        if let Some(beat) = &mut self.quiet
+            && beat.elapsed() >= Duration::from_secs(30)
+        {
+            let busy: Vec<String> = nodes
+                .iter()
+                .filter(|n| {
+                    [
+                        "starting",
+                        "building",
+                        "pulling",
+                        "pending",
+                        "stopping",
+                        "restarting",
+                    ]
+                    .iter()
+                    .any(|b| n.state.starts_with(b))
+                })
+                .map(|n| format!("{} ({})", n.node.name.0, n.state))
+                .collect();
+            if !busy.is_empty() {
                 eprintln!(
-                    "[{:>3}s] {} {state}",
+                    "[{:>3}s] waiting for {}",
                     start.elapsed().as_secs(),
-                    n.node.name.0
+                    busy.join(", ")
                 );
+                *beat = Instant::now();
+            }
+        }
+        for n in nodes {
+            let state = n.state.to_string();
+            let problem = ["exited", "restarting", "failed"]
+                .iter()
+                .any(|p| state.starts_with(p));
+            if last.get(&n.node.name.0) != Some(&state) {
+                if self.quiet.is_none() || problem {
+                    eprintln!(
+                        "[{:>3}s] {} {state}",
+                        start.elapsed().as_secs(),
+                        n.node.name.0
+                    );
+                }
                 last.insert(n.node.name.0, state);
             }
         }
