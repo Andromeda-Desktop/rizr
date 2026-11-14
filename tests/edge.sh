@@ -102,7 +102,17 @@ downplain() { # down removes what a plain compose run left in the same project
   done_case downplain
 }
 
-cases=("${@:-orphan crashloop slowjob server500 credentials namecheck downplain}")
+socket() { # this user may not use the docker socket: up names the docker group fix
+  stack socket 'services:
+  a: {image: alpine, command: sleep 600}'
+  python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$WORK/denied.sock"
+  chmod 000 "$WORK/denied.sock"
+  DOCKER_HOST=unix://$WORK/denied.sock timeout 60 "$RIZR" up >out 2>&1; echo "rc=$?" >>out
+  expect socket out 'rc=4'
+  expect socket out 'usermod -aG docker'
+}
+
+cases=("${@:-orphan crashloop slowjob server500 credentials namecheck downplain socket}")
 for c in ${cases[*]}; do ("$c") >"$WORK/$c.log" 2>&1 & done
 wait
 cat "$WORK"/*.log
