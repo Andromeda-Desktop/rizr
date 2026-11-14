@@ -22,6 +22,8 @@ declare -A REPO=(
   [8]="dockersamples/example-voting-app 63e9150ca17af4ed05880d4245e486481f73fcb4"
   [9]="saleor/saleor-platform ab6315bd59c58b4815175df4c679107ff9695be4"
   [10]="knadh/listmonk 32078ede6d87c83f4948cc592c76bee91d629f0b"
+  [11]="dockersamples/example-voting-app 63e9150ca17af4ed05880d4245e486481f73fcb4"
+  [12]="dockersamples/example-voting-app 63e9150ca17af4ed05880d4245e486481f73fcb4"
 )
 MARK=eval-marker@example.com # task 10: a row in the first copy's data that the second copy must have
 OTHER=rizr-eval-other # task 7: a server outside the stack that holds the stack's port
@@ -131,6 +133,10 @@ prep() { # task: pull and build images, so the run measures the agent, not the n
     8) # the worker joins the wrong network: it waits for redis and db forever, and every container looks fine
       sed -i '/^  worker:/,/^  redis:/s/- back-tier/- front-tier/' "$d/docker-compose.yml"
       seal "$d" ;;
+    11) git -C "$d" worktree add -q --detach "$ROOT/$t/wt2" HEAD ;;
+    12) # worker and result hold the old password; the db container stays healthy
+      sed -i 's/POSTGRES_PASSWORD: "postgres"/POSTGRES_PASSWORD: "postgres-dev"/' "$d/docker-compose.yml"
+      seal "$d" ;;
   esac
 }
 
@@ -143,7 +149,7 @@ arm() { # task: give the agent rizr the way a user would: on PATH, trusted once,
   chmod +x "$ROOT/bin/rizr"
   for dir in "$ROOT/$1/repo" "$ROOT/$1/wt2"; do
     [[ -d $dir ]] || continue
-    echo 'This stack runs with rizr (on PATH). `rizr up` starts it and prints each URL with a check result and the cause of a failure; `rizr context --json` gives the graph, the state and every verb.' >"$dir/CLAUDE.md"
+    echo 'This stack runs with rizr (on PATH). `rizr up` starts it and waits to an outcome: each URL with a check result, the cause of a failure, and the test and migrate commands; for a slow start run `rizr up --timeout 540`. `rizr context --json` gives the graph, the state and every verb.' >"$dir/CLAUDE.md"
     (cd "$dir" && script -qec "$ROOT/bin/rizr ${COMPOSE[$1]:-} trust" /dev/null <<<y) >>"$OUT/$1/prep.log" 2>&1 || { log "task $1: rizr trust failed in $dir"; return 1; }
   done
   # preflight: the agent must start with the task's files trusted, as a user who ran them once
@@ -161,7 +167,8 @@ prompt() {
     6) echo "You are in a repository with a docker compose stack ($d). Someone worked on it before you. Make the running stack match the current compose file. Tell me the URLs of the vote page and the result page." ;;
     7|9) echo "You are in a repository with a docker compose stack ($d). Start the stack. Tell me the URL where $([[ $1 == 7 ]] && echo 'the listmonk admin page answers' || echo 'the GraphQL API answers a shop query') when it is ready." ;;
     10) echo "A copy of this docker compose stack already runs from $d, with data in its database. Run a second copy from the git worktree at $ROOT/10/wt2 that starts with a copy of the first copy's data. The first copy must keep running unchanged, and changes in the second copy must not reach the first. Tell me the URL of the second copy." ;;
-    8) echo "You are in a repository with a docker compose stack ($d). Start the stack. Votes cast on the vote page never show up on the result page. Find the cause and fix it." ;;
+    8|12) echo "You are in a repository with a docker compose stack ($d). Start the stack. Votes cast on the vote page never show up on the result page. Find the cause and fix it." ;;
+    11) echo "You are in a repository with a docker compose stack ($d). A second git worktree of it is at $ROOT/11/wt2. Run the stack from both worktrees at the same time; each must serve its own vote page. Tell me the URL of each vote page." ;;
   esac
 }
 
@@ -201,7 +208,7 @@ check() { # task -> exit 0 on pass; prints the reason
          http_ok "http://localhost:$p/admin/login" && final 7 | grep -q ":$p" && { echo "listmonk on $p, named in the reply"; return 0; }
        done
        echo "no listmonk answers on the port the reply names"; return 1 ;;
-    8) local i n=0
+    8|12) local i n=0
        for i in 1 2 3; do curl -s -m 10 -o /dev/null -b "voter_id=eval$i" -d "vote=a" http://localhost:8080/; done
        for i in $(seq 10); do
          n=$(docker exec "$(served_by "$(service_ctr "$d" worker)" db)" psql -U postgres -tAc 'select count(*) from votes' 2>/dev/null | tr -dc 0-9)
@@ -227,6 +234,15 @@ check() { # task -> exit 0 on pass; prints the reason
        echo "no second copy answers on the port the reply names"; return 1 ;;
     9) http_ok http://localhost:8000/graphql/ '{"query":"{ shop { name } }"}' && ! grep -q '"errors"' /tmp/rizr-eval-body || { echo "graphql fails"; return 1; }
        echo "graphql shop query ok" ;;
+    11) local w c p seen=
+       for w in "$d" "$ROOT/11/wt2"; do
+         c=$(service_ctr "$w" vote); [[ -n $c ]] || { echo "no vote container from $w"; return 1; }
+         p=$(docker port "$c" 80 | head -n1 | grep -oE '[0-9]+$')
+         [[ -n $p && $p != "$seen" ]] && http_ok "http://localhost:$p/" && grep -q 'Cats vs Dogs' /tmp/rizr-eval-body || { echo "no vote page from $w (port ${p:-none})"; return 1; }
+         final 11 | grep -q ":$p" || { echo "reply does not name port $p"; return 1; }
+         seen=$p
+       done
+       echo "two vote pages, both URLs in the reply" ;;
   esac
 }
 

@@ -8,7 +8,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 BASE=${BASE:-$here/../.agent/scratch/eval-rounds}
 ROUNDS=${ROUNDS:-3}
 ARMS=${ARMS:-bare rizr}
-tasks=("${@:-1 2 3 4 5 6 7 8 9 10}")
+tasks=("${@:-1 2 3 4 5 6 7 8 9 10 11 12}")
 
 for r in $(seq "$ROUNDS"); do
   for arm in $ARMS; do
