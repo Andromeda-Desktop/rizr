@@ -82,7 +82,10 @@ clone() { # task -> $ROOT/<task>/repo at the pinned commit
   local t=$1 slug sha dir
   read -r slug sha <<<"${REPO[$t]}"
   dir=$ROOT/$t
-  rm -rf "$dir" && mkdir -p "$dir/repo"
+  # containers write root-owned files into bind mounts (task 2 backend/htmlcov)
+  rm -rf "$dir" 2>/dev/null || docker run --rm -v "$ROOT:/r" alpine rm -rf "/r/$t"
+  [[ ! -e $dir ]] || { log "task $t: cannot remove $dir"; return 1; }
+  mkdir -p "$dir/repo"
   git -C "$dir/repo" init -q
   git -C "$dir/repo" fetch -q --depth 1 "https://github.com/$slug" "$sha"
   git -C "$dir/repo" checkout -q FETCH_HEAD
