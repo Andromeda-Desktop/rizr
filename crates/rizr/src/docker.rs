@@ -757,7 +757,15 @@ impl Provider<'_> {
                         if db.attach(&project, &node.name.0)? && instance != "main" {
                             let mark = dir.join(format!("seed-{}", node.name.0));
                             match db.seed(&project, &node.name.0, &names.0, &names.1)? {
-                                Some(source) => std::fs::write(&mark, source),
+                                Some(source) => {
+                                    let n = crate::postgres::tables(
+                                        &db.shared.server.container(&project),
+                                        db.shared.server.user(),
+                                        &db.database,
+                                    )
+                                    .map_or(String::new(), |n| format!(" (tables: {n})"));
+                                    std::fs::write(&mark, format!("{source}{n}"))
+                                }
                                 None => std::fs::remove_file(&mark).or(Ok(())),
                             }
                             .map_err(|e| e.to_string())?;

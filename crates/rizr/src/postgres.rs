@@ -693,28 +693,28 @@ pub fn empty(dir: &Path, project: &str) -> Vec<(String, String)> {
         .databases
         .into_iter()
         .filter(|(_, d)| {
-            Command::new("docker")
-                .args([
-                    "exec",
-                    &format!("rizr-{project}-{}", d.server),
-                    "psql",
-                    "-U",
-                    &d.user,
-                    "-d",
-                ])
-                .arg(&d.database)
-                .args([
-                    "-qtAc",
-                    "select count(*) from information_schema.tables \
-                     where table_schema not in ('pg_catalog', 'information_schema')",
-                ])
-                .output()
-                .is_ok_and(|o| {
-                    o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "0"
-                })
+            tables(
+                &format!("rizr-{project}-{}", d.server),
+                &d.user,
+                &d.database,
+            ) == Some(0)
         })
         .map(|(svc, d)| (svc, d.database))
         .collect()
+}
+
+/// The tables of `db` outside the system schemas; `None` when the server does not answer.
+pub fn tables(server: &str, user: &str, db: &str) -> Option<u64> {
+    let o = Command::new("docker")
+        .args(["exec", server, "psql", "-U", user, "-d", db, "-qtAc"])
+        .arg(
+            "select count(*) from information_schema.tables \
+             where table_schema not in ('pg_catalog', 'information_schema')",
+        )
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    String::from_utf8_lossy(&o.stdout).trim().parse().ok()
 }
 
 /// Close `db` to new sessions and end its open ones: a template, a drop or a rename needs it alone.
