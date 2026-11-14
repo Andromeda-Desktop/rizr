@@ -319,6 +319,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             } else {
                 print_status(&stack, &s, status_of(&s, failed.is_some()));
                 print_urls(&urls);
+                print_databases(&stack);
                 let hints = task_hints(&stack.root);
                 if !hints.is_empty() {
                     println!("tasks: {}", hints.join("; "));
@@ -399,6 +400,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             } else {
                 print_status(&stack, &s, status);
                 print_urls(&urls);
+                print_databases(&stack);
                 if let Some(e) = &failed {
                     println!("error: {}\nhint: {}\ntry: {}", e.message, e.hint, e.example);
                 }
@@ -607,7 +609,7 @@ fn databases(stack: &docker::Stack) -> serde_json::Value {
                 "service": svc, "database": db.database, "server": container,
                 "url": db.url(&format!("{svc}:5432")),
                 "host_url": port.map(|p| db.url(&format!("127.0.0.1:{p}"))),
-                "psql": format!("docker exec -it {container} psql -U {} -d {}", db.user, db.database),
+                "psql": format!("docker exec -i {container} psql -U {} -d {}", db.user, db.database),
             })
         })
         .collect();
@@ -997,6 +999,16 @@ fn url_checks(stack: &docker::Stack, since: u64) -> (Vec<serde_json::Value>, Opt
     }
     let failed = urls.iter().find(|u| url_failed(u)).map(server_error);
     (urls, failed)
+}
+
+/// One line per database on a shared server: the compose service has no container, so its command is not
+/// `docker compose exec <service>`.
+fn print_databases(stack: &docker::Stack) {
+    for db in databases(stack)["shared"].as_array().into_iter().flatten() {
+        if let (Some(svc), Some(psql)) = (db["service"].as_str(), db["psql"].as_str()) {
+            println!("  {svc} database: {psql} -c '<sql>'");
+        }
+    }
 }
 
 fn print_urls(urls: &[serde_json::Value]) {

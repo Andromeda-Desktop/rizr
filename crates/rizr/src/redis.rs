@@ -65,7 +65,7 @@ pub fn context(project: &str) -> Value {
                 "service": r.service, "container": r.container,
                 "url": format!("redis://{}:6379", r.service),
                 "host_url": r.host_port.map(|p| format!("redis://127.0.0.1:{p}")),
-                "cli": format!("docker exec -it {} redis-cli", r.container),
+                "cli": format!("docker exec -i {} redis-cli", r.container),
             })
         })
         .collect()
