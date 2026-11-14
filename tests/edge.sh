@@ -156,6 +156,23 @@ grant() { # an agent runs rizr through a daemon grant: host verbs and -f refused
   "$RIZR" status --json >direct 2>&1
   cmp -s s1 direct && echo "ok   grant: same answer as the CLI" ||
     { echo "FAIL grant: grant and CLI differ"; diff s1 direct | sed 's/^/     /'; fails=$((fails + 1)); }
+  printf '  b:\n    image: alpine\n    command: sleep 600\n' >>compose.yaml
+  local asks=$XDG_RUNTIME_DIR/rizr/confirm
+  pending() { timeout 10 bash -c "until compgen -G '$asks/*.json' >/dev/null; do sleep 0.05; done"; }
+  agent up >no.out 2>&1 & local up=$!
+  pending && script -qec "$RIZR confirm" /dev/null <<<n >/dev/null 2>&1
+  wait $up; echo "exit $?" >>no.out
+  expect grant no.out 'the human said no'
+  expect grant no.out 'exit 3'
+  printf 'version = 1\n[agents]\ntrust = "deny"\n' >rizr.toml
+  agent up >deny.out 2>&1
+  expect grant deny.out 'trust = "deny"'
+  rm rizr.toml
+  agent up >yes.out 2>&1 & up=$!
+  pending && script -qec "$RIZR confirm" /dev/null <<<y >confirm.out 2>&1
+  wait $up
+  expect grant confirm.out 'asks: trust .*/grant'
+  expect grant yes.out 'grant: Up'
   "$RIZR" agent revoke "$id" >/dev/null 2>&1
   agent status >gone.out 2>&1
   expect grant gone.out 'cannot reach the rizr daemon'

@@ -32,6 +32,29 @@ struct Manifest {
     /// Compose options rizr refuses by default, allowed per service: `[allow] proxy = ["bind"]`.
     #[serde(default)]
     allow: BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// What an agent grant may ask the human for: `[agents] trust = "deny"`.
+    #[serde(default)]
+    agents: Agents,
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(deny_unknown_fields)]
+pub struct Agents {
+    /// Stopping another instance of the project (max_instances).
+    #[serde(default)]
+    pub other_instances: Policy,
+    /// Running compose files that changed since the human trusted them.
+    #[serde(default)]
+    pub trust: Policy,
+}
+
+/// `confirm` asks the human through `rizr confirm`; `deny` refuses at once.
+#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Policy {
+    #[default]
+    Confirm,
+    Deny,
 }
 
 /// `[allow]` of `<root>/rizr.toml`; empty when it is absent or does not parse.
@@ -40,6 +63,15 @@ pub fn allow(root: &Path) -> BTreeMap<String, std::collections::BTreeSet<String>
         .ok()
         .and_then(|t| toml::from_str::<Manifest>(&t).ok())
         .map(|m| m.allow)
+        .unwrap_or_default()
+}
+
+/// `[agents]` of `<root>/rizr.toml`; every policy is `confirm` when it is absent or does not parse.
+pub fn agents(root: &Path) -> Agents {
+    std::fs::read_to_string(root.join("rizr.toml"))
+        .ok()
+        .and_then(|t| toml::from_str::<Manifest>(&t).ok())
+        .map(|m| m.agents)
         .unwrap_or_default()
 }
 

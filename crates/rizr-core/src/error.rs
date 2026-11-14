@@ -45,6 +45,8 @@ pub enum ErrorCode {
     TaskFailed,
     /// A compose option gives a service the host; a human allows it in rizr.toml.
     Refused,
+    /// The human answered no to an agent grant's ask, or the policy in rizr.toml denies it.
+    Denied,
 }
 
 /// Exit code classes: an agent can branch on the class without parsing the message.
@@ -70,7 +72,7 @@ impl ErrorCode {
         match self {
             ErrorCode::Usage | ErrorCode::NoTask => ErrorClass::Usage,
             ErrorCode::TaskFailed => ErrorClass::TaskFailed,
-            ErrorCode::Untrusted | ErrorCode::Refused => ErrorClass::NeedsHuman,
+            ErrorCode::Untrusted | ErrorCode::Refused | ErrorCode::Denied => ErrorClass::NeedsHuman,
             ErrorCode::RuntimeUnavailable | ErrorCode::ImportFailed => ErrorClass::Environment,
             ErrorCode::StartFailed
             | ErrorCode::StartTimeout

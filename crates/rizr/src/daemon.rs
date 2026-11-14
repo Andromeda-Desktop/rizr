@@ -288,6 +288,7 @@ fn check(argv: &[String]) -> Result<(), Error> {
         Command::Gc => "gc",
         Command::Daemon => "daemon",
         Command::Agent { .. } => "agent",
+        Command::Confirm => "confirm",
         _ => return Ok(()),
     };
     Err(Error::new(
@@ -352,8 +353,14 @@ fn call(path: &Path, req: &Value) -> std::io::Result<Value> {
 
 /// True for the verbs that run in this process even under RIZR_SOCKET.
 pub fn local(argv: &[String]) -> bool {
-    Cli::try_parse_from(std::iter::once("rizr").chain(argv.iter().map(String::as_str)))
-        .is_ok_and(|c| matches!(c.command, Command::Daemon | Command::Agent { .. }))
+    Cli::try_parse_from(std::iter::once("rizr").chain(argv.iter().map(String::as_str))).is_ok_and(
+        |c| {
+            matches!(
+                c.command,
+                Command::Daemon | Command::Agent { .. } | Command::Confirm
+            )
+        },
+    )
 }
 
 /// The agent side: send the arguments to the grant socket and replay the answer.

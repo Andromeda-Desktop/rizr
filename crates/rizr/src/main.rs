@@ -9,6 +9,7 @@ use rizr_core::{Action, Event, State, plan, reduce};
 use serde_json::json;
 
 mod compose;
+mod confirm;
 mod daemon;
 mod detect;
 mod devenv;
@@ -120,6 +121,8 @@ enum Command {
     Schema,
     /// Serve agent grants in the foreground: each grant is a socket that runs rizr in one worktree.
     Daemon,
+    /// Answer the pending asks of agent grants on this terminal.
+    Confirm,
     /// Open, close or list the agent grants of the running daemon.
     Agent {
         #[command(subcommand)]
@@ -140,7 +143,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = cli.json;
     let files = cli.file.clone();
-    let host_only = matches!(cli.command, Command::Daemon | Command::Agent { .. });
+    let host_only = matches!(
+        cli.command,
+        Command::Daemon | Command::Agent { .. } | Command::Confirm
+    );
     let engine = if host_only {
         Ok(())
     } else {
@@ -206,6 +212,7 @@ fn run(cli: Cli) -> Result<(), Error> {
     match &cli.command {
         Command::Daemon => return daemon::serve(&data),
         Command::Agent { op } => return daemon::agent(op, json),
+        Command::Confirm => return confirm::run(),
         _ => {}
     }
     if let Command::Doctor | Command::Footprint | Command::Gc = cli.command {
@@ -226,6 +233,7 @@ fn run(cli: Cli) -> Result<(), Error> {
         | Command::Gc
         | Command::Daemon
         | Command::Agent { .. }
+        | Command::Confirm
         | Command::Action(Action::Trust { .. }) => Ok(()),
         Command::Action(action) => {
             let up = matches!(action, Action::Up { .. });

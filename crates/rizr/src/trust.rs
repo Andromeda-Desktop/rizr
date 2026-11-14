@@ -345,6 +345,9 @@ pub fn gate(root: &Path, chosen: &[PathBuf], ask: bool) -> Result<Inputs, Error>
         return Ok(i);
     }
     let known = known(&store, &i);
+    if crate::refuse::gateway() {
+        return grant_ask(&store, i, chosen, known);
+    }
     let terminal = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     if !ask || !terminal {
         return Err(untrusted(&i, chosen, known));
@@ -369,6 +372,42 @@ pub fn gate(root: &Path, chosen: &[PathBuf], ask: bool) -> Result<Inputs, Error>
     }
     grant(&store, &i).map_err(|e| io_error(&store, &e))?;
     Ok(i)
+}
+
+/// Under an agent grant there is no terminal: the human answers through `rizr confirm`, as `[agents] trust` says.
+fn grant_ask(store: &Path, i: Inputs, chosen: &[PathBuf], known: bool) -> Result<Inputs, Error> {
+    use crate::confirm::{self, Answer, Ask};
+    let denied = |why: &str| {
+        Error::new(
+            ErrorCode::Denied,
+            format!("{why}: an agent cannot run compose files the human has not trusted"),
+            "undo the change to the compose files, or ask the human to run `rizr trust` in the worktree",
+            "git diff -- compose.yaml rizr.toml",
+        )
+    };
+    if crate::manifest::agents(&i.root).trust == crate::manifest::Policy::Deny {
+        return Err(denied("rizr.toml [agents] trust = \"deny\""));
+    }
+    let ask = Ask {
+        grant: std::env::var("RIZR_GRANT").unwrap_or_default(),
+        verb: "trust".into(),
+        target: i.root.display().to_string(),
+        summary: if known {
+            "run compose files that changed since you trusted them"
+        } else {
+            "run compose files you have not trusted yet"
+        }
+        .into(),
+        files: i.files.iter().map(|f| f.display().to_string()).collect(),
+    };
+    match confirm::request(&ask, confirm::TIMEOUT) {
+        Answer::Allow => {
+            grant(store, &i).map_err(|e| io_error(store, &e))?;
+            Ok(i)
+        }
+        Answer::Deny => Err(denied("the human said no")),
+        Answer::Timeout => Err(untrusted(&i, chosen, known)),
+    }
 }
 
 fn untrusted(i: &Inputs, chosen: &[PathBuf], known: bool) -> Error {

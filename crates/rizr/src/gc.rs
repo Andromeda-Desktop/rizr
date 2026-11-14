@@ -308,6 +308,40 @@ fn release(stack: &Stack, instance: &str, kind: &str) {
 
 /// Before `up`: with `max_instances` set and reached, stop the other instance that rizr used least recently.
 /// Its containers and units stop; its data stays, and `rizr up` there starts it again.
+/// An agent grant stops another instance only when `[agents] other_instances` and the human allow it.
+fn grant_may_stop(stack: &Stack, stop: &[&String], max: usize) -> bool {
+    use crate::confirm::{self, Answer, Ask};
+    let names = stop
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let answer = if crate::manifest::agents(&stack.main_root).other_instances
+        == crate::manifest::Policy::Deny
+    {
+        Answer::Deny
+    } else {
+        confirm::request(
+            &Ask {
+                grant: std::env::var("RIZR_GRANT").unwrap_or_default(),
+                verb: "stop".into(),
+                target: names.clone(),
+                summary: format!(
+                    "stop instance {names} to stay within max_instances = {max}; its data stays"
+                ),
+                files: vec![],
+            },
+            confirm::TIMEOUT,
+        )
+    };
+    if answer != Answer::Allow {
+        eprintln!(
+            "kept instance {names} running ({answer:?}): more than max_instances = {max} run now"
+        );
+    }
+    answer == Answer::Allow
+}
+
 pub fn make_room(stack: &Stack) {
     let Some(max) = crate::manifest::max_instances(&stack.main_root) else {
         return;
@@ -339,7 +373,15 @@ pub fn make_room(stack: &Stack) {
         .map(|(i, d)| (used(&d), i))
         .collect();
     by_age.sort();
-    for (_, inst) in by_age.iter().take(running.len() + 1 - max) {
+    let stop: Vec<&String> = by_age
+        .iter()
+        .take(running.len() + 1 - max)
+        .map(|(_, i)| i)
+        .collect();
+    if crate::refuse::gateway() && !grant_may_stop(stack, &stop, max) {
+        return;
+    }
+    for inst in stop {
         let ids = docker(&[
             "ps",
             "-q",
