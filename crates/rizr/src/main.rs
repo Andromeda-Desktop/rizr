@@ -495,7 +495,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let databases = databases(&stack);
+            let databases = databases(&stack, &s);
             // One line, answer first: an agent's `| head -c 3000` keeps the status, the cause, the next commands and the tasks.
             println!(
                 "{}",
@@ -582,8 +582,14 @@ fn run(cli: Cli) -> Result<(), Error> {
 }
 
 /// Where a node runs: a compose service, or a systemd user unit for a host process from `rizr.toml`.
-/// The shared databases of this instance: URLs, the psql command, and every env var rizr rewrote.
-fn databases(stack: &docker::Stack) -> serde_json::Value {
+/// The shared databases of this instance: URLs, the psql command, and every env var rizr rewrote. An absent
+/// node has no database of this instance yet, so it is left out.
+fn databases(stack: &docker::Stack, s: &State) -> serde_json::Value {
+    let absent: Vec<String> = view::nodes(s)
+        .into_iter()
+        .filter(|n| n.state == "absent")
+        .map(|n| n.node.name.0)
+        .collect();
     let info = postgres::Info::load(&stack.dir);
     let host = manifest::host_services(&stack.root);
     let mut rewritten: Vec<_> = info
@@ -594,6 +600,7 @@ fn databases(stack: &docker::Stack) -> serde_json::Value {
     let dbs: Vec<_> = info
         .databases
         .iter()
+        .filter(|(svc, _)| !absent.contains(svc))
         .map(|(svc, db)| {
             let container = format!("rizr-{}-{}", stack.project.0, db.server);
             let port = postgres::host_port(&container);
@@ -1003,18 +1010,14 @@ fn url_checks(stack: &docker::Stack, since: u64) -> (Vec<serde_json::Value>, Opt
 }
 
 /// One line per database on a shared server: the compose service has no container, so its command is not
-/// `docker compose exec <service>`. An absent node has no database of this instance yet.
+/// `docker compose exec <service>`.
 fn print_databases(stack: &docker::Stack, s: &State) {
-    let absent: Vec<String> = view::nodes(s)
+    for db in databases(stack, s)["shared"]
+        .as_array()
         .into_iter()
-        .filter(|n| n.state == "absent")
-        .map(|n| n.node.name.0)
-        .collect();
-    for db in databases(stack)["shared"].as_array().into_iter().flatten() {
+        .flatten()
+    {
         if let (Some(svc), Some(psql)) = (db["service"].as_str(), db["psql"].as_str()) {
-            if absent.iter().any(|a| a == svc) {
-                continue;
-            }
             println!(
                 "  {svc} database: {psql} -c '<sql>' (its password follows the compose file at each up)"
             );
@@ -1246,7 +1249,7 @@ fn why(stack: &docker::Stack, s: &State, name: &str, json: bool) -> Result<(), E
             "{}",
             json!({"node": name, "state": v.state, "kind": kind, "signal": v.signal, "deps": deps,
                    "needed_by": needed_by, "next": next, "runtime": runtime_line(stack, name),
-                   "generated_env": generated, "problems": problems, "databases": databases(stack),
+                   "generated_env": generated, "problems": problems, "databases": databases(stack, s),
                    "urls": urls, "error": url_error, "recent_log": recent})
         );
         return Ok(());
@@ -1270,7 +1273,7 @@ fn why(stack: &docker::Stack, s: &State, name: &str, json: bool) -> Result<(), E
         println!("  needed by: {}", needed_by.join(", "));
     }
     println!("  runtime: {}", runtime_line(stack, name));
-    let dbs = databases(stack);
+    let dbs = databases(stack, s);
     if let Some(db) = dbs["shared"]
         .as_array()
         .into_iter()
