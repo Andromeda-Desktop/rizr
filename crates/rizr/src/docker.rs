@@ -25,6 +25,8 @@ use crate::compose;
 enum Msg {
     Done(EffectId, Answer),
     Event(Event),
+    /// A pull or build step of a node while compose starts it: shown to the caller, not part of the state.
+    Progress(String, String),
 }
 
 /// The current container id per service. A `die`, health or destroy event from another id is stale: it
@@ -285,6 +287,11 @@ impl Provider<'_> {
             match msg {
                 Some(Msg::Done(id, answer)) => s = reduce(s, Event::Done { id, answer }),
                 Some(Msg::Event(e)) => s = reduce(s, e),
+                Some(Msg::Progress(node, step)) => {
+                    if let Some((start, _)) = &self.progress {
+                        eprintln!("[{:>3}s] {node} {step}", start.elapsed().as_secs());
+                    }
+                }
                 None => unreachable!("the provider holds a sender"),
             }
             self.print_progress(&s);
@@ -366,6 +373,7 @@ impl Provider<'_> {
 
     fn dispatch(&mut self, s: &State, id: EffectId, op: Op) {
         let tx = self.tx.clone();
+        let progress = self.tx.clone();
         let done = move |a: Answer| {
             let _ = tx.send(Msg::Done(id, a));
         };
@@ -804,7 +812,7 @@ impl Provider<'_> {
                         crate::rewind::take(t, &dir, &job, true);
                     }
                     done(match r {
-                        Ok(()) => exec(cmd),
+                        Ok(()) => exec_progress(cmd, &job, &progress),
                         Err(tail) => Answer::Err { tail },
                     });
                 });
@@ -1177,6 +1185,88 @@ fn log_line(cmd: Command, pattern: &str) -> bool {
     let _ = child.kill();
     let _ = child.wait();
     found
+}
+
+/// `exec` that reads compose's output as it comes and reports each new pull or build step. Compose writes pulls
+/// to stderr and build steps to stdout.
+fn exec_progress(mut cmd: Command, node: &str, tx: &Sender<Msg>) -> Answer {
+    let report = |tx: Sender<Msg>, node: String| {
+        let mut last = String::new();
+        move |line: &str| {
+            if let Some(step) = progress_step(line)
+                && step != last
+            {
+                let _ = tx.send(Msg::Progress(node.clone(), step.clone()));
+                last = step;
+            }
+        }
+    };
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            return Answer::Err {
+                tail: format!("cannot run docker compose: {e}"),
+            };
+        }
+    };
+    let steps = child.stdout.take().map(|out| {
+        let mut on = report(tx.clone(), node.to_string());
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                on(&line);
+            }
+        })
+    });
+    let mut err = Vec::new();
+    if let Some(out) = child.stderr.take() {
+        let mut on = report(tx.clone(), node.to_string());
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            on(&line);
+            err.extend_from_slice(line.as_bytes());
+            err.push(b'\n');
+        }
+    }
+    if let Some(t) = steps {
+        let _ = t.join();
+    }
+    match child.wait() {
+        Ok(st) if st.success() => Answer::Ok,
+        Ok(_) => Answer::Err {
+            tail: compose::tail(&err),
+        },
+        Err(e) => Answer::Err {
+            tail: format!("cannot run docker compose: {e}"),
+        },
+    }
+}
+
+/// The step a compose `up` line shows: ` Image x Pulling`, ` Image x Building`, `#6 [2/3] RUN ...`.
+fn progress_step(line: &str) -> Option<String> {
+    let line = line.trim();
+    if let Some(rest) = line.strip_prefix("Image ") {
+        let (image, verb) = rest.rsplit_once(' ')?;
+        return match verb {
+            "Pulling" => Some(format!("pulling {image}")),
+            "Building" => Some("building".into()),
+            _ => None,
+        };
+    }
+    let rest = line.strip_prefix('#')?.split_once(' ')?.1;
+    // `[2/3]`, or `[backend 2/3]` when compose builds several images
+    let step = rest
+        .strip_prefix('[')?
+        .split_once(']')?
+        .0
+        .rsplit(' ')
+        .next()?;
+    let (n, total) = step.split_once('/')?;
+    (n.parse::<u32>().is_ok() && total.parse::<u32>().is_ok())
+        .then(|| format!("building: step {n}/{total}"))
 }
 
 fn exec(mut cmd: Command) -> Answer {

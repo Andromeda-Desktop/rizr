@@ -65,7 +65,7 @@ pub fn checks(project: &str) -> Vec<Value> {
             .collect();
         runs.into_iter()
             .map(|(svc, port, h)| {
-                json!({"node": svc, "url": format!("http://localhost:{port}"), "check": h.join().unwrap_or_default()})
+                json!({"node": svc, "url": format!("http://localhost:{port}/"), "check": h.join().unwrap_or_default()})
             })
             .collect()
     })

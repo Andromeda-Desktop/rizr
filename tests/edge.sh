@@ -60,7 +60,7 @@ server500() { # the app answers 5xx: up, status, why and context say degraded wi
   expect server500 out 'Degraded'
   expect server500 st 'Degraded'
   expect server500 st 'database has no tables'
-  expect server500 why 'problem: web http://localhost:18099 -> HTTP 500'
+  expect server500 why 'problem: web http://localhost:18099/ -> HTTP 500'
   expect server500 ctx '"status":"degraded"|"status": "degraded"'
   done_case server500
 }
