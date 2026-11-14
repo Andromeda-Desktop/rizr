@@ -298,11 +298,18 @@ fn run(cli: Cli) -> Result<(), Error> {
             } else {
                 (Vec::new(), None)
             };
-            let notes = if up {
+            let login = if up {
+                login_failure(&stack, since)
+            } else {
+                None
+            };
+            // A client that cannot log in never made its tables; the migration note would name the wrong cause.
+            let notes = if up && login.is_none() {
                 empty_databases(&stack)
             } else {
                 Vec::new()
             };
+            let failed = failed.or(login);
             if json && up {
                 let mut r = serde_json::to_value(view::receipt(&s)).unwrap_or_default();
                 r["urls"] = urls.into();
@@ -741,6 +748,33 @@ fn server_error(u: &serde_json::Value) -> Error {
         ),
         format!("rizr exec {node} -- {migrate}"),
     )
+}
+
+/// A client refused by a shared database server since `since`: the server is healthy, so no check sees it.
+fn login_failure(stack: &docker::Stack, since: u64) -> Option<Error> {
+    let info = postgres::Info::load(&stack.dir);
+    info.databases.iter().find_map(|(svc, db)| {
+        let id = docker::shared_container(stack, svc)?;
+        let out = std::process::Command::new("docker")
+            .args(["logs", "--since", &since.to_string(), &id])
+            .output()
+            .ok()?;
+        // postgres logs to stderr. All instances share the server, so another instance's client can show here.
+        let log = String::from_utf8_lossy(&out.stderr);
+        let line = log
+            .lines()
+            .find(|l| l.contains("password authentication failed for user"))?;
+        let fatal = line.find("FATAL").map_or(line, |i| &line[i..]);
+        Some(Error::new(
+            ErrorCode::Unhealthy,
+            format!("{svc}: a client cannot log in: {fatal}"),
+            format!(
+                "{svc} takes user `{}` and its password from the compose file; a service that connects with another password is refused: make both the same, then `rizr up`",
+                db.user
+            ),
+            "grep -rn -i password --exclude-dir=.git .".to_owned(),
+        ))
+    })
 }
 
 /// Databases of this instance with no tables yet, as a note line and the migrate command the repo's docs give.

@@ -83,6 +83,24 @@ volumes: {dbdata: {}}"
   done_case credentials
 }
 
+loginfail() { # healthy postgres, but a client logs in with another password: up is not Up
+  stack loginfail 'services:
+  db:
+    image: postgres:16-alpine
+    environment: {POSTGRES_PASSWORD: right}
+    healthcheck: {test: [CMD, pg_isready, -U, postgres], interval: 2s, retries: 30}
+  app:
+    image: postgres:16-alpine
+    command: [sh, -c, "until PGPASSWORD=wrong psql -h db -U postgres -c \"select 1\"; do echo Waiting for db; sleep 1; done; sleep 600"]
+    depends_on: {db: {condition: service_healthy}}'
+  "$RIZR" up >out 2>&1
+  expect loginfail out 'Degraded'
+  expect loginfail out 'password authentication failed for user "postgres"'
+  ! grep -q 'has no tables' out && echo "ok   loginfail: no migration note" ||
+    { echo "FAIL loginfail: migration note"; fails=$((fails + 1)); }
+  done_case loginfail
+}
+
 namecheck() { # container_name held by a container outside the stack
   docker run -d --name rizr-edge-fixed alpine sleep 600 >/dev/null
   stack namecheck 'services:
@@ -293,7 +311,7 @@ subnet() { # two worktrees of a repo that pins a subnet and a fixed address run 
   done_case subnet
 }
 
-cases=("${@:-orphan crashloop slowjob server500 credentials namecheck downplain socket portstray image daemon variable yaml job health build disk oom tool nocmd envfile undefined redis otherfile unsynced subnet}")
+cases=("${@:-orphan crashloop slowjob server500 credentials loginfail namecheck downplain socket portstray image daemon variable yaml job health build disk oom tool nocmd envfile undefined redis otherfile unsynced subnet}")
 # Each case takes a docker network; docker has about 30 address pools for every stack on the machine.
 for c in ${cases[*]}; do
   while (($(jobs -rp | wc -l) >= 4)); do wait -n; done
