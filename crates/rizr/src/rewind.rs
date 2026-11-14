@@ -251,11 +251,29 @@ pub fn rewind(stack: &Stack, db: Option<&str>, back: usize) -> Result<(), Error>
     Ok(())
 }
 
-/// `rizr reset`: empty each named database and remove the instance's finished job containers, so the next `up`
-/// reruns migrate and seed jobs.
+/// `rizr reset`: empty each named database and redis, and remove the instance's finished job containers, so the
+/// next `up` reruns migrate and seed jobs.
 pub fn reset(stack: &Stack, db: Option<&str>) -> Result<(), Error> {
     let _lock = locked(stack)?;
-    for t in targets(stack, db)? {
+    let redis: Vec<_> = crate::redis::running(&stack.compose_name())
+        .into_iter()
+        .filter(|r| db.is_none_or(|n| n == r.service))
+        .collect();
+    let pg = match targets(stack, db) {
+        Err(_) if !redis.is_empty() => Vec::new(),
+        r => r?,
+    };
+    for r in &redis {
+        crate::redis::flush(r).map_err(|e| {
+            fail(
+                format!("cannot empty redis {}: {e}", r.service),
+                "redis must run; a password set only in its command needs REDISCLI_AUTH in its environment",
+                &format!("docker exec -it {} redis-cli", r.container),
+            )
+        })?;
+        println!("emptied redis {} (FLUSHALL)", r.service);
+    }
+    for t in pg {
         let saved = keep_current(&t, &stack.dir, "reset")?;
         replace(&t, None).map_err(|e| fail(e, "the shared server must run", "rizr up"))?;
         println!(

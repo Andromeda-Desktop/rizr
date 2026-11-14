@@ -17,6 +17,7 @@ mod gc;
 mod manifest;
 mod ports;
 mod postgres;
+mod redis;
 mod rewind;
 mod supervisor;
 mod trust;
@@ -491,7 +492,7 @@ fn databases(stack: &docker::Stack) -> serde_json::Value {
             })
         })
         .collect();
-    json!({"shared": dbs, "rewritten_env": rewritten, "plain": info.plain})
+    json!({"shared": dbs, "rewritten_env": rewritten, "plain": info.plain, "redis": redis::context(&stack.compose_name())})
 }
 
 fn runtime_line(stack: &docker::Stack, name: &str) -> String {

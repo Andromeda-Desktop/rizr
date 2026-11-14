@@ -230,7 +230,21 @@ undefined() { # depends_on names a service no file defines
   expect undefined out 'a depends on nosuch, which no compose file in use defines'
 }
 
-cases=("${@:-orphan crashloop slowjob server500 credentials namecheck downplain socket portstray image daemon variable yaml job health build disk oom tool nocmd envfile undefined}")
+redis() { # a redis is ready by its log line, answers PING, and reset empties it
+  stack redis 'services:
+  cache: {image: "redis:7-alpine", ports: ["18096:6379"]}'
+  up_rc
+  "$RIZR" status >>out 2>&1
+  docker exec redis-cache-1 redis-cli set k v >/dev/null
+  "$RIZR" reset cache >>out 2>&1
+  echo "after reset: [$(docker exec redis-cache-1 redis-cli get k)]" >>out
+  expect redis out 'log line "Ready to accept connections"'
+  expect redis out 'redis://localhost:18096 -> PONG'
+  expect redis out 'after reset: \[\]'
+  done_case redis
+}
+
+cases=("${@:-orphan crashloop slowjob server500 credentials namecheck downplain socket portstray image daemon variable yaml job health build disk oom tool nocmd envfile undefined redis}")
 # Each case takes a docker network; docker has about 30 address pools for every stack on the machine.
 for c in ${cases[*]}; do
   while (($(jobs -rp | wc -l) >= 4)); do wait -n; done

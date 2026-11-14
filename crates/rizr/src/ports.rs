@@ -34,41 +34,79 @@ pub fn lines(dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Each published TCP port of compose project `project` with the result of one HTTP GET to it, so an agent
-/// needs no own curl. A report for the agent, not a readiness probe (those never use host ports).
+/// Each published TCP port of compose project `project` with the result of one HTTP GET to it (a redis: PING), so
+/// an agent needs no own curl. A report for the agent, not a readiness probe (those never use host ports).
 pub fn checks(project: &str) -> Vec<Value> {
     let out = Command::new("docker")
         .args(["ps", "--filter"])
         .arg(format!("label=com.docker.compose.project={project}"))
         .args([
             "--format",
-            "{{.Label \"com.docker.compose.service\"}}\t{{.Ports}}",
+            "{{.Label \"com.docker.compose.service\"}}\t{{.Image}}\t{{.Ports}}",
         ])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
     let mut found = std::collections::BTreeSet::new();
-    for (svc, ports) in out.lines().filter_map(|l| l.split_once('\t')) {
+    for (svc, image, ports) in out.lines().filter_map(|l| {
+        let mut f = l.splitn(3, '\t');
+        Some((f.next()?, f.next()?, f.next()?))
+    }) {
+        let redis = crate::redis::image(image);
         for p in ports.split(", ") {
             let Some((host, _)) = p.split_once("->").filter(|_| p.ends_with("/tcp")) else {
                 continue;
             };
             if let Some(port) = host.rsplit(':').next().and_then(|n| n.parse::<u16>().ok()) {
-                found.insert((svc.to_owned(), port));
+                found.insert((svc.to_owned(), port, redis));
             }
         }
     }
     std::thread::scope(|s| {
         let runs: Vec<_> = found
             .iter()
-            .map(|(svc, port)| (svc, port, s.spawn(|| http_get(*port))))
+            .map(|(svc, port, redis)| {
+                let (port, redis) = (*port, *redis);
+                let h = s.spawn(move || if redis { ping(port) } else { http_get(port) });
+                (svc, port, redis, h)
+            })
             .collect();
         runs.into_iter()
-            .map(|(svc, port, h)| {
-                json!({"node": svc, "url": format!("http://localhost:{port}/"), "check": h.join().unwrap_or_default()})
+            .map(|(svc, port, redis, h)| {
+                let url = if redis {
+                    format!("redis://localhost:{port}")
+                } else {
+                    format!("http://localhost:{port}/")
+                };
+                json!({"node": svc, "url": url, "check": h.join().unwrap_or_default()})
             })
             .collect()
     })
+}
+
+/// A redis `PING`: `PONG`, or what the server says instead (a password it wants, data it still loads).
+fn ping(port: u16) -> String {
+    use std::io::{Read, Write};
+    use std::time::Duration;
+    let Ok(mut c) = std::net::TcpStream::connect_timeout(
+        &([127, 0, 0, 1], port).into(),
+        Duration::from_secs(5),
+    ) else {
+        return "connection refused".into();
+    };
+    let _ = c.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut buf = [0u8; 128];
+    match c.write_all(b"PING\r\n").and_then(|()| c.read(&mut buf)) {
+        Ok(n) => {
+            let r = String::from_utf8_lossy(&buf[..n]);
+            let r = r.trim();
+            r.strip_prefix('+')
+                .or_else(|| r.strip_prefix('-'))
+                .unwrap_or(r)
+                .to_owned()
+        }
+        Err(e) => format!("port open, {e}"),
+    }
 }
 
 /// `GET /`: 5 s to connect, 15 s to reply (a hung request often logs its cause late): the status line, or why there is none.

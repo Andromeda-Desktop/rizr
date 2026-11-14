@@ -285,11 +285,18 @@ pub fn model(config: &Value, instance: &InstanceId, inputs: Digest) -> Result<Mo
     Ok(m)
 }
 
-/// Readiness signal: healthcheck event, else a tcp probe on each container port, else ready at start.
+/// Readiness signal: healthcheck event, else a redis server's ready line, else a tcp probe on each container
+/// port, else ready at start.
 fn probe(svc: &Value) -> Probe {
     let hc = &svc["healthcheck"];
     if hc.is_object() && hc["disable"] != true && hc["test"] != serde_json::json!(["NONE"]) {
         return Probe::HealthEvent;
+    }
+    if redis_server(svc) {
+        // Redis opens its port before it loads its data; until this line it answers LOADING.
+        return Probe::LogLine {
+            pattern: "Ready to accept connections".into(),
+        };
     }
     let mut ports: Vec<u16> = svc["ports"]
         .as_array()
@@ -313,6 +320,24 @@ fn probe(svc: &Value) -> Probe {
     } else {
         Probe::Tcp { ports }
     }
+}
+
+/// A redis or valkey image that runs its server: the image's own command, or one that starts the server.
+fn redis_server(svc: &Value) -> bool {
+    let command = match &svc["command"] {
+        Value::Array(a) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" "),
+        Value::String(s) => s.clone(),
+        _ => String::new(),
+    };
+    crate::redis::image(svc["image"].as_str().unwrap_or_default())
+        && svc["entrypoint"].is_null()
+        && (command.is_empty()
+            || command.contains("redis-server")
+            || command.contains("valkey-server"))
 }
 
 pub fn cycle(m: &Model) -> Option<NodeId> {
@@ -386,6 +411,8 @@ mod tests {
         let config = serde_json::json!({"services": {
             "db": {"healthcheck": {"test": ["CMD", "true"]}, "ports": [{"target": 5432, "protocol": "tcp"}]},
             "cache": {"expose": ["6379/tcp"]},
+            "redis": {"image": "redis:7-alpine", "command": ["redis-server", "--appendonly", "yes"]},
+            "redis-cli": {"image": "redis:7", "command": ["redis-cli", "-h", "redis", "monitor"], "expose": ["6379/tcp"]},
             "create-site": {"deploy": {"restart_policy": {"condition": "none"}}},
             "migrate": {"depends_on": {"db": {"condition": "service_healthy"}}},
             "api": {"depends_on": {
@@ -402,6 +429,20 @@ mod tests {
         );
         assert_eq!(
             get("cache").kind,
+            NodeKind::Service {
+                probe: Probe::Tcp { ports: vec![6379] }
+            }
+        );
+        assert_eq!(
+            get("redis").kind,
+            NodeKind::Service {
+                probe: Probe::LogLine {
+                    pattern: "Ready to accept connections".into()
+                }
+            }
+        );
+        assert_eq!(
+            get("redis-cli").kind,
             NodeKind::Service {
                 probe: Probe::Tcp { ports: vec![6379] }
             }
