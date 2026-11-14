@@ -540,10 +540,50 @@ fn command_task(line: &str) -> Option<TaskName> {
         "make check",
     ];
     let starts = |p: &str| l == p || l.starts_with(&format!("{p} "));
-    if test.iter().any(|p| starts(p)) {
+    if test.iter().any(|p| starts(p)) && !subset(l) {
         return Some(TaskName::Test);
     }
     None
+}
+
+/// A test line that runs one target or a benchmark (`--test gui`, `--bin rg`, `-bench=X`, `-run X`), not the suite.
+fn subset(line: &str) -> bool {
+    line.split_whitespace().take_while(|w| *w != "--").any(|w| {
+        let flag = w.split('=').next().unwrap_or(w);
+        matches!(
+            flag,
+            "--test" | "--bin" | "--example" | "--bench" | "-bench" | "-run"
+        )
+    })
+}
+
+/// 1 when a command runs every package (`--workspace`, `--all`, `./...`), else 0.
+fn scope(cmd: &str) -> u8 {
+    u8::from(
+        cmd.split_whitespace()
+            .any(|w| matches!(w, "--workspace" | "--all" | "./...")),
+    )
+}
+
+/// Adds a CI or docs candidate: the broadest line of its source wins, the first among equals.
+/// For tests a CI line beats any docs line: a README often shows the tool's own usage, not the repo's test run.
+fn add_ranked(pkg: &mut Package, name: TaskName, cmd: &str, source: Source, from: &str) {
+    let list = pkg.tasks.get(&name).map(Vec::as_slice).unwrap_or_default();
+    if source == Source::Docs
+        && name == TaskName::Test
+        && list.iter().any(|t| t.source == Source::Ci)
+    {
+        return;
+    }
+    if let Some(i) = list.iter().position(|t| t.source == source) {
+        if scope(cmd) <= scope(&list[i].cmd) {
+            return;
+        }
+        if let Some(l) = pkg.tasks.get_mut(&name) {
+            l.remove(i);
+        }
+    }
+    pkg.add(name, task(cmd, source, from.to_owned()));
 }
 
 fn ci(tree: &Tree, pkg: &mut Package) {
@@ -567,18 +607,11 @@ fn ci(tree: &Tree, pkg: &mut Package) {
                 .collect::<Vec<_>>()
         });
         for line in lines {
-            if line.contains("${{") || line.contains('$') && line.contains("{{") {
+            if line.contains("${") || line.contains('$') && line.contains("{{") {
                 continue;
             }
-            if let Some(name) = command_task(&line)
-                && !pkg
-                    .tasks
-                    .get(&name)
-                    .into_iter()
-                    .flatten()
-                    .any(|t| t.source == Source::Ci)
-            {
-                pkg.add(name, task(line.trim(), Source::Ci, path.clone()));
+            if let Some(name) = command_task(&line) {
+                add_ranked(pkg, name, line.trim(), Source::Ci, path);
             }
         }
     }
@@ -598,16 +631,9 @@ fn docs(tree: &Tree, pkg: &mut Package) {
             if !fenced {
                 continue;
             }
-            if let Some(name) = command_task(line)
-                && !pkg
-                    .tasks
-                    .get(&name)
-                    .into_iter()
-                    .flatten()
-                    .any(|t| t.source == Source::Docs)
-            {
+            if let Some(name) = command_task(line) {
                 let cmd = line.trim().trim_start_matches("$ ").trim();
-                pkg.add(name, task(cmd, Source::Docs, path.clone()));
+                add_ranked(pkg, name, cmd, Source::Docs, path);
             }
         }
     }
@@ -671,6 +697,34 @@ mod tests {
             test_cmd(&t),
             ("cargo test --workspace --locked".into(), Source::Ci)
         );
+    }
+
+    #[test]
+    fn a_target_filtered_ci_line_loses_to_the_whole_suite() {
+        let t = tree(&[
+            ("Cargo.toml", "[package]\nname = \"a\"\n"),
+            (
+                ".github/workflows/ci.yml",
+                "jobs:\n  gui:\n    steps:\n      - run: cargo test --locked --test gui\n  test:\n    steps:\n      - run: cargo test --locked\n      - run: cargo test --workspace --locked\n",
+            ),
+        ]);
+        assert_eq!(
+            test_cmd(&t),
+            ("cargo test --workspace --locked".into(), Source::Ci)
+        );
+    }
+
+    #[test]
+    fn a_ci_test_line_beats_readme_usage_examples() {
+        let t = tree(&[
+            ("go.mod", "module x\n"),
+            ("README.md", "```\ngo test -bench=Caller\njust test\n```\n"),
+            (
+                ".github/workflows/ci.yml",
+                "jobs:\n  test:\n    steps:\n      - run: go test -race -v ./...\n",
+            ),
+        ]);
+        assert_eq!(test_cmd(&t), ("go test -race -v ./...".into(), Source::Ci));
     }
 
     #[test]
