@@ -1,5 +1,6 @@
 //! The pure core of rizr: no IO, no clock. See .agent/SPEC-core.md.
 
+pub mod code;
 pub mod error;
 pub mod event;
 pub mod invariants;

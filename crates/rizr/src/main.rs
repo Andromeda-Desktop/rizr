@@ -9,6 +9,7 @@ use rizr_core::{Action, Event, State, plan, reduce};
 use serde_json::json;
 
 mod compose;
+mod detect;
 mod devenv;
 mod docker;
 mod docs;
@@ -345,6 +346,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                 }
             }
             print_order(&s);
+            print_tasks(&stack.root);
             Ok(())
         }
         Command::Status => {
@@ -445,6 +447,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                     "findings": findings(&s), "unverified": unverified, "moved_ports": ports::lines(&stack.dir), "outside_rizr": strays,
                     "generation": s.intents.generation.0, "graph": graph, "nodes": view::nodes(&s),
                     "drift": view::drift(&s), "failed": failed, "urls": urls, "error": url_error, "next": next, "notes": empty.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), "verbs": verbs(),
+                    "packages": detect::detect(&detect::read(&stack.root)),
                 })
             );
             Ok(())
@@ -975,6 +978,26 @@ fn print_status(stack: &docker::Stack, s: &State, status: InstanceStatus) {
             "unverified: {} started, but no healthcheck proves they serve requests; read each URL check below, or `rizr logs <node>`",
             unverified.join(", ")
         );
+    }
+}
+
+/// The task each package runs, with its source, for `plan`.
+fn print_tasks(root: &Path) {
+    let packages = detect::detect(&detect::read(root));
+    if packages.is_empty() {
+        return;
+    }
+    println!("tasks:");
+    for p in &packages {
+        for (name, list) in &p.tasks {
+            let Some(t) = list.first() else { continue };
+            let name = serde_json::to_value(name).unwrap_or_default();
+            let name = name.as_str().unwrap_or_default();
+            println!(
+                "  {} {name}: {} ({:?} from {})",
+                p.dir, t.cmd, t.source, t.from
+            );
+        }
     }
 }
 
