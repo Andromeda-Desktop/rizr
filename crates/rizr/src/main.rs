@@ -321,13 +321,16 @@ fn run(cli: Cli) -> Result<(), Error> {
                 }
                 println!("{r}");
             } else {
-                print_status(&stack, &s, status_of(&s, failed.is_some()), failed.as_ref());
+                let tasks = task_hints(&stack.root);
+                print_status(
+                    &stack,
+                    &s,
+                    status_of(&s, failed.is_some()),
+                    failed.as_ref(),
+                    &tasks,
+                );
                 print_urls(&urls);
                 print_databases(&stack, &s);
-                let hints = task_hints(&stack.root);
-                if !hints.is_empty() {
-                    println!("tasks: {}", hints.join("; "));
-                }
                 // Last, so a `| tail` keeps it.
                 for (n, _) in &notes {
                     println!("note: {n}");
@@ -402,7 +405,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                            "urls": urls, "error": failed})
                 );
             } else {
-                print_status(&stack, &s, status, failed.as_ref());
+                print_status(&stack, &s, status, failed.as_ref(), &[]);
                 print_urls(&urls);
                 print_databases(&stack, &s);
             }
@@ -1081,8 +1084,14 @@ fn print_urls(urls: &[serde_json::Value]) {
     }
 }
 
-/// `failed` prints under the status line, so the cause and fix lead the output.
-fn print_status(stack: &docker::Stack, s: &State, status: InstanceStatus, failed: Option<&Error>) {
+/// `failed` and `tasks` print under the status line, so the cause, fix and test command lead the output.
+fn print_status(
+    stack: &docker::Stack,
+    s: &State,
+    status: InstanceStatus,
+    failed: Option<&Error>,
+    tasks: &[String],
+) {
     print_findings(s);
     println!(
         "{}: {:?} (generation {})",
@@ -1092,6 +1101,9 @@ fn print_status(stack: &docker::Stack, s: &State, status: InstanceStatus, failed
     );
     if let Some(e) = failed {
         println!("error: {}\nhint: {}\ntry: {}", e.message, e.hint, e.example);
+    }
+    if !tasks.is_empty() {
+        println!("tasks: {}", tasks.join("; "));
     }
     let drift = view::drift(s);
     for n in view::nodes(s) {
