@@ -873,13 +873,19 @@ pub fn detect(svc: &Value) -> Option<Server> {
     if init || !svc["command"].is_null() {
         return None;
     }
-    let env = svc["environment"]
+    let mut env: BTreeMap<String, String> = svc["environment"]
         .as_object()
         .into_iter()
         .flatten()
         .filter(|(k, _)| k.starts_with("POSTGRES_") && *k != "POSTGRES_DB")
         .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
         .collect();
+    // The image refuses to start without a password; the repo asks for none, and the server listens only on
+    // loopback and the stack's networks.
+    if env.get("POSTGRES_PASSWORD").is_none_or(String::is_empty) {
+        env.entry("POSTGRES_HOST_AUTH_METHOD".into())
+            .or_insert_with(|| "trust".into());
+    }
     Some(Server {
         major,
         image: svc["image"].as_str()?.to_owned(),
