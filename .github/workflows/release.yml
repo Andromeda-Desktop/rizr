@@ -1,0 +1,33 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+      - run: cargo test --locked
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: upload
+        run: |
+          f=rizr-$TAG-${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/rizr "$f"
+          sha256sum "$f" > "$f.sha256"
+          # both jobs create the release; the second create fails and only uploads
+          gh release create "$TAG" --verify-tag --title "rizr $TAG" --notes "Static Linux binaries. Needs docker with compose v2." || true
+          gh release upload "$TAG" "$f" "$f.sha256" --clobber
