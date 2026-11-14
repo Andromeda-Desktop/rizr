@@ -1089,11 +1089,8 @@ fn url_checks(stack: &docker::Stack, since: u64) -> (Vec<serde_json::Value>, Opt
 /// One line per database on a shared server: the compose service has no container, so its command is not
 /// `docker compose exec <service>`.
 fn print_databases(stack: &docker::Stack, s: &State) {
-    for db in databases(stack, s)["shared"]
-        .as_array()
-        .into_iter()
-        .flatten()
-    {
+    let all = databases(stack, s);
+    for db in all["shared"].as_array().into_iter().flatten() {
         if let (Some(svc), Some(psql)) = (db["service"].as_str(), db["psql"].as_str()) {
             println!(
                 "  {svc} database: {psql} -c '<sql>' (its password follows the compose file at each up)"
@@ -1104,6 +1101,25 @@ fn print_databases(stack: &docker::Stack, s: &State) {
                 );
             }
         }
+    }
+    let env: Vec<String> = all["rewritten_env"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|r| {
+            format!(
+                "{} {}={}",
+                r["service"].as_str().unwrap_or_default(),
+                r["var"].as_str().unwrap_or_default(),
+                r["value"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    if !env.is_empty() {
+        println!(
+            "  env rizr points at this instance's databases: {}",
+            env.join(", ")
+        );
     }
 }
 
