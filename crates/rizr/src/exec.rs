@@ -59,17 +59,41 @@ pub fn start(stack: &Stack, node: &str, cmd: &[String]) -> Result<(), Error> {
         .map_err(|e| runtime(&e.to_string()))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
+        let last = err
+            .trim()
+            .lines()
+            .last()
+            .unwrap_or("docker compose run failed")
+            .to_owned();
+        // `failed to start containers: <id>` names no reason; the container keeps it.
+        let reason = Command::new("docker")
+            .args(["inspect", "--format", "{{.State.Error}}", &id])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap_or_default();
+        let (hint, example) = if last.contains("no such service") {
+            (
+                "the node must be a service of the compose files rizr uses".to_owned(),
+                "rizr status".to_owned(),
+            )
+        } else if reason.is_empty() {
+            (
+                "compose could not start the job container; its output is above".to_owned(),
+                format!("docker logs {id}"),
+            )
+        } else {
+            (
+                format!("the job container did not start: {reason}"),
+                format!("docker inspect --format '{{{{.State.Error}}}}' {id}"),
+            )
+        };
+        let tail: Vec<&str> = err.trim().lines().rev().take(8).collect();
+        eprintln!("{}", tail.into_iter().rev().collect::<Vec<_>>().join("\n"));
         return Err(Error::new(
             ErrorCode::JobFailed,
-            format!(
-                "cannot start a job in {node}: {}",
-                err.trim()
-                    .lines()
-                    .last()
-                    .unwrap_or("docker compose run failed")
-            ),
-            "the node must be a service of this stack; `rizr up` builds its image and starts its dependencies",
-            "rizr status",
+            format!("cannot start a job in {node}: {last}"),
+            hint,
+            example,
         ));
     }
     println!("job {id}: {node} $ {}", cmd.join(" "));

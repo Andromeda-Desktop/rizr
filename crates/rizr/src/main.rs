@@ -11,6 +11,7 @@ use serde_json::json;
 mod compose;
 mod devenv;
 mod docker;
+mod docs;
 mod doctor;
 mod exec;
 mod gc;
@@ -279,9 +280,21 @@ fn run(cli: Cli) -> Result<(), Error> {
             } else {
                 (Vec::new(), None)
             };
+            let notes = if up {
+                empty_databases(&stack)
+            } else {
+                Vec::new()
+            };
             if json && up {
                 let mut r = serde_json::to_value(view::receipt(&s)).unwrap_or_default();
                 r["urls"] = urls.into();
+                if !notes.is_empty() {
+                    r["notes"] = notes
+                        .iter()
+                        .map(|(n, _)| n.clone())
+                        .collect::<Vec<_>>()
+                        .into();
+                }
                 if let Some(e) = &failed {
                     r["error"] = serde_json::to_value(e).unwrap_or_default();
                     println!("{r}");
@@ -291,6 +304,10 @@ fn run(cli: Cli) -> Result<(), Error> {
             } else {
                 print_status(&stack, &s, status_of(&s, failed.is_some()));
                 print_urls(&urls);
+                // Last, so a `| tail` keeps it.
+                for (n, _) in &notes {
+                    println!("note: {n}");
+                }
             }
             failed.map_or(Ok(()), Err)
         }
@@ -376,7 +393,9 @@ fn run(cli: Cli) -> Result<(), Error> {
                     failed.push(f.node.name.0.clone());
                 }
             }
-            let mut next: Vec<String> = url_error.iter().map(|e| e.example.clone()).collect();
+            let empty = empty_databases(&stack);
+            let mut next: Vec<String> = empty.iter().filter_map(|(_, c)| c.clone()).collect();
+            next.extend(url_error.iter().map(|e| e.example.clone()));
             next.extend(
                 failed
                     .iter()
@@ -425,7 +444,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                     "rewind": rewind::entries(&stack.dir).iter().rev().take(10).collect::<Vec<_>>(),
                     "findings": findings(&s), "unverified": unverified, "moved_ports": ports::lines(&stack.dir), "outside_rizr": strays,
                     "generation": s.intents.generation.0, "graph": graph, "nodes": view::nodes(&s),
-                    "drift": view::drift(&s), "failed": failed, "urls": urls, "error": url_error, "next": next, "verbs": verbs(),
+                    "drift": view::drift(&s), "failed": failed, "urls": urls, "error": url_error, "next": next, "notes": empty.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), "verbs": verbs(),
                 })
             );
             Ok(())
@@ -463,12 +482,30 @@ fn run(cli: Cli) -> Result<(), Error> {
             if follow {
                 c.arg("--follow");
             }
-            c.args(shared.or(node));
+            c.args(shared.or(node.clone()));
             let st = c.status().map_err(|e| runtime_error(&e.to_string()))?;
             if st.success() {
-                Ok(())
-            } else {
-                Err(runtime_error("docker compose logs failed"))
+                return Ok(());
+            }
+            let services: Vec<String> = stack
+                .compose()
+                .args(["config", "--services"])
+                .output()
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            match node.filter(|n| !services.is_empty() && !services.contains(n)) {
+                Some(n) => Err(Error::new(
+                    ErrorCode::Usage,
+                    format!("no service {n} in the compose files rizr uses"),
+                    format!("its services: {}", services.join(", ")),
+                    "rizr status",
+                )),
+                None => Err(runtime_error("docker compose logs failed")),
             }
         }
         Command::Eject { out } => {
@@ -589,6 +626,29 @@ fn server_error(u: &serde_json::Value) -> Error {
     )
 }
 
+/// Databases of this instance with no tables yet, as a note line and the migrate command the repo's docs give.
+fn empty_databases(stack: &docker::Stack) -> Vec<(String, Option<String>)> {
+    let empty = postgres::empty(&stack.dir, &stack.project.0);
+    if empty.is_empty() {
+        return Vec::new();
+    }
+    let cmd = docs::migrate(&stack.root);
+    empty
+        .into_iter()
+        .map(|(svc, db)| {
+            let line = match &cmd {
+                Some(c) => format!(
+                    "database {db} ({svc}) has no tables: the app's migration has not run; the repo's docs give it, run it before anything that reads the database: `{c}`"
+                ),
+                None => format!(
+                    "database {db} ({svc}) has no tables: the app's migration has not run; run it (see the repo's README) before anything that reads the database, with `rizr exec <service> <command>`"
+                ),
+            };
+            (line, cmd.clone())
+        })
+        .collect()
+}
+
 /// A failed `up` beside other compose files may have run the wrong one: the hint names them, since a `| tail`
 /// cuts the note printed before up's output. When one of them defines services the used files lack (a
 /// self-contained `pwd.yml` with its own database), `rizr -f <file> up` becomes the command to try first.
@@ -597,6 +657,7 @@ fn with_others(stack: &docker::Stack, mut e: Error, others: &[String]) -> Error 
         || !matches!(
             e.code,
             ErrorCode::StartFailed
+                | ErrorCode::StillRunning
                 | ErrorCode::StartTimeout
                 | ErrorCode::Unhealthy
                 | ErrorCode::JobFailed

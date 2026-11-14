@@ -672,6 +672,37 @@ pub fn admin(
     }
 }
 
+/// The services whose database on a shared server has no tables yet, as (service, database): the app's
+/// migration has not run. A server that does not answer counts as not empty.
+pub fn empty(dir: &Path, project: &str) -> Vec<(String, String)> {
+    Info::load(dir)
+        .databases
+        .into_iter()
+        .filter(|(_, d)| {
+            Command::new("docker")
+                .args([
+                    "exec",
+                    &format!("rizr-{project}-{}", d.server),
+                    "psql",
+                    "-U",
+                    &d.user,
+                    "-d",
+                ])
+                .arg(&d.database)
+                .args([
+                    "-qtAc",
+                    "select count(*) from information_schema.tables \
+                     where table_schema not in ('pg_catalog', 'information_schema')",
+                ])
+                .output()
+                .is_ok_and(|o| {
+                    o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "0"
+                })
+        })
+        .map(|(svc, d)| (svc, d.database))
+        .collect()
+}
+
 /// Close `db` to new sessions and end its open ones: a template, a drop or a rename needs it alone.
 pub fn close(server: &str, user: &str, db: &str) -> Result<(), String> {
     admin(
