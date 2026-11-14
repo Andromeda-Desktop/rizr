@@ -73,6 +73,8 @@ pub struct Node {
     /// Spec digest of the container this machine tracks; events with another digest are ignored.
     pub live: Option<Digest>,
     pub running: bool,
+    /// Id of the latest `Start` sent; a probe with a lower id saw the container before it and is stale.
+    pub started_at: EffectId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -353,6 +355,7 @@ fn sent(s: &mut State, e: Effect) {
             if let Some(n) = s.nodes.get_mut(node) {
                 n.live = Some(spec.clone());
                 n.running = false;
+                n.started_at = e.id;
             }
             let node = node.clone();
             s.step(&node, Input::StartSent);
@@ -425,7 +428,11 @@ fn done(s: &mut State, id: EffectId, answer: Answer) {
                 n.running = false;
             }
         }
-        (Op::Probe(node), Answer::Probe { ok }) => s.step(&node, Input::ProbeResult(ok)),
+        (Op::Probe(node), Answer::Probe { ok }) => {
+            if s.nodes.get(&node).is_some_and(|n| n.started_at < id) {
+                s.step(&node, Input::ProbeResult(ok));
+            }
+        }
         (Op::AcquireProjectLock, Answer::Err { tail }) => {
             s.lock = Lock::Free;
             s.reject(format!("project lock: {tail}"));
@@ -474,6 +481,7 @@ fn load(s: &mut State, model: Model) {
                         machine,
                         live: None,
                         running: false,
+                        started_at: EffectId(0),
                     },
                 );
                 false
@@ -520,6 +528,7 @@ fn rebuild(s: &mut State, world: &World) {
             machine: Machine::Service(Service::Absent),
             live: None,
             running: false,
+            started_at: EffectId(0),
         });
     }
     // `up` reruns a service that exited 0, as compose does; any other verb shows it completed
