@@ -263,6 +263,27 @@ fn unreachable(
     out
 }
 
+/// The images a compose `build` starts FROM, read from its Dockerfile; empty when the file does not read.
+fn base_images(build: &Value) -> Vec<String> {
+    let text = match build["dockerfile_inline"].as_str() {
+        Some(t) => t.to_owned(),
+        None => {
+            let context = Path::new(build["context"].as_str().unwrap_or("."));
+            let file = build["dockerfile"].as_str().unwrap_or("Dockerfile");
+            std::fs::read_to_string(context.join(file)).unwrap_or_default()
+        }
+    };
+    text.lines()
+        .filter_map(|l| {
+            let mut words = l.split_whitespace();
+            if !words.next()?.eq_ignore_ascii_case("FROM") {
+                return None;
+            }
+            words.find(|w| !w.starts_with("--")).map(str::to_owned)
+        })
+        .collect()
+}
+
 pub fn model(config: &Value, instance: &InstanceId, inputs: Digest) -> Result<Model, String> {
     let services = config["services"]
         .as_object()
@@ -285,11 +306,12 @@ pub fn model(config: &Value, instance: &InstanceId, inputs: Digest) -> Result<Mo
         svc["deploy"]["restart_policy"]["condition"] == "none" || svc["restart"] == "no"
     };
     // `docker compose up --no-deps` pulls an image that another service builds instead of building it.
-    let builders: BTreeMap<&str, &str> = services
-        .iter()
-        .filter(|(_, s)| !s["build"].is_null())
-        .filter_map(|(n, s)| Some((s["image"].as_str()?, n.as_str())))
-        .collect();
+    let mut builders: BTreeMap<&str, &str> = BTreeMap::new();
+    for (n, s) in services.iter().filter(|(_, s)| !s["build"].is_null()) {
+        if let Some(i) = s["image"].as_str() {
+            builders.entry(i).or_insert(n);
+        }
+    }
     let mut nodes = BTreeMap::new();
     for (name, svc) in services {
         let mut deps: Vec<Dep> = svc["depends_on"]
@@ -306,16 +328,30 @@ pub fn model(config: &Value, instance: &InstanceId, inputs: Digest) -> Result<Mo
                 },
             })
             .collect();
-        if let Some(&b) = svc["image"].as_str().and_then(|i| builders.get(i))
-            && b != name
-            && deps.iter().all(|d| d.node.name.0 != b)
-            && services[b]["depends_on"].get(name).is_none()
+        // A service with a build needs the images its Dockerfile starts FROM; one without needs its `image`.
+        let needs = if svc["build"].is_null() {
+            svc["image"]
+                .as_str()
+                .map(str::to_owned)
+                .into_iter()
+                .collect()
+        } else {
+            base_images(&svc["build"])
+        };
+        for b in needs
+            .iter()
+            .filter_map(|i| builders.get(i.as_str()).copied())
         {
-            let job = jobs.contains(b) || once(&services[b]);
-            deps.push(Dep {
-                node: id(b),
-                gate: if job { Gate::Completed } else { Gate::Ready },
-            });
+            if b != name
+                && deps.iter().all(|d| d.node.name.0 != b)
+                && services[b]["depends_on"].get(name).is_none()
+            {
+                let job = jobs.contains(b) || once(&services[b]);
+                deps.push(Dep {
+                    node: id(b),
+                    gate: if job { Gate::Completed } else { Gate::Ready },
+                });
+            }
         }
         let kind = if jobs.contains(name.as_str()) {
             NodeKind::Job {
@@ -475,9 +511,11 @@ mod tests {
     #[test]
     fn a_service_waits_for_the_service_that_builds_its_image() {
         let config = serde_json::json!({"services": {
-            "rails": {"build": {"context": "."}, "image": "app:dev"},
-            "vite": {"image": "app:dev"},
+            "rails": {"build": {"context": "/nonexistent"}, "image": "app:dev"},
+            "web": {"image": "app:dev"},
             "worker": {"image": "app:dev", "depends_on": {"rails": {"condition": "service_healthy"}}},
+            "vite": {"build": {"dockerfile_inline": "FROM --platform=linux/amd64 app:dev\nRUN true\n"}, "image": "vite:dev"},
+            "sidekiq": {"build": {"context": "/nonexistent"}, "image": "app:dev"},
         }});
         let m = model(&config, &"main".into(), "d".into()).unwrap();
         let deps = |n: &str| {
@@ -487,9 +525,11 @@ mod tests {
                 .map(|d| d.node.name.0.clone())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(deps("vite"), ["rails"]);
+        assert_eq!(deps("web"), ["rails"]);
         assert_eq!(deps("worker"), ["rails"]);
+        assert_eq!(deps("vite"), ["rails"]);
         assert!(deps("rails").is_empty());
+        assert!(deps("sidekiq").is_empty());
     }
 
     #[test]
