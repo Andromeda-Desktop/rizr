@@ -267,6 +267,19 @@ pub fn prepare(
         .collect();
     let mut mine = BTreeSet::new();
     let mut all = load(dir);
+    // A moved port also avoids this instance's claims, the moves already made and this service's other ports:
+    // two ports of one service moved to the same host port make the container fail to create.
+    let mut avoid: BTreeSet<u16> = others
+        .iter()
+        .chain(held.get(instance).into_iter().flatten())
+        .chain(all.values().flat_map(|m| m.values()))
+        .copied()
+        .collect();
+    avoid.extend(
+        ports
+            .iter()
+            .filter_map(|p| p["published"].as_str().and_then(|s| s.parse::<u16>().ok())),
+    );
     let mut changed = false;
     let mut out = Vec::new();
     for p in ports {
@@ -282,8 +295,9 @@ pub fn prepare(
                     || others.contains(&want)
                     || taken_by_other(&ip, want, root) =>
                 {
-                    let h = free_after(&ip, want, root, &others);
+                    let h = free_after(&ip, want, root, &avoid);
                     if let Some(h) = h {
+                        avoid.insert(h);
                         all.entry(svc.into()).or_default().insert(want, h);
                         changed = true;
                     }
@@ -375,6 +389,34 @@ mod tests {
             host,
             "the port stays the same across runs"
         );
+    }
+
+    #[test]
+    fn two_taken_ports_of_one_service_move_to_different_ports() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two neighbouring ports held by another program: the first free port after each is the same one.
+        let (a, _held) = loop {
+            let first = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let a = first.local_addr().unwrap().port();
+            if let Ok(second) = TcpListener::bind(("127.0.0.1", a + 1)) {
+                break (a, (first, second));
+            }
+        };
+        let ports = [a, a + 1].map(|p| {
+            json!({"target": p, "published": p.to_string(), "host_ip": "127.0.0.1", "protocol": "tcp"})
+        });
+        let claims = dir.path().join("p.ports.json");
+        prepare(
+            dir.path(),
+            Path::new("/rizr-test-none"),
+            "app",
+            &ports,
+            &claims,
+            "main",
+        )
+        .unwrap();
+        let moved = &load(dir.path())["app"];
+        assert_ne!(moved[&a], moved[&(a + 1)]);
     }
 
     #[test]
