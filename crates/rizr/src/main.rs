@@ -328,8 +328,9 @@ fn run(cli: Cli) -> Result<(), Error> {
                     status_of(&s, failed.is_some()),
                     failed.as_ref(),
                     &tasks,
+                    &urls,
                 );
-                print_urls(&urls);
+                print_log_tails(&urls);
                 print_databases(&stack, &s);
                 // Last, so a `| tail` keeps it.
                 for (n, _) in &notes {
@@ -405,8 +406,8 @@ fn run(cli: Cli) -> Result<(), Error> {
                            "urls": urls, "error": failed})
                 );
             } else {
-                print_status(&stack, &s, status, failed.as_ref(), &[]);
-                print_urls(&urls);
+                print_status(&stack, &s, status, failed.as_ref(), &[], &urls);
+                print_log_tails(&urls);
                 print_databases(&stack, &s);
             }
             Ok(())
@@ -1072,25 +1073,43 @@ fn print_databases(stack: &docker::Stack, s: &State) {
 
 fn print_urls(urls: &[serde_json::Value]) {
     for u in urls {
-        println!(
-            "  {} {} -> {}",
-            u["node"].as_str().unwrap_or_default(),
-            u["url"].as_str().unwrap_or_default(),
-            u["check"].as_str().unwrap_or_default()
-        );
+        print_url(u);
         if let Some(t) = u["log_tail"].as_str() {
             println!("    last log lines:\n{t}");
         }
     }
 }
 
-/// `failed` and `tasks` print under the status line, so the cause, fix and test command lead the output.
+fn print_url(u: &serde_json::Value) {
+    println!(
+        "  {} {} -> {}",
+        u["node"].as_str().unwrap_or_default(),
+        u["url"].as_str().unwrap_or_default(),
+        u["check"].as_str().unwrap_or_default()
+    );
+}
+
+/// After the node rows: the URL lines already lead the output.
+fn print_log_tails(urls: &[serde_json::Value]) {
+    for u in urls {
+        if let Some(t) = u["log_tail"].as_str() {
+            println!(
+                "  {} last log lines:\n{t}",
+                u["node"].as_str().unwrap_or_default()
+            );
+        }
+    }
+}
+
+/// `failed`, `tasks` and the URL checks print under the status line, so the cause, fix, test command and
+/// URLs lead the output.
 fn print_status(
     stack: &docker::Stack,
     s: &State,
     status: InstanceStatus,
     failed: Option<&Error>,
     tasks: &[String],
+    urls: &[serde_json::Value],
 ) {
     print_findings(s);
     println!(
@@ -1105,6 +1124,7 @@ fn print_status(
     if !tasks.is_empty() {
         println!("tasks: {}", tasks.join("; "));
     }
+    urls.iter().for_each(print_url);
     let drift = view::drift(s);
     for n in view::nodes(s) {
         let next = drift
@@ -1125,7 +1145,7 @@ fn print_status(
     let unverified: Vec<String> = view::unverified(s).into_iter().map(|n| n.0).collect();
     if !unverified.is_empty() {
         println!(
-            "unverified: {} started, but no healthcheck proves they serve requests; read each URL check below, or `rizr logs <node>`",
+            "unverified: {} started, but no healthcheck proves they serve requests; read each URL check above, or `rizr logs <node>`",
             unverified.join(", ")
         );
     }
