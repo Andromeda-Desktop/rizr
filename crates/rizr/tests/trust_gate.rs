@@ -36,6 +36,17 @@ fn hostile_untrusted_repo_starts_no_process() {
         ),
     );
     w(&repo.join(".env"), "COMPOSE_FILE=compose.yml\n");
+    w(
+        &repo.join("package.json"),
+        &format!(
+            "{{\"scripts\": {{\"test\": \"touch {m}\", \"build\": \"touch {m}\"}}}}",
+            m = marker.display()
+        ),
+    );
+    w(
+        &repo.join("justfile"),
+        &format!("test:\n\ttouch {}\n", marker.display()),
+    );
     // Every tool rizr could start before trust records that it ran.
     for tool in [
         "docker",
@@ -48,6 +59,12 @@ fn hostile_untrusted_repo_starts_no_process() {
         "sh",
         "bash",
         "env",
+        "pnpm",
+        "node",
+        "just",
+        "make",
+        "uv",
+        "python3",
     ] {
         let p = bin.join(tool);
         w(
@@ -62,6 +79,8 @@ fn hostile_untrusted_repo_starts_no_process() {
         &["down"],
         &["trust"],
         &["trust", "--yes"],
+        &["test"],
+        &["build"],
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_rizr"))
             .args(args)
