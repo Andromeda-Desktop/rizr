@@ -309,6 +309,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                         .collect::<Vec<_>>()
                         .into();
                 }
+                r["tasks"] = task_hints(&stack.root).into();
                 if let Some(e) = &failed {
                     r["error"] = serde_json::to_value(e).unwrap_or_default();
                     println!("{r}");
@@ -318,6 +319,10 @@ fn run(cli: Cli) -> Result<(), Error> {
             } else {
                 print_status(&stack, &s, status_of(&s, failed.is_some()));
                 print_urls(&urls);
+                let hints = task_hints(&stack.root);
+                if !hints.is_empty() {
+                    println!("tasks: {}", hints.join("; "));
+                }
                 // Last, so a `| tail` keeps it.
                 for (n, _) in &notes {
                     println!("note: {n}");
@@ -420,7 +425,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             .collect();
             println!(
                 "{}",
-                json!({"root": stack.root, "status": "no_stack", "compose_files": [], "packages": packages, "next": next, "verbs": verbs()})
+                json!({"status": "no_stack", "next": next, "tasks": task_hints(&stack.root), "packages": packages, "root": stack.root, "compose_files": [], "verbs": verbs()})
             );
             Ok(())
         }
@@ -487,19 +492,21 @@ fn run(cli: Cli) -> Result<(), Error> {
                 })
                 .unwrap_or_default();
             let databases = databases(&stack);
-            // One line: an agent's `| head -n 100` must not cut the graph or the next commands off.
+            // One line, answer first: an agent's `| head -c 3000` keeps the status, the cause, the next commands and the tasks.
             println!(
                 "{}",
                 json!({
-                    "databases": databases,
+                    "status": status, "failed": failed, "error": url_error, "next": next,
+                    "notes": empty.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                    "tasks": task_hints(&stack.root), "urls": urls, "findings": findings(&s),
+                    "unverified": unverified, "moved_ports": ports::lines(&stack.dir), "outside_rizr": strays,
+                    "packages": detect::detect(&detect::read(&stack.root)), "nodes": view::nodes(&s), "graph": graph,
+                    "drift": view::drift(&s), "databases": databases,
                     "root": stack.root, "project": stack.compose_name(), "data_dir": stack.dir,
-                    "compose_files": compose::resolve(&stack.root, &stack.files), "status": status,
+                    "compose_files": compose::resolve(&stack.root, &stack.files),
                     "other_compose_files": compose::others(&stack.root, &stack.files),
                     "rewind": rewind::entries(&stack.dir).iter().rev().take(10).collect::<Vec<_>>(),
-                    "findings": findings(&s), "unverified": unverified, "moved_ports": ports::lines(&stack.dir), "outside_rizr": strays,
-                    "generation": s.intents.generation.0, "graph": graph, "nodes": view::nodes(&s),
-                    "drift": view::drift(&s), "failed": failed, "urls": urls, "error": url_error, "next": next, "notes": empty.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), "verbs": verbs(),
-                    "packages": detect::detect(&detect::read(&stack.root)),
+                    "generation": s.intents.generation.0, "verbs": verbs(),
                 })
             );
             Ok(())
@@ -1036,6 +1043,28 @@ fn print_status(stack: &docker::Stack, s: &State, status: InstanceStatus) {
             unverified.join(", ")
         );
     }
+}
+
+/// The commands that run each package's tests and migration, as `rizr test`/`rizr migrate` lines with the
+/// detected command, so an agent needs no search for them.
+fn task_hints(root: &Path) -> Vec<String> {
+    let packages = detect::detect(&detect::read(root));
+    let mut out = Vec::new();
+    for p in &packages {
+        for (name, verb) in [
+            (rizr_core::code::TaskName::Test, "test"),
+            (rizr_core::code::TaskName::Migrate, "migrate"),
+        ] {
+            let Some(t) = p.task(name) else { continue };
+            let arg = if packages.len() > 1 {
+                format!(" {}", p.dir)
+            } else {
+                String::new()
+            };
+            out.push(format!("`rizr {verb}{arg}` runs `{}`", t.cmd));
+        }
+    }
+    out
 }
 
 /// The task each package runs, with its source, for `plan`.
