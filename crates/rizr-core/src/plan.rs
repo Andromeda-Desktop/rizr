@@ -217,7 +217,7 @@ pub fn plan(s: &State) -> Vec<Effect> {
     match s.lock {
         Lock::Free if need_lock => ops.push((
             Op::AcquireProjectLock,
-            "change a node shared by all instances".into(),
+            "lock the nodes shared by all instances while this up changes them; other instances keep running".into(),
         )),
         Lock::Held if !need_lock && !project_busy => {
             node_ops.push((Op::ReleaseProjectLock, "no shared node changes now".into()));

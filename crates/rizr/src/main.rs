@@ -1065,7 +1065,9 @@ fn print_databases(stack: &docker::Stack, s: &State) {
                 "  {svc} database: {psql} -c '<sql>' (its password follows the compose file at each up)"
             );
             if let Some(src) = db["copied_from"].as_str() {
-                println!("    it holds a copy of {src}, made when rizr created it");
+                println!(
+                    "    it holds a copy of {src}, made when rizr created it; the source stays as it is"
+                );
             }
         }
     }
@@ -1230,7 +1232,7 @@ fn print_order(s: &State, worktree: bool) {
             && id.scope != rizr_core::model::Scope::Project
             && n.provider.0 == postgres::PROVIDER
         {
-            "database on the shared server; when new, it gets a copy of main's data"
+            "database on the shared server; when new, it gets a copy of main's data, and main's database stays as it is"
         } else {
             "service"
         };
