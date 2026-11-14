@@ -287,7 +287,19 @@ pub fn prepare(
         let want = p["published"].as_str().and_then(|s| s.parse::<u16>().ok());
         if let Some(want) = want {
             let ip = p["host_ip"].as_str().unwrap_or("0.0.0.0").to_string();
-            let known = all.get(svc).and_then(|m| m.get(&want)).copied();
+            let free = |port| TcpListener::bind((ip.as_str(), port)).is_ok();
+            // A move of the main worktree ends when the stack is down and the compose port is free again.
+            let known = all
+                .get(svc)
+                .and_then(|m| m.get(&want))
+                .copied()
+                .filter(|h| {
+                    instance != "main" || others.contains(&want) || !(free(want) && free(*h))
+                });
+            if known.is_none() && all.get_mut(svc).is_some_and(|m| m.remove(&want).is_some()) {
+                all.retain(|_, m| !m.is_empty());
+                changed = true;
+            }
             let host = match known {
                 Some(h) => Some(h),
                 // The compose file's own ports belong to the main worktree, also when it is not running.
@@ -349,7 +361,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_port_held_by_another_program_moves_and_stays_moved() {
+    fn a_port_held_by_another_program_moves_until_it_is_free_and_the_stack_is_down() {
         let dir = tempfile::tempdir().unwrap();
         let other = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let want = other.local_addr().unwrap().port();
@@ -375,20 +387,31 @@ mod tests {
                 .contains(&format!("\"published\":\"{host}\""))
         );
         drop(other);
-        prepare(
-            dir.path(),
-            Path::new("/rizr-test-none"),
-            "app",
-            &ports,
-            &claims,
-            "main",
-        )
-        .unwrap();
+        let running = TcpListener::bind(("127.0.0.1", host)).unwrap();
+        let again = || {
+            prepare(
+                dir.path(),
+                Path::new("/rizr-test-none"),
+                "app",
+                &ports,
+                &claims,
+                "main",
+            )
+            .unwrap()
+        };
+        again();
         assert_eq!(
             load(dir.path())["app"][&want],
             host,
-            "the port stays the same across runs"
+            "the port stays while the stack runs on it"
         );
+        drop(running);
+        assert_eq!(
+            again(),
+            None,
+            "a stopped stack returns to the free compose port"
+        );
+        assert!(!load(dir.path()).contains_key("app"));
     }
 
     #[test]
