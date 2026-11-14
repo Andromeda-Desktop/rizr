@@ -403,6 +403,26 @@ fn run(cli: Cli) -> Result<(), Error> {
             let s = docker::run(&stack, i.digest, None)?;
             why(&stack, &s, &node, json)
         }
+        Command::Context
+            if compose::resolve(&stack.root, &stack.files).is_empty()
+                && manifest::host_names(&stack.root).is_empty() =>
+        {
+            // No stack to run: the code graph alone, so an agent still learns how to build and test the repo.
+            let packages = detect::detect(&detect::read(&stack.root));
+            let next: Vec<&str> = [
+                (rizr_core::code::TaskName::Test, "rizr test"),
+                (rizr_core::code::TaskName::Build, "rizr build"),
+            ]
+            .into_iter()
+            .filter(|(t, _)| packages.iter().any(|p| p.task(*t).is_some()))
+            .map(|(_, c)| c)
+            .collect();
+            println!(
+                "{}",
+                json!({"root": stack.root, "status": "no_stack", "compose_files": [], "packages": packages, "next": next, "verbs": verbs()})
+            );
+            Ok(())
+        }
         Command::Context => {
             let s = docker::run(&stack, i.digest, None)?;
             let (urls, url_error) = url_checks(&stack, 0);
