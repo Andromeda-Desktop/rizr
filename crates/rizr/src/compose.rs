@@ -279,9 +279,20 @@ pub fn model(config: &Value, instance: &InstanceId, inputs: Digest) -> Result<Mo
         .filter(|(_, c)| c["condition"] == "service_completed_successfully")
         .map(|(n, _)| n.as_str())
         .collect();
+    // A service that compose must never restart runs once: a setup step that nothing waits on (frappe
+    // create-site). It runs once per data set, not on every `up`.
+    let once = |svc: &Value| {
+        svc["deploy"]["restart_policy"]["condition"] == "none" || svc["restart"] == "no"
+    };
+    // `docker compose up --no-deps` pulls an image that another service builds instead of building it.
+    let builders: BTreeMap<&str, &str> = services
+        .iter()
+        .filter(|(_, s)| !s["build"].is_null())
+        .filter_map(|(n, s)| Some((s["image"].as_str()?, n.as_str())))
+        .collect();
     let mut nodes = BTreeMap::new();
     for (name, svc) in services {
-        let deps = svc["depends_on"]
+        let mut deps: Vec<Dep> = svc["depends_on"]
             .as_object()
             .into_iter()
             .flat_map(|d| d.iter())
@@ -295,14 +306,22 @@ pub fn model(config: &Value, instance: &InstanceId, inputs: Digest) -> Result<Mo
                 },
             })
             .collect();
-        // A service that compose must never restart runs once: a setup step that nothing waits on (frappe
-        // create-site). It runs once per data set, not on every `up`.
-        let once = svc["deploy"]["restart_policy"]["condition"] == "none" || svc["restart"] == "no";
+        if let Some(&b) = svc["image"].as_str().and_then(|i| builders.get(i))
+            && b != name
+            && deps.iter().all(|d| d.node.name.0 != b)
+            && services[b]["depends_on"].get(name).is_none()
+        {
+            let job = jobs.contains(b) || once(&services[b]);
+            deps.push(Dep {
+                node: id(b),
+                gate: if job { Gate::Completed } else { Gate::Ready },
+            });
+        }
         let kind = if jobs.contains(name.as_str()) {
             NodeKind::Job {
                 kind: JobKind::Migrate,
             }
-        } else if once {
+        } else if once(svc) {
             NodeKind::Job {
                 kind: JobKind::Seed,
             }
@@ -451,6 +470,26 @@ mod tests {
                 "worker cannot reach redis: worker is on front, redis on back"
             )]
         );
+    }
+
+    #[test]
+    fn a_service_waits_for_the_service_that_builds_its_image() {
+        let config = serde_json::json!({"services": {
+            "rails": {"build": {"context": "."}, "image": "app:dev"},
+            "vite": {"image": "app:dev"},
+            "worker": {"image": "app:dev", "depends_on": {"rails": {"condition": "service_healthy"}}},
+        }});
+        let m = model(&config, &"main".into(), "d".into()).unwrap();
+        let deps = |n: &str| {
+            let spec = m.nodes.iter().find(|(k, _)| k.name.0 == n).unwrap().1;
+            spec.deps
+                .iter()
+                .map(|d| d.node.name.0.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(deps("vite"), ["rails"]);
+        assert_eq!(deps("worker"), ["rails"]);
+        assert!(deps("rails").is_empty());
     }
 
     #[test]
