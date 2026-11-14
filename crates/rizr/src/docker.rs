@@ -996,6 +996,17 @@ fn runtime_event(line: &str, instance: &InstanceId, current: &Current) -> Option
                 .unwrap_or(-1),
         },
         "destroy" => RuntimeKind::Destroy,
+        // Podman sends a bare `health_status` after each check run, with no result: read it from the container.
+        "health_status" => RuntimeKind::Health(health(
+            String::from_utf8_lossy(
+                &std::process::Command::new("docker")
+                    .args(["inspect", "--format", "{{.State.Health.Status}}", cid])
+                    .output()
+                    .ok()?
+                    .stdout,
+            )
+            .trim(),
+        )?),
         a => RuntimeKind::Health(health(a.strip_prefix("health_status: ")?)?),
     };
     let mut cur = current.lock().ok()?;
@@ -1156,11 +1167,28 @@ fn probe(cid: Option<String>, ports: &[u16]) -> bool {
         .into_iter()
         .flat_map(|n| n.values())
         .find_map(|n| n["IPAddress"].as_str()?.parse().ok());
-    let Some(ip) = ip else { return false };
+    let pid = c["State"]["Pid"].as_u64().filter(|p| *p > 0);
     !ports.is_empty()
         && ports.iter().all(|p| {
-            TcpStream::connect_timeout(&SocketAddr::new(ip, *p), Duration::from_millis(400)).is_ok()
+            ip.is_some_and(|ip| {
+                TcpStream::connect_timeout(&SocketAddr::new(ip, *p), Duration::from_millis(400))
+                    .is_ok()
+            }) || pid.is_some_and(|pid| listening(pid, *p))
         })
+}
+
+/// Whether a socket in the network namespace of process `pid` listens on `port`. Rootless podman puts
+/// containers on a network the host cannot reach; their own /proc view still shows the listener.
+fn listening(pid: u64, port: u16) -> bool {
+    let hex = format!(":{port:04X}");
+    ["tcp", "tcp6"].iter().any(|f| {
+        std::fs::read_to_string(format!("/proc/{pid}/net/{f}")).is_ok_and(|t| {
+            t.lines().skip(1).any(|l| {
+                let w: Vec<&str> = l.split_whitespace().collect();
+                w.get(1).is_some_and(|a| a.ends_with(&hex)) && w.get(3) == Some(&"0A")
+            })
+        })
+    })
 }
 
 /// Follows the output of `cmd` until a line contains `pattern` (true) or the output ends (false). The follow

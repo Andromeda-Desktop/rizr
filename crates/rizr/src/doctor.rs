@@ -102,13 +102,23 @@ fn daemon(info: Option<&Value>, root: &Path) -> Check {
         );
     };
     let host = std::env::var("DOCKER_HOST").unwrap_or_default();
-    let version = i["ServerVersion"].as_str().unwrap_or("?");
+    let engine = crate::runtime::current();
+    let version = format!(
+        "{} {}",
+        engine.name(),
+        i["ServerVersion"].as_str().unwrap_or("?")
+    );
     if host.is_empty() || host.starts_with("unix://") {
         check(
             "docker",
             Level::Ok,
             format!(
-                "{version}, local daemon: bind mounts of {} work",
+                "{version}, local daemon{}: bind mounts of {} work",
+                if engine == crate::runtime::Engine::Podman {
+                    format!(" at {host} (docker API; RIZR_RUNTIME=docker to use docker)")
+                } else {
+                    String::new()
+                },
                 root.display()
             ),
             None,

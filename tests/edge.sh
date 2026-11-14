@@ -109,7 +109,7 @@ socket() { # this user may not use the docker socket: up names the docker group 
   chmod 000 "$WORK/denied.sock"
   DOCKER_HOST=unix://$WORK/denied.sock timeout 60 "$RIZR" up >out 2>&1; echo "rc=$?" >>out
   expect socket out 'rc=4'
-  expect socket out 'usermod -aG docker'
+  expect socket out 'usermod -aG docker|unset DOCKER_HOST'
 }
 
 up_rc() { # case: up with a time limit; the exit code goes into out
@@ -121,7 +121,7 @@ portstray() { # a plain compose copy of the same repo holds the port
   a: {image: busybox:1.36-musl, command: [httpd, -f, -p, "80"], ports: ["18097:80"]}'
   docker compose -p portstray-old up -d >/dev/null 2>&1
   up_rc
-  expect portstray out 'try: docker compose -p portstray-old down --remove-orphans'
+  expect portstray out 'docker compose -p portstray-old down --remove-orphans'
   docker compose -p portstray-old down >/dev/null 2>&1
   done_case portstray
 }
@@ -139,7 +139,7 @@ daemon() { # docker does not run
   a: {image: alpine, command: sleep 600}'
   DOCKER_HOST=unix://$WORK/none.sock up_rc
   expect daemon out 'rc=4'
-  expect daemon out 'try: systemctl start docker'
+  expect daemon out 'try: systemctl (start docker|--user enable --now podman.socket)'
 }
 
 variable() { # a required compose variable has no value: rizr names it and where to set it

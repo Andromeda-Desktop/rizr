@@ -19,6 +19,7 @@ mod ports;
 mod postgres;
 mod redis;
 mod rewind;
+mod runtime;
 mod subnet;
 mod supervisor;
 mod trust;
@@ -106,7 +107,15 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = cli.json;
     let files = cli.file.clone();
-    match run(cli) {
+    let engine = runtime::select().map_err(|m| {
+        Error::new(
+            ErrorCode::RuntimeUnavailable,
+            m,
+            "start podman's user socket, or set RIZR_RUNTIME=docker",
+            "systemctl --user enable --now podman.socket",
+        )
+    });
+    match engine.and_then(|_| run(cli)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let e = known_cause(e, &files);
@@ -659,7 +668,42 @@ fn health_output(stack: &docker::Stack, node: &str) -> String {
     c.args(["inspect", "--format", "{{json .State.Health.Log}}", &id]);
     let log: serde_json::Value = serde_json::from_str(&out(c)).unwrap_or_default();
     let last = log.as_array().and_then(|a| a.last());
-    let text = last.and_then(|l| l["Output"].as_str()).unwrap_or_default();
+    let mut text = last
+        .and_then(|l| l["Output"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    // Podman keeps no output for a check whose program is missing: run the check once more to see why it fails.
+    if text.trim().is_empty() && last.is_some_and(|l| l["ExitCode"] != 0) {
+        let mut t = std::process::Command::new("docker");
+        t.args([
+            "inspect",
+            "--format",
+            "{{json .Config.Healthcheck.Test}}",
+            &id,
+        ]);
+        let test: Vec<String> = serde_json::from_str(&out(t)).unwrap_or_default();
+        let argv: Vec<String> = match test.first().map(String::as_str) {
+            Some("CMD") => test[1..].to_vec(),
+            Some("CMD-SHELL") => ["sh", "-c"]
+                .into_iter()
+                .map(str::to_owned)
+                .chain(test[1..].iter().cloned())
+                .collect(),
+            _ => Vec::new(),
+        };
+        if !argv.is_empty() {
+            text = std::process::Command::new("timeout")
+                .args(["10", "docker", "exec", &id])
+                .args(&argv)
+                .output()
+                .map(|o| {
+                    let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+                    s.push_str(&String::from_utf8_lossy(&o.stderr));
+                    s
+                })
+                .unwrap_or_default();
+        }
+    }
     let lines: Vec<&str> = text.trim_end().lines().collect();
     let code = last.map_or(String::new(), |l| {
         format!("healthcheck exit {}\n", l["ExitCode"])
@@ -1118,6 +1162,15 @@ fn runtime_error(msg: &str) -> Error {
 
 /// The failure catalog (VISION section 9): a known cause gets its own hint and next command.
 fn known_cause(mut e: Error, files: &[PathBuf]) -> Error {
+    if e.code == ErrorCode::RuntimeUnavailable
+        && e.example == "systemctl start docker"
+        && !e.message.to_ascii_lowercase().contains("permission denied")
+        && runtime::current() == runtime::Engine::Podman
+    {
+        e.hint = "start podman's API socket; rizr drives podman through it".into();
+        e.example = "systemctl --user enable --now podman.socket".into();
+        return e;
+    }
     let m = e.message.to_ascii_lowercase();
     if m.contains("port is already allocated") || m.contains("address already in use") {
         let port = e.message.rsplit(':').find_map(|p| {
@@ -1147,6 +1200,8 @@ fn known_cause(mut e: Error, files: &[PathBuf]) -> Error {
         "manifest unknown",
         "failed to resolve reference",
         "not found: manifest",
+        "requested access to the resource is denied",
+        "name unknown",
     ]
     .iter()
     .any(|k| m.contains(k))
@@ -1200,13 +1255,19 @@ fn known_cause(mut e: Error, files: &[PathBuf]) -> Error {
         );
         e.example = format!("touch {file}");
     } else if m.contains("permission denied") && m.contains("docker") && m.contains("sock") {
-        e.hint = "docker runs, but this user may not use its socket; add the user to the docker group, then log in again".into();
-        e.example = "sudo usermod -aG docker $USER".into();
+        if runtime::current() == runtime::Engine::Podman {
+            e.hint = "this user may not use the socket DOCKER_HOST names; rootless podman serves each user their own: unset DOCKER_HOST and rizr finds it".into();
+            e.example = "unset DOCKER_HOST".into();
+        } else {
+            e.hint = "docker runs, but this user may not use its socket; add the user to the docker group, then log in again".into();
+            e.example = "sudo usermod -aG docker $USER".into();
+        }
     } else if let Some(name) = e
         .message
-        .split("is already in use by container")
+        // docker: `name "/x" is already in use by container "id"`; podman: `name "x" is already in use by id`.
+        .split("is already in use by")
         .next()
-        .filter(|_| m.contains("is already in use by container"))
+        .filter(|_| m.contains("is already in use by") && m.contains("container name"))
         .and_then(|h| h.rsplit('"').nth(1))
     {
         let name = name.trim_start_matches('/').to_owned();
