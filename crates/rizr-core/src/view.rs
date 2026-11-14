@@ -132,7 +132,22 @@ pub fn outcome(s: &State) -> Option<Result<(), Error>> {
             "docker compose config",
         )));
     }
-    if !s.trusted() || s.sync != Sync::Synced || s.loaded().is_none() || !s.pending.is_empty() {
+    if !s.trusted() || s.sync != Sync::Synced || s.loaded().is_none() {
+        return None;
+    }
+    // A failed node keeps the stack from ready in this run, so `up` ends without waiting on its siblings.
+    if s.intents.target == Target::Up
+        && s.nodes.values().any(|n| {
+            n.spec.is_some()
+                && matches!(
+                    n.machine,
+                    Machine::Service(Service::Failed(_)) | Machine::Job(Job::Failed(_))
+                )
+        })
+    {
+        return first_problem(s).map(Err);
+    }
+    if !s.pending.is_empty() {
         return None;
     }
     // `down` leaves shared project nodes as they are, so it does not wait for them.

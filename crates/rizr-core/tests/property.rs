@@ -800,6 +800,49 @@ fn service_without_probe_that_dies_at_start_fails_up() {
     );
 }
 
+/// One service fails while a sibling's start is still in flight: `up` ends with the failure at once.
+#[test]
+fn a_failed_service_ends_up_while_a_sibling_still_starts() {
+    let node = NodeGen {
+        project: false,
+        kind: 0,
+        deps: vec![],
+    };
+    let mut fake = Fake::new(vec![node.clone(), node]);
+    let (a, b) = (fake.id(0), fake.id(1));
+    let mut s = start(&mut fake).expect("start");
+    let mut crashes = 0;
+    for _ in 0..200 {
+        if outcome(&s).is_some() {
+            break;
+        }
+        let held = |e: &Effect| matches!(&e.op, Op::Start { node, .. } if *node == b);
+        if let Some(e) = s.pending.values().find(|e| !held(e)).cloned() {
+            let answer = fake.answer(&e, true);
+            s = reduce(s, Event::Done { id: e.id, answer });
+        } else if let Some(e) = fake.deliver(0) {
+            s = reduce(s, e);
+        } else if crashes < 10 {
+            crashes += 1;
+            fake.crash(0);
+        } else if let Some((&id, _)) = s.deadlines.iter().find(|(_, d)| d.node == a) {
+            s = reduce(s, Event::DeadlineHit(id));
+        }
+        s = settle(s, &mut fake).expect("settle");
+    }
+    assert!(
+        s.pending
+            .values()
+            .any(|e| matches!(&e.op, Op::Start { node, .. } if *node == b))
+    );
+    let err = outcome(&s).expect("outcome").expect_err("up must fail");
+    assert_eq!(
+        err.code,
+        rizr_core::error::ErrorCode::StartFailed,
+        "{err:?}"
+    );
+}
+
 /// A test runner service (no restart policy, nothing waits on it) runs and exits 0: `up` succeeds, as compose `up -d` does.
 #[test]
 fn service_that_exits_0_without_restart_completes_up() {
