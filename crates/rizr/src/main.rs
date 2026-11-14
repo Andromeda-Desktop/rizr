@@ -225,6 +225,10 @@ fn run(cli: Cli) -> Result<(), Error> {
             let since = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
+            if up {
+                let _ = std::fs::create_dir_all(&stack.dir);
+                let _ = std::fs::write(stack.dir.join("up-at"), since.to_string());
+            }
             let s = docker::run(&stack, i.digest, Some(action));
             for e in rewind::entries(&stack.dir) {
                 if e.at >= since && !e.ok {
@@ -537,18 +541,49 @@ fn run(cli: Cli) -> Result<(), Error> {
             let shared = node
                 .as_deref()
                 .and_then(|n| docker::shared_container(&stack, n));
-            let mut c = match &shared {
-                Some(_) => std::process::Command::new("docker"),
-                None => stack.compose(),
+            let base = || {
+                let mut c = match &shared {
+                    Some(_) => std::process::Command::new("docker"),
+                    None => stack.compose(),
+                };
+                c.args(["logs", "--tail", &tail]);
+                if shared.is_none() {
+                    c.arg("--no-color");
+                }
+                if follow {
+                    c.arg("--follow");
+                }
+                c
             };
-            c.args(["logs", "--tail", &tail]);
-            if shared.is_none() {
-                c.arg("--no-color");
+            let target = shared.clone().or(node.clone());
+            // A container that up did not recreate keeps lines from before the up, and they look live: split them.
+            let up_at = std::fs::read_to_string(stack.dir.join("up-at"))
+                .ok()
+                .and_then(|t| t.trim().parse::<u64>().ok())
+                .filter(|_| !follow);
+            if let Some(at) = up_at {
+                let run = |flag: &str| base().args([flag, &at.to_string()]).args(&target).output();
+                let old = run("--until").map_err(|e| runtime_error(&e.to_string()))?;
+                if old.status.success() {
+                    let new = run("--since").map_err(|e| runtime_error(&e.to_string()))?;
+                    let ago = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs())
+                        .saturating_sub(at);
+                    use std::io::Write;
+                    let mut out = std::io::stdout().lock();
+                    let _ = out.write_all(&old.stdout);
+                    let _ = writeln!(
+                        out,
+                        "--- the last `rizr up` started {ago} s ago: lines above are older, lines below are newer{} ---",
+                        if new.stdout.is_empty() { " (none)" } else { "" }
+                    );
+                    let _ = out.write_all(&new.stdout);
+                    return Ok(());
+                }
             }
-            if follow {
-                c.arg("--follow");
-            }
-            c.args(shared.or(node.clone()));
+            let mut c = base();
+            c.args(target);
             let st = c.status().map_err(|e| runtime_error(&e.to_string()))?;
             if st.success() {
                 return Ok(());
