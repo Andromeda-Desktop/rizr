@@ -171,6 +171,9 @@ pub fn import(
     };
     let config: Value =
         serde_json::from_slice(&out.stdout).map_err(|e| format!("compose config: {e}"))?;
+    if crate::refuse::gateway() {
+        crate::refuse::check(&config, root, &crate::manifest::allow(root))?;
+    }
     // Shared by the project's instances: `<data>/<project>-<instance>` -> `<data>/<project>.subnets.json`.
     let claims = dir.with_file_name(format!(
         "{}.subnets.json",

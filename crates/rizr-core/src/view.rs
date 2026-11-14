@@ -124,6 +124,16 @@ pub fn outcome(s: &State) -> Option<Result<(), Error>> {
             "rizr up",
         )));
     }
+    if let ModelState::Failed(tail) = &s.model
+        && tail.starts_with("rizr refuses")
+    {
+        return Some(Err(Error::new(
+            ErrorCode::Refused,
+            tail.clone(),
+            "each one can run code as root on the host or read files outside the repo: remove it, or let a human allow it for that service in rizr.toml",
+            "printf '[allow]\\n<service> = [\"<allow key>\"]\\n' >> rizr.toml",
+        )));
+    }
     if let ModelState::Failed(tail) = &s.model {
         return Some(Err(Error::new(
             ErrorCode::ImportFailed,

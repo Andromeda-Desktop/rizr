@@ -29,6 +29,18 @@ struct Manifest {
     attach: Option<String>,
     /// Instances of this project that may run at once; `up` of one more stops the least recently used.
     max_instances: Option<usize>,
+    /// Compose options rizr refuses by default, allowed per service: `[allow] proxy = ["bind"]`.
+    #[serde(default)]
+    allow: BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+/// `[allow]` of `<root>/rizr.toml`; empty when it is absent or does not parse.
+pub fn allow(root: &Path) -> BTreeMap<String, std::collections::BTreeSet<String>> {
+    std::fs::read_to_string(root.join("rizr.toml"))
+        .ok()
+        .and_then(|t| toml::from_str::<Manifest>(&t).ok())
+        .map(|m| m.allow)
+        .unwrap_or_default()
 }
 
 pub fn max_instances(root: &Path) -> Option<usize> {

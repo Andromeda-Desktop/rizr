@@ -43,6 +43,8 @@ pub enum ErrorCode {
     NoTask,
     /// The task ran and exited non-zero: failing tests, a failed build.
     TaskFailed,
+    /// A compose option gives a service the host; a human allows it in rizr.toml.
+    Refused,
 }
 
 /// Exit code classes: an agent can branch on the class without parsing the message.
@@ -68,7 +70,7 @@ impl ErrorCode {
         match self {
             ErrorCode::Usage | ErrorCode::NoTask => ErrorClass::Usage,
             ErrorCode::TaskFailed => ErrorClass::TaskFailed,
-            ErrorCode::Untrusted => ErrorClass::NeedsHuman,
+            ErrorCode::Untrusted | ErrorCode::Refused => ErrorClass::NeedsHuman,
             ErrorCode::RuntimeUnavailable | ErrorCode::ImportFailed => ErrorClass::Environment,
             ErrorCode::StartFailed
             | ErrorCode::StartTimeout

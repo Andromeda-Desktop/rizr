@@ -20,6 +20,7 @@ mod manifest;
 mod ports;
 mod postgres;
 mod redis;
+mod refuse;
 mod rewind;
 mod runtime;
 mod subnet;
@@ -1573,6 +1574,33 @@ fn known_cause(mut e: Error, files: &[PathBuf]) -> Error {
     {
         e.hint = "start podman's API socket; rizr drives podman through it".into();
         e.example = "systemctl --user enable --now podman.socket".into();
+        return e;
+    }
+    // The message lists `<service>: <detail> (allow key `<key>`)` items; the first one makes the example.
+    if e.code == ErrorCode::Refused
+        && let Some(first) = e
+            .message
+            .split_once("the host: ")
+            .and_then(|(_, r)| r.split("; ").next())
+            .map(str::to_owned)
+        && let (Some((svc, _)), Some(key)) = (
+            first.split_once(": "),
+            first
+                .split("allow key `")
+                .nth(1)
+                .and_then(|k| k.split('`').next()),
+        )
+    {
+        let toml = std::fs::read_to_string("rizr.toml").ok();
+        e.example = match toml {
+            None => {
+                format!("printf 'version = 1\\n\\n[allow]\\n{svc} = [\"{key}\"]\\n' > rizr.toml")
+            }
+            Some(t) if !t.contains("[allow]") => {
+                format!("printf '\\n[allow]\\n{svc} = [\"{key}\"]\\n' >> rizr.toml")
+            }
+            Some(_) => format!("${{EDITOR:-vi}} rizr.toml  # add \"{key}\" to {svc} under [allow]"),
+        };
         return e;
     }
     // Compose builds with BuildKit, which pulls a FROM image and does not see podman's local store.

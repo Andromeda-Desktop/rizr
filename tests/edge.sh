@@ -105,6 +105,29 @@ loginfail() { # healthy postgres, but a client logs in with another password: up
   done_case loginfail
 }
 
+refuse() { # gateway mode: options that give a service the host are refused until [allow] names them
+  stack refuse 'services:
+  a:
+    image: alpine
+    command: sleep 600
+    privileged: true
+    volumes: [/var/run/docker.sock:/var/run/docker.sock, ./src:/src]'
+  "$RIZR" up >human 2>&1
+  expect refuse human 'refuse: Up'
+  "$RIZR" down >/dev/null 2>&1
+  RIZR_GRANT=edge "$RIZR" up >out 2>&1
+  expect refuse out 'a: privileged: true'
+  expect refuse out 'a: bind mount /var/run/docker.sock'
+  ! grep -q '/src' out && echo "ok   refuse: repo bind kept" || { echo "FAIL refuse: repo bind refused"; fails=$((fails + 1)); }
+  ! docker ps -a --format '{{.Names}}' | grep -q '^refuse-a' && echo "ok   refuse: nothing started" ||
+    { echo "FAIL refuse: a container started"; fails=$((fails + 1)); }
+  printf 'version = 1\n[allow]\na = ["privileged", "bind"]\n' >rizr.toml
+  "$RIZR" trust --yes >/dev/null 2>&1
+  RIZR_GRANT=edge "$RIZR" up >allowed 2>&1
+  expect refuse allowed 'refuse: Up'
+  done_case refuse
+}
+
 namecheck() { # container_name held by a container outside the stack
   docker run -d --name rizr-edge-fixed alpine sleep 600 >/dev/null
   stack namecheck 'services:
@@ -315,7 +338,7 @@ subnet() { # two worktrees of a repo that pins a subnet and a fixed address run 
   done_case subnet
 }
 
-cases=("${@:-orphan crashloop slowjob server500 credentials loginfail namecheck downplain socket portstray image daemon variable yaml job health build disk oom tool nocmd envfile undefined redis otherfile unsynced subnet}")
+cases=("${@:-orphan crashloop slowjob server500 credentials loginfail refuse namecheck downplain socket portstray image daemon variable yaml job health build disk oom tool nocmd envfile undefined redis otherfile unsynced subnet}")
 # Each case takes a docker network; docker has about 30 address pools for every stack on the machine.
 for c in ${cases[*]}; do
   while (($(jobs -rp | wc -l) >= 4)); do wait -n; done
