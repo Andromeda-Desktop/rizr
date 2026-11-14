@@ -319,7 +319,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             } else {
                 print_status(&stack, &s, status_of(&s, failed.is_some()));
                 print_urls(&urls);
-                print_databases(&stack);
+                print_databases(&stack, &s);
                 let hints = task_hints(&stack.root);
                 if !hints.is_empty() {
                     println!("tasks: {}", hints.join("; "));
@@ -400,7 +400,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             } else {
                 print_status(&stack, &s, status);
                 print_urls(&urls);
-                print_databases(&stack);
+                print_databases(&stack, &s);
                 if let Some(e) = &failed {
                     println!("error: {}\nhint: {}\ntry: {}", e.message, e.hint, e.example);
                 }
@@ -1003,10 +1003,18 @@ fn url_checks(stack: &docker::Stack, since: u64) -> (Vec<serde_json::Value>, Opt
 }
 
 /// One line per database on a shared server: the compose service has no container, so its command is not
-/// `docker compose exec <service>`.
-fn print_databases(stack: &docker::Stack) {
+/// `docker compose exec <service>`. An absent node has no database of this instance yet.
+fn print_databases(stack: &docker::Stack, s: &State) {
+    let absent: Vec<String> = view::nodes(s)
+        .into_iter()
+        .filter(|n| n.state == "absent")
+        .map(|n| n.node.name.0)
+        .collect();
     for db in databases(stack)["shared"].as_array().into_iter().flatten() {
         if let (Some(svc), Some(psql)) = (db["service"].as_str(), db["psql"].as_str()) {
+            if absent.iter().any(|a| a == svc) {
+                continue;
+            }
             println!(
                 "  {svc} database: {psql} -c '<sql>' (its password follows the compose file at each up)"
             );

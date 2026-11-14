@@ -28,7 +28,10 @@ pub fn lines(dir: &Path) -> Vec<String> {
         .iter()
         .flat_map(|(svc, m)| {
             m.iter().map(move |(want, host)| {
-                format!("{svc}: host port {want} is taken by another program; using {host} (http://localhost:{host})")
+                let by = docker_lines(&["ps", "--filter", &format!("publish={want}"), "--format", "{{.Names}}"])
+                    .first()
+                    .map_or("another program".into(), |n| format!("container {n}"));
+                format!("{svc}: host port {want} is taken by {by}; using {host} (http://localhost:{host})")
             })
         })
         .collect()
@@ -232,14 +235,43 @@ pub fn remove_orphans(own: &str, services: &[String]) -> Vec<String> {
     names
 }
 
-/// One line per stray project, with the command that stops it; volumes stay.
+/// One line per stray project, with the command that stops it; volumes stay. Running containers of rizr's own
+/// project that rizr did not start (a plain `docker compose up`) get one line too: their nodes show as absent.
 pub fn stray_lines(root: &Path, own: &str) -> Vec<String> {
+    let unadopted: Vec<String> = docker_lines(&[
+        "ps",
+        "--filter",
+        &format!("label=com.docker.compose.project={own}"),
+        "--format",
+        "{{.Names}} {{.Label \"rizr.project\"}}",
+    ])
+    .into_iter()
+    .filter(|l| !l.contains(' ') || l.ends_with(' '))
+    .map(|l| l.trim().to_owned())
+    .collect();
+    let own_line = (!unadopted.is_empty()).then(|| {
+        format!("running outside rizr in compose project `{own}`: {}; rizr did not start them, so their nodes show as absent; `rizr up` recreates them under rizr", unadopted.join(", "))
+    });
     strays(root, own)
         .into_iter()
         .map(|(p, n)| {
             format!("this repo also runs outside rizr as compose project `{p}` ({n} containers); it can hold ports and confuse checks; stop it, volumes stay: docker compose -p {p} down --remove-orphans")
         })
+        .chain(own_line)
         .collect()
+}
+
+fn docker_lines(args: &[&str]) -> Vec<String> {
+    Command::new("docker")
+        .args(args)
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Writes `ports-<svc>.yml` when a published port of `svc` is remapped, and returns it for `-f`.
