@@ -312,7 +312,19 @@ fn run(cli: Cli) -> Result<(), Error> {
             } else {
                 Vec::new()
             };
-            let failed = failed.or(login);
+            let mut failed = failed.or(login);
+            // A server error and an empty database: the log tail is often a stack trace that hides the cause.
+            if let (Some(e), Some((_, cmd))) = (&mut failed, notes.first())
+                && e.example.starts_with("rizr logs ")
+            {
+                let node = e.message.split_whitespace().next().unwrap_or_default();
+                e.hint = format!(
+                    "{node} answers with a server error and its database has no tables: run the app's migration once, then `rizr up` again"
+                );
+                e.example = cmd.clone().unwrap_or_else(|| {
+                    "rizr exec <service> <the migrate command from the README>".into()
+                });
+            }
             if json && up {
                 let mut r = serde_json::to_value(view::receipt(&s)).unwrap_or_default();
                 r["urls"] = urls.into();
