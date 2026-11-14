@@ -84,6 +84,9 @@ enum Command {
     },
     /// Build a package with the command the repo uses, as `test` does.
     Build { package: Option<String> },
+    /// Run a package's database migration with the command the repo uses (alembic, manage.py, prisma, ...), as
+    /// `test` does: inside the service that runs the package, after `up`.
+    Migrate { package: Option<String> },
     /// Wait up to 100 s more for the last `exec` (or the named job), then print its last output and exit code.
     Wait { job: Option<String> },
     /// Take a rewind point of each shared database now (or of the named one). rizr also takes one before each
@@ -330,6 +333,12 @@ fn run(cli: Cli) -> Result<(), Error> {
         Command::Test { package } => task::run(
             &stack,
             rizr_core::code::TaskName::Test,
+            package.as_deref(),
+            json,
+        ),
+        Command::Migrate { package } => task::run(
+            &stack,
+            rizr_core::code::TaskName::Migrate,
             package.as_deref(),
             json,
         ),
@@ -657,13 +666,18 @@ fn empty_databases(stack: &docker::Stack) -> Vec<(String, Option<String>)> {
     if empty.is_empty() {
         return Vec::new();
     }
-    let cmd = docs::migrate(&stack.root);
+    let cmd = docs::migrate(&stack.root).or_else(|| {
+        detect::detect(&detect::read(&stack.root))
+            .iter()
+            .any(|p| p.task(rizr_core::code::TaskName::Migrate).is_some())
+            .then(|| "rizr migrate".to_owned())
+    });
     empty
         .into_iter()
         .map(|(svc, db)| {
             let line = match &cmd {
                 Some(c) => format!(
-                    "database {db} ({svc}) has no tables: the app's migration has not run; the repo's docs give it, run it before anything that reads the database: `{c}`"
+                    "database {db} ({svc}) has no tables: the app's migration has not run; run it before anything that reads the database: `{c}`"
                 ),
                 None => format!(
                     "database {db} ({svc}) has no tables: the app's migration has not run; run it (see the repo's README) before anything that reads the database, with `rizr exec <service> <command>`"
