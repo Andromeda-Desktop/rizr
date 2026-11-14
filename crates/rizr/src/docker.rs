@@ -671,6 +671,7 @@ impl Provider<'_> {
                 let db = self.db(&node);
                 let (project, tx) = (self.stack.project.0.clone(), self.tx.clone());
                 let instance = self.stack.instance.0.clone();
+                let dir = self.stack.dir.clone();
                 let names = (
                     self.stack.main_compose_name.clone(),
                     self.stack.compose_name(),
@@ -706,7 +707,12 @@ impl Provider<'_> {
                             .or_else(|| db.shared.old_data.clone());
                         let _ = old.output();
                         if db.attach(&project, &node.name.0)? && instance != "main" {
-                            db.seed(&project, &node.name.0, &names.0, &names.1)?;
+                            let mark = dir.join(format!("seed-{}", node.name.0));
+                            match db.seed(&project, &node.name.0, &names.0, &names.1)? {
+                                Some(source) => std::fs::write(&mark, source),
+                                None => std::fs::remove_file(&mark).or(Ok(())),
+                            }
+                            .map_err(|e| e.to_string())?;
                         }
                         match mount {
                             Some(m) => db.import(&project, &instance, &m).map(|_| ()),

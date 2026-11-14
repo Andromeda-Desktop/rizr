@@ -340,18 +340,15 @@ impl Db {
         Ok(created)
     }
 
-    /// Copies the old compose data of the service into its database once: roles first, then the database. It
-    /// runs only while the database has no tables and no import mark. The old data is read, never changed.
-    /// On a failure it drops the database, so the next start tries again. Returns true when it copied data.
     /// Fill a new instance database from main's data: main's database on this server, else main's running
-    /// compose container, else main's compose volume. With none of them it stays empty.
+    /// compose container, else main's compose volume. With none of them it stays empty. Returns the source.
     pub fn seed(
         &self,
         project: &str,
         svc: &str,
         main_compose: &str,
         compose: &str,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         let server = self.shared.server.container(project);
         let user = self.shared.server.user();
         let main = &self.shared.db;
@@ -375,10 +372,11 @@ impl Db {
                 "--maintenance-db=template1",
                 &self.database,
             ]))?;
-            return clone(&server, user, main, &self.database, None);
+            clone(&server, user, main, &self.database, None)?;
+            return Ok(Some(format!("main's database {main} on this server")));
         }
         let running = Command::new("docker")
-            .args(["ps", "-q"])
+            .args(["ps", "--format={{.Names}}"])
             .arg(format!(
                 "--filter=label=com.docker.compose.project={main_compose}"
             ))
@@ -426,7 +424,9 @@ impl Db {
                     crate::compose::tail(&load.stderr)
                 ));
             }
-            return Ok(());
+            return Ok(Some(format!(
+                "the database in main's running container {id}"
+            )));
         }
         // A named volume of this instance is `<compose>_<name>`; main's is `<main_compose>_<name>`.
         let main_volume = self.shared.old_data.as_ref().and_then(|(source, target)| {
@@ -434,11 +434,16 @@ impl Db {
             Some((format!("{main_compose}_{name}"), target.clone()))
         });
         match main_volume {
-            Some(old) => self.import(project, svc, &old).map(|_| ()),
-            None => Ok(()),
+            Some(old) => Ok(self
+                .import(project, svc, &old)?
+                .then(|| format!("main's volume {}", old.0))),
+            None => Ok(None),
         }
     }
 
+    /// Copies the old compose data of the service into its database once: roles first, then the database. It
+    /// runs only while the database has no tables and no import mark. The old data is read, never changed.
+    /// On a failure it drops the database, so the next start tries again. Returns true when it copied data.
     pub fn import(
         &self,
         project: &str,

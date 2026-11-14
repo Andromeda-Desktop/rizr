@@ -610,6 +610,7 @@ fn databases(stack: &docker::Stack) -> serde_json::Value {
                 "url": db.url(&format!("{svc}:5432")),
                 "host_url": port.map(|p| db.url(&format!("127.0.0.1:{p}"))),
                 "psql": format!("docker exec -i {container} psql -U {} -d {}", db.user, db.database),
+                "copied_from": std::fs::read_to_string(stack.dir.join(format!("seed-{svc}"))).ok(),
             })
         })
         .collect();
@@ -1009,6 +1010,9 @@ fn print_databases(stack: &docker::Stack) {
             println!(
                 "  {svc} database: {psql} -c '<sql>' (its password follows the compose file at each up)"
             );
+            if let Some(src) = db["copied_from"].as_str() {
+                println!("    it holds a copy of {src}, made when rizr created it");
+            }
         }
     }
 }
