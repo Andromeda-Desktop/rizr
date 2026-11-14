@@ -66,7 +66,8 @@ enum Command {
     /// within 100 s; a longer command keeps running.
     Exec {
         node: String,
-        #[arg(last = true, required = true)]
+        /// The command; `--` before it is optional.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
     },
     /// Wait up to 100 s more for the last `exec` (or the named job), then print its last output and exit code.
