@@ -192,10 +192,7 @@ impl std::fmt::Display for Place {
     }
 }
 
-fn place(stack: &docker::Stack, pkg: &Package) -> Place {
-    let Ok(dir) = stack.root.join(&pkg.dir).canonicalize() else {
-        return Place::Host;
-    };
+fn place(stack: &docker::Stack, pkg: &Package, packages: &[Package]) -> Place {
     let Ok(out) = stack
         .compose()
         .args(["config", "--format", "json"])
@@ -205,6 +202,14 @@ fn place(stack: &docker::Stack, pkg: &Package) -> Place {
         return Place::Host;
     };
     let config: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    place_in(&config, &stack.root, pkg, packages)
+}
+
+/// `config` is the output of `docker compose config --format json`.
+fn place_in(config: &Value, root: &Path, pkg: &Package, packages: &[Package]) -> Place {
+    let Ok(dir) = root.join(&pkg.dir).canonicalize() else {
+        return Place::Host;
+    };
     let same = |p: &str| Path::new(p).canonicalize().is_ok_and(|p| p == dir);
     for (name, svc) in config["services"].as_object().into_iter().flatten() {
         let Some(ctx) = svc["build"]["context"].as_str() else {
@@ -214,8 +219,18 @@ fn place(stack: &docker::Stack, pkg: &Package) -> Place {
             Path::new(ctx).join(svc["build"]["dockerfile"].as_str().unwrap_or("Dockerfile"));
         // The package's path inside the build context. A context above the package counts when the package
         // holds the service's Dockerfile (`context: .`, `dockerfile: backend/Dockerfile`).
+        // A Dockerfile in another package's directory makes the service that package's, not the context's.
+        let elsewhere = dockerfile
+            .parent()
+            .and_then(|p| p.canonicalize().ok())
+            .is_some_and(|d| {
+                d != dir
+                    && packages
+                        .iter()
+                        .any(|p| root.join(&p.dir).canonicalize().is_ok_and(|x| x == d))
+            });
         let inner = if same(ctx) {
-            Some(PathBuf::new())
+            (!elsewhere).then(PathBuf::new)
         } else {
             dockerfile
                 .parent()
@@ -416,7 +431,7 @@ pub fn run(
         return Ok(());
     };
     let (root, data) = (stack.root.as_path(), stack.dir.as_path());
-    let place = place(stack, pkg);
+    let place = place(stack, pkg, &packages);
     // Steps that run first, in the same script: (verb, command, reason).
     let mut before = Vec::new();
     let mut toolchain = None;
@@ -667,8 +682,43 @@ pub fn run(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "a test panics on a broken precondition")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_task_runs_in_the_service_whose_dockerfile_is_in_its_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("backend")).unwrap();
+        std::fs::write(
+            root.join("backend/Dockerfile"),
+            "FROM python\nWORKDIR /app/backend/\n",
+        )
+        .unwrap();
+        let pkg = |d: &str| Package {
+            dir: d.into(),
+            kind: Kind::Go,
+            tasks: std::collections::BTreeMap::new(),
+        };
+        let packages = [pkg("."), pkg("backend")];
+        let config = serde_json::json!({"services": {"backend": {"build": {
+            "context": root, "dockerfile": "backend/Dockerfile"}}}});
+        let at = |p: &Package| match place_in(&config, root, p, &packages) {
+            Place::Host => None,
+            Place::Service(svc, mounts) => Some((svc, mounts)),
+        };
+        let mount = format!(
+            "{}:/app/backend/",
+            root.join("backend").canonicalize().unwrap().display()
+        );
+        assert_eq!(at(&packages[1]), Some(("backend".to_owned(), vec![mount])));
+        assert_eq!(
+            at(&packages[0]),
+            None,
+            "the root package does not run in the backend's image"
+        );
+    }
 
     #[test]
     fn counts_and_failures_of_each_runner() {
