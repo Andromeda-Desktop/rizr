@@ -286,6 +286,51 @@ fn up(stack: &docker::Stack) -> Result<(), Error> {
     ))
 }
 
+/// The tools `mise exec` provides when the repo pins versions and mise is installed; mise installs a missing one.
+/// A mise config file is a trust input: after rizr's trust, mise is told to trust it too.
+fn mise(root: &Path, dir: &Path) -> Option<Vec<String>> {
+    let on_path = std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("mise").is_file()));
+    if !on_path {
+        return None;
+    }
+    let find = |name: &str| {
+        [dir, root]
+            .into_iter()
+            .map(|d| d.join(name))
+            .find(|p| p.is_file())
+    };
+    let configs: Vec<PathBuf> = [".mise.toml", "mise.toml"]
+        .iter()
+        .filter_map(|n| find(n))
+        .collect();
+    for c in &configs {
+        let _ = Command::new("mise")
+            .args(["trust", "--quiet"])
+            .arg(c)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    if !configs.is_empty() || find(".tool-versions").is_some() {
+        return Some(Vec::new());
+    }
+    let tools: Vec<String> = [
+        (".nvmrc", "node"),
+        (".node-version", "node"),
+        (".python-version", "python"),
+    ]
+    .iter()
+    .filter_map(|(file, tool)| {
+        let v = std::fs::read_to_string(find(file)?).ok()?;
+        let v = v.trim().trim_start_matches('v');
+        (!v.is_empty() && !v.contains(|c: char| c.is_whitespace() || c == '/'))
+            .then(|| format!("{tool}@{v}"))
+    })
+    .collect();
+    (!tools.is_empty()).then_some(tools)
+}
+
 /// The command that installs a package's missing dependencies before a host task, and why it runs.
 fn install(root: &Path, pkg: &Package) -> Option<(&'static str, &'static str)> {
     let dir = root.join(&pkg.dir);
@@ -386,8 +431,25 @@ pub fn run(
             let err = file.try_clone().map_err(io)?;
             let mut c = match &place {
                 Place::Host => {
-                    let mut c = Command::new("sh");
-                    c.current_dir(root.join(&pkg.dir));
+                    let dir = root.join(&pkg.dir);
+                    let mut c = match mise(root, &dir) {
+                        Some(tools) => {
+                            eprintln!(
+                                "rizr: toolchain: {}",
+                                ["mise exec"]
+                                    .iter()
+                                    .copied()
+                                    .chain(tools.iter().map(String::as_str))
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            );
+                            let mut c = Command::new("mise");
+                            c.arg("exec").args(&tools).args(["--", "sh"]);
+                            c
+                        }
+                        None => Command::new("sh"),
+                    };
+                    c.current_dir(dir);
                     c
                 }
                 Place::Service(svc, mount) => {
