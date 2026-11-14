@@ -22,7 +22,7 @@ pub enum Action {
     Down,
     /// Clear the failure of one node and start it again.
     Restart { node: NodeName },
-    /// Trust the repo files that rizr will read and run. After you edit them: `rizr trust --yes && rizr up`.
+    /// Trust the repo files that rizr will read and run. Edits at the trusted commit need no new trust; after a new commit: `rizr trust --yes`.
     Trust {
         /// Without a terminal: trust the changed files of a repo that a person trusted before.
         #[cfg_attr(feature = "clap", arg(long))]
