@@ -425,7 +425,9 @@ fn run(cli: Cli) -> Result<(), Error> {
             .collect();
             println!(
                 "{}",
-                json!({"status": "no_stack", "next": next, "tasks": task_hints(&stack.root), "packages": packages, "root": stack.root, "compose_files": [], "verbs": verbs()})
+                ordered(
+                    json!({"status": "no_stack", "next": next, "tasks": task_hints(&stack.root), "packages": packages, "root": stack.root, "compose_files": [], "verbs": verbs()})
+                )
             );
             Ok(())
         }
@@ -495,7 +497,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             // One line, answer first: an agent's `| head -c 3000` keeps the status, the cause, the next commands and the tasks.
             println!(
                 "{}",
-                json!({
+                ordered(json!({
                     "status": status, "failed": failed, "error": url_error, "next": next,
                     "notes": empty.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
                     "tasks": task_hints(&stack.root), "urls": urls, "findings": findings(&s),
@@ -507,7 +509,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                     "other_compose_files": compose::others(&stack.root, &stack.files),
                     "rewind": rewind::entries(&stack.dir).iter().rev().take(10).collect::<Vec<_>>(),
                     "generation": s.intents.generation.0, "verbs": verbs(),
-                })
+                }))
             );
             Ok(())
         }
@@ -1043,6 +1045,26 @@ fn print_status(stack: &docker::Stack, s: &State, status: InstanceStatus) {
             unverified.join(", ")
         );
     }
+}
+
+/// The keys agents need first, in this order, then the rest: serde_json sorts object keys, and agents cut the
+/// line with `head -c`.
+fn ordered(v: serde_json::Value) -> String {
+    const FIRST: [&str; 8] = [
+        "status", "failed", "error", "next", "notes", "tasks", "urls", "findings",
+    ];
+    let Some(m) = v.as_object() else {
+        return v.to_string();
+    };
+    let keys = FIRST
+        .iter()
+        .copied()
+        .filter(|k| m.contains_key(*k))
+        .chain(m.keys().map(String::as_str).filter(|k| !FIRST.contains(k)));
+    let fields: Vec<String> = keys
+        .map(|k| format!("{}:{}", serde_json::Value::from(k), m[k]))
+        .collect();
+    format!("{{{}}}", fields.join(","))
 }
 
 /// The commands that run each package's tests and migration, as `rizr test`/`rizr migrate` lines with the
