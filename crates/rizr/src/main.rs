@@ -1006,7 +1006,9 @@ fn url_checks(stack: &docker::Stack, since: u64) -> (Vec<serde_json::Value>, Opt
 fn print_databases(stack: &docker::Stack) {
     for db in databases(stack)["shared"].as_array().into_iter().flatten() {
         if let (Some(svc), Some(psql)) = (db["service"].as_str(), db["psql"].as_str()) {
-            println!("  {svc} database: {psql} -c '<sql>'");
+            println!(
+                "  {svc} database: {psql} -c '<sql>' (its password follows the compose file at each up)"
+            );
         }
     }
 }
