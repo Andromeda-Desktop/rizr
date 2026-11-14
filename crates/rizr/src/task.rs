@@ -292,47 +292,66 @@ fn workdir(dockerfile: &str) -> Option<String> {
         .next_back()
 }
 
-/// Brings the stack up (`rizr up --wait ready`) for a task that runs in one of its services.
-fn up(stack: &docker::Stack) -> Result<(), Error> {
+/// Brings the stack up (`rizr up --wait ready`) for a task that runs in one of its services. A stack whose
+/// services run but whose URL check fails is enough: the check often fails until this task (a migration) runs.
+fn up(stack: &docker::Stack, name: TaskName) -> Result<(), Error> {
     let exe = std::env::current_exe().unwrap_or_else(|_| "rizr".into());
     let mut c = Command::new(exe);
     for f in &stack.files {
         c.arg("-f").arg(f);
     }
     let out = c
-        .args(["up", "--wait", "ready"])
+        .args(["up", "--wait", "ready", "--json"])
         .stdin(Stdio::null())
         .output();
-    // A stack that is up adds nothing to the task's result; up's report shows only when it fails.
-    let status = out.map(|o| {
-        if !o.status.success() {
-            eprint!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            );
+    let failed = || {
+        Error::new(
+            ErrorCode::DependencyFailed,
+            "the stack did not come up, so the task cannot run in its service",
+            "the task runs inside a compose service and needs the stack; fix the error above",
+            "rizr up",
+        )
+    };
+    let Ok(o) = out else {
+        return Err(failed());
+    };
+    if o.status.success() {
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_default();
+    let error = |k: &str| v["error"][k].as_str().unwrap_or_default().to_owned();
+    match v["status"].as_str() {
+        Some("up") => {
+            eprintln!("note: {}; the task runs anyway", error("message"));
+            return Ok(());
         }
-        o.status
-    });
-    match status.ok().and_then(|s| s.code()) {
-        Some(0) => return Ok(()),
-        // Exit 5 (not ready): up keeps going in the background and the next call waits for it.
-        Some(5) => {
+        // up keeps going in the background and the next call waits for it.
+        Some("starting") => {
             return Err(Error::new(
                 ErrorCode::StillRunning,
                 "the stack is still starting, so the task has not run yet",
                 "the task runs inside a compose service; the same command again waits up to 100 s more",
-                "rizr test",
+                format!("rizr {}", format!("{name:?}").to_lowercase()),
             ));
         }
         _ => {}
     }
-    Err(Error::new(
-        ErrorCode::DependencyFailed,
-        "the stack did not come up, so the task cannot run in its service",
-        "the task runs inside a compose service and needs the stack; fix the error above",
-        "rizr up",
-    ))
+    let msg = if v["error"].is_object() {
+        format!(
+            "error: {}\nhint: {}\ntry: {}\n",
+            error("message"),
+            error("hint"),
+            error("example")
+        )
+    } else {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+    };
+    eprint!("{msg}");
+    Err(failed())
 }
 
 /// The program a shell command line starts, after `VAR=value` assignments; None for a path or a shell builtin.
@@ -456,7 +475,7 @@ pub fn run(
             }
         }
         Place::Service(..) => {
-            up(stack)?;
+            up(stack, name)?;
             if name == TaskName::Test
                 && let Some(m) = pkg.task(TaskName::Migrate)
                 && !postgres::empty(data, &stack.project.0).is_empty()
