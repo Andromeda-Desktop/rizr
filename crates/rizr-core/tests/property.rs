@@ -1186,3 +1186,36 @@ fn a_crash_loop_keeps_the_first_start_deadline() {
         s.nodes[&node].machine
     );
 }
+
+/// The import names the shared databases; a snapshot read before it shows them absent and the stack Down.
+#[test]
+fn observe_waits_for_the_import() {
+    let mut s = State::new(ProjectId::from("p"), InstanceId::from("main"), Gen(1));
+    s = reduce(
+        s,
+        Event::Hashed {
+            inputs: Digest::from("in"),
+            trusted: true,
+        },
+    );
+    for _ in 0..8 {
+        for e in plan(&s) {
+            s = reduce(s, Event::Sent(e));
+        }
+        assert!(
+            !s.pending.values().any(|e| e.op == Op::Observe),
+            "observe sent while the import is pending"
+        );
+        let Some(e) = s.pending.values().find(|e| e.op != Op::Import).cloned() else {
+            break;
+        };
+        s = reduce(
+            s,
+            Event::Done {
+                id: e.id,
+                answer: Answer::Ok,
+            },
+        );
+    }
+    assert!(s.pending.values().any(|e| e.op == Op::Import));
+}
