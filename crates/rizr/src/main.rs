@@ -97,6 +97,9 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    // `rizr status | head` must end quietly, as other unix tools do, not panic on the closed pipe.
+    // SAFETY: runs before any thread starts; SIG_DFL is a valid handler.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let cli = Cli::parse();
     let json = cli.json;
     let files = cli.file.clone();

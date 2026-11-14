@@ -475,6 +475,7 @@ name = "rizr"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "libc",
  "rizr-core",
  "schemars",
  "serde",
