@@ -207,7 +207,28 @@ fn place(stack: &docker::Stack, pkg: &Package) -> Place {
     let config: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
     let same = |p: &str| Path::new(p).canonicalize().is_ok_and(|p| p == dir);
     for (name, svc) in config["services"].as_object().into_iter().flatten() {
-        let Some(ctx) = svc["build"]["context"].as_str().filter(|c| same(c)) else {
+        let Some(ctx) = svc["build"]["context"].as_str() else {
+            continue;
+        };
+        let dockerfile =
+            Path::new(ctx).join(svc["build"]["dockerfile"].as_str().unwrap_or("Dockerfile"));
+        // The package's path inside the build context. A context above the package counts when the package
+        // holds the service's Dockerfile (`context: .`, `dockerfile: backend/Dockerfile`).
+        let inner = if same(ctx) {
+            Some(PathBuf::new())
+        } else {
+            dockerfile
+                .parent()
+                .filter(|p| p.to_str().is_some_and(same))
+                .and_then(|_| {
+                    Some(
+                        dir.strip_prefix(Path::new(ctx).canonicalize().ok()?)
+                            .ok()?
+                            .to_owned(),
+                    )
+                })
+        };
+        let Some(inner) = inner else {
             continue;
         };
         let mounted = svc["volumes"]
@@ -227,12 +248,11 @@ fn place(stack: &docker::Stack, pkg: &Package) -> Place {
                     && w["action"].as_str().is_some_and(|a| a.starts_with("sync"))
             })
             .and_then(|w| w["target"].as_str().map(str::to_owned));
-        let dockerfile =
-            Path::new(ctx).join(svc["build"]["dockerfile"].as_str().unwrap_or("Dockerfile"));
         let target = synced.or_else(|| {
             std::fs::read_to_string(dockerfile)
                 .ok()
                 .and_then(|t| workdir(&t))
+                .filter(|w| Path::new(w).ends_with(&inner))
         });
         if let Some(t) = target {
             let mut volumes = vec![format!("{}:{t}", dir.display())];
@@ -264,12 +284,21 @@ fn up(stack: &docker::Stack) -> Result<(), Error> {
     for f in &stack.files {
         c.arg("-f").arg(f);
     }
-    // up's report goes to stderr: stdout holds only the task's result.
-    let status = c
+    let out = c
         .args(["up", "--wait", "ready"])
         .stdin(Stdio::null())
-        .stdout(std::io::stderr())
-        .status();
+        .output();
+    // A stack that is up adds nothing to the task's result; up's report shows only when it fails.
+    let status = out.map(|o| {
+        if !o.status.success() {
+            eprint!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+        }
+        o.status
+    });
     match status.ok().and_then(|s| s.code()) {
         Some(0) => return Ok(()),
         // Exit 5 (not ready): up keeps going in the background and the next call waits for it.
