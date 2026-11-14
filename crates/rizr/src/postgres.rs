@@ -283,15 +283,20 @@ impl Db {
     pub fn attach(&self, project: &str, alias: &str) -> Result<bool, String> {
         let server = self.shared.server.container(project);
         for (key, net) in &self.shared.networks {
-            if !ok(Command::new("docker").args(["network", "inspect", net])) {
-                run(Command::new("docker")
+            let exists = || ok(Command::new("docker").args(["network", "inspect", net]));
+            if !exists() {
+                // A compose up of another node can create the network between the inspect and the create.
+                let created = run(Command::new("docker")
                     .args(["network", "create"])
                     .arg(format!(
                         "--label=com.docker.compose.project={}",
                         self.shared.project
                     ))
                     .arg(format!("--label=com.docker.compose.network={key}"))
-                    .arg(net))?;
+                    .arg(net));
+                if created.is_err() && !exists() {
+                    created?;
+                }
             }
         }
         let user = self.shared.server.user();
