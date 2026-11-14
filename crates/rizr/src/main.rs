@@ -19,6 +19,7 @@ mod ports;
 mod postgres;
 mod redis;
 mod rewind;
+mod subnet;
 mod supervisor;
 mod trust;
 

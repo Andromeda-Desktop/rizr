@@ -119,6 +119,16 @@ pub fn default_name(root: &Path, chosen: &[PathBuf]) -> String {
 /// The command prefix every compose call of this stack uses.
 /// `dir` is rizr's data directory for the instance: the dev env files live there.
 pub fn command(root: &Path, chosen: &[PathBuf], project: &str, dir: &Path) -> Command {
+    let mut c = files_only(root, chosen, project, dir);
+    let nets = crate::subnet::file(dir);
+    if nets.is_file() {
+        c.arg("-f").arg(nets);
+    }
+    c
+}
+
+/// As `command`, without the instance's network override: the compose files' own config.
+fn files_only(root: &Path, chosen: &[PathBuf], project: &str, dir: &Path) -> Command {
     let mut c = Command::new("docker");
     c.arg("compose")
         .arg("-p")
@@ -148,7 +158,7 @@ pub fn import(
     crate::devenv::prepare(root, dir, &compose_files)?;
     // Compose names one unset required variable per run; each round fills one.
     let out = loop {
-        let out = command(root, chosen, project, dir)
+        let out = files_only(root, chosen, project, dir)
             .args(["config", "--format", "json"])
             .output()
             .map_err(|e| format!("cannot run docker compose: {e}"))?;
@@ -161,6 +171,15 @@ pub fn import(
     };
     let config: Value =
         serde_json::from_slice(&out.stdout).map_err(|e| format!("compose config: {e}"))?;
+    // Shared by the project's instances: `<data>/<project>-<instance>` -> `<data>/<project>.subnets.json`.
+    let claims = dir.with_file_name(format!(
+        "{}.subnets.json",
+        dir.file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(&format!("-{}", instance.0)))
+            .unwrap_or(project)
+    ));
+    crate::subnet::prepare(&config, dir, &claims, &instance.0, project)?;
     let side = config["services"]
         .as_object()
         .into_iter()

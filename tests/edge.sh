@@ -270,7 +270,25 @@ unsynced() { # exec misses a path the image lacks and develop.watch syncs: the t
   done_case unsynced
 }
 
-cases=("${@:-orphan crashloop slowjob server500 credentials namecheck downplain socket portstray image daemon variable yaml job health build disk oom tool nocmd envfile undefined redis otherfile unsynced}")
+subnet() { # two worktrees of a repo that pins a subnet and a fixed address run up at once, each on its own subnet
+  mkdir -p "$WORK/subnet" && cd "$WORK/subnet"
+  printf 'services:\n  a: {image: alpine, command: sleep 600, networks: {back: {ipv4_address: 10.213.7.10}}}\nnetworks:\n  back: {ipam: {config: [{subnet: 10.213.7.0/24, gateway: 10.213.7.1}]}}\n' >compose.yaml
+  git init -q && git add -A && git -c user.email=e@x -c user.name=e commit -qm init && git worktree add -q ../subnet-wt
+  for d in . ../subnet-wt; do (cd "$d" && script -qec "$RIZR trust" /dev/null <<<y >/dev/null); done
+  (timeout 120 "$RIZR" up >main.out 2>&1; echo "rc=$?" >>main.out) &
+  (cd ../subnet-wt && timeout 120 "$RIZR" up >../subnet/wt.out 2>&1; echo "rc=$?" >>../subnet/wt.out) &
+  wait
+  expect subnet main.out 'rc=0'
+  expect subnet wt.out 'rc=0'
+  docker ps -q --filter label=com.docker.compose.service=a --filter name=subnet |
+    xargs -r docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' >ips
+  expect subnet ips '^10\.213\.7\.10 $'
+  expect subnet ips '^10\.213\.8\.10 $'
+  (cd ../subnet-wt && "$RIZR" down >/dev/null 2>&1)
+  done_case subnet
+}
+
+cases=("${@:-orphan crashloop slowjob server500 credentials namecheck downplain socket portstray image daemon variable yaml job health build disk oom tool nocmd envfile undefined redis otherfile unsynced subnet}")
 # Each case takes a docker network; docker has about 30 address pools for every stack on the machine.
 for c in ${cases[*]}; do
   while (($(jobs -rp | wc -l) >= 4)); do wait -n; done
