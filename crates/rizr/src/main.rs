@@ -572,13 +572,20 @@ fn run(cli: Cli) -> Result<(), Error> {
                         .saturating_sub(at);
                     use std::io::Write;
                     let mut out = std::io::stdout().lock();
+                    // `docker logs` gives the container's stderr on stderr: postgres logs only there.
                     let _ = out.write_all(&old.stdout);
+                    let _ = out.write_all(&old.stderr);
                     let _ = writeln!(
                         out,
                         "--- the last `rizr up` started {ago} s ago: lines above are older, lines below are newer{} ---",
-                        if new.stdout.is_empty() { " (none)" } else { "" }
+                        if new.stdout.is_empty() && new.stderr.is_empty() {
+                            " (none)"
+                        } else {
+                            ""
+                        }
                     );
                     let _ = out.write_all(&new.stdout);
+                    let _ = out.write_all(&new.stderr);
                     return Ok(());
                 }
             }
