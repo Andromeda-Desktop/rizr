@@ -364,7 +364,18 @@ pub fn model(config: &Value, instance: &InstanceId, inputs: Digest) -> Result<Mo
         } else {
             NodeKind::Service { probe: probe(svc) }
         };
-        let spec = Digest(hex(&Sha256::digest(svc.to_string())));
+        let context = svc["build"]["context"].as_str().map(Path::new);
+        // A service that mounts its build context runs the edited files already.
+        let mounted = svc["volumes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|v| v["type"] == "bind" && v["source"].as_str().map(Path::new) == context);
+        let mut spec = svc.to_string().into_bytes();
+        if let Some(ctx) = context.filter(|_| !mounted) {
+            spec.extend(sources(ctx));
+        }
+        let spec = Digest(hex(&Sha256::digest(spec)));
         nodes.insert(
             id(name),
             rizr_core::model::NodeSpec {
@@ -389,6 +400,32 @@ pub fn model(config: &Value, instance: &InstanceId, inputs: Digest) -> Result<Mo
 
 /// Readiness signal: healthcheck event, else a redis server's ready line, else a tcp probe on each container
 /// port, else ready at start.
+/// The sources of a build context as git sees them: the committed tree, the uncommitted diff and the untracked
+/// files. An edit changes it, so the service's spec changes and `up` builds the image again. Empty outside git.
+fn sources(ctx: &Path) -> Vec<u8> {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .current_dir(ctx)
+            .args(args)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|o| o.stdout)
+            .unwrap_or_default()
+    };
+    let mut s = git(&["rev-parse", "HEAD:./"]);
+    s.extend(git(&["diff", "HEAD", "--", "."]));
+    let untracked = git(&["ls-files", "-o", "--exclude-standard", "-z", "--", "."]);
+    for f in String::from_utf8_lossy(&untracked)
+        .split('\0')
+        .filter(|f| !f.is_empty())
+    {
+        if let Ok(m) = ctx.join(f).metadata() {
+            s.extend(format!("{f} {} {:?}\n", m.len(), m.modified().ok()).bytes());
+        }
+    }
+    s
+}
+
 fn probe(svc: &Value) -> Probe {
     let hc = &svc["healthcheck"];
     if hc.is_object() && hc["disable"] != true && hc["test"] != serde_json::json!(["NONE"]) {
@@ -506,6 +543,53 @@ mod tests {
                 "worker cannot reach redis: worker is on front, redis on back"
             )]
         );
+    }
+
+    #[test]
+    fn an_edit_in_a_build_context_changes_the_spec_of_its_service_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .current_dir(dir.path())
+                    .args([
+                        "-c",
+                        "user.name=t",
+                        "-c",
+                        "user.email=t@t",
+                        "-c",
+                        "commit.gpgsign=false"
+                    ])
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        std::fs::create_dir(dir.path().join("worker")).unwrap();
+        std::fs::write(dir.path().join("worker/main.c"), "int main;").unwrap();
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        let config = serde_json::json!({"services": {
+            "worker": {"build": {"context": dir.path().join("worker")}},
+            "db": {"image": "postgres:15"},
+        }});
+        let spec = |n: &str| {
+            let m = model(&config, &"main".into(), "d".into()).unwrap();
+            m.nodes
+                .iter()
+                .find(|(k, _)| k.name.0 == n)
+                .unwrap()
+                .1
+                .spec
+                .clone()
+        };
+        let (worker, db) = (spec("worker"), spec("db"));
+        std::fs::write(dir.path().join("worker/main.c"), "int main = 1;").unwrap();
+        assert_ne!(spec("worker"), worker);
+        assert_eq!(spec("db"), db);
     }
 
     #[test]

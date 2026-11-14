@@ -829,7 +829,8 @@ impl Provider<'_> {
                     for f in files {
                         cmd.arg("-f").arg(f);
                     }
-                    cmd.args(["up", "-d", "--no-deps"]).arg(&node.name.0);
+                    cmd.args(["up", "-d", "--build", "--no-deps"])
+                        .arg(&node.name.0);
                 });
                 std::thread::spawn(move || {
                     for t in &points {
@@ -1396,7 +1397,7 @@ pub fn render(stack: &Stack, s: &State, op: &Op) -> Option<String> {
             format!("docker rm --force rizr-{}-{}", stack.project.0, node.name.0)
         }
         Op::Start { node, .. } => format!(
-            "{} -f {} up -d --no-deps {}",
+            "{} -f {} up -d --build --no-deps {}",
             base(stack.compose()),
             stack
                 .dir
