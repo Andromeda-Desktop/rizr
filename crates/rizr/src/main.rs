@@ -1563,6 +1563,29 @@ fn known_cause(mut e: Error, files: &[PathBuf]) -> Error {
         e.example = "systemctl --user enable --now podman.socket".into();
         return e;
     }
+    // Compose builds with BuildKit, which pulls a FROM image and does not see podman's local store.
+    if runtime::current() == runtime::Engine::Podman
+        && let Some(image) = e
+            .message
+            .split("failed to resolve source metadata for ")
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+            .map(|i| {
+                i.trim_end_matches(':')
+                    .trim_start_matches("docker.io/library/")
+                    .to_owned()
+            })
+        && std::process::Command::new("docker")
+            .args(["image", "inspect", &image])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    {
+        e.hint = format!(
+            "{image} exists in podman's local store, but compose builds with BuildKit, which looks for it in a registry; build with the classic builder"
+        );
+        e.example = "COMPOSE_BAKE=false DOCKER_BUILDKIT=0 rizr up".into();
+        return e;
+    }
     let m = e.message.to_ascii_lowercase();
     if m.contains("port is already allocated") || m.contains("address already in use") {
         let port = e.message.rsplit(':').find_map(|p| {
