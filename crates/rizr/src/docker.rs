@@ -751,9 +751,27 @@ impl Provider<'_> {
                                 .ok()
                                 .and_then(|v| v.into_iter().next())
                                 .filter(|c| c["State"]["Running"] == true);
-                            let same = running.as_ref().is_some_and(|c| {
+                            let mut same = running.as_ref().is_some_and(|c| {
                                 c["Config"]["Labels"]["rizr.spec"] == spec.0.as_str()
                             });
+                            // The image applies POSTGRES_PASSWORD only when it creates the data. A changed
+                            // compose value needs no new server: the role takes it on the running one.
+                            if let (false, Some(c), Some(pw)) =
+                                (same, &running, pg.env.get("POSTGRES_PASSWORD"))
+                            {
+                                same = password_only(c, &pg)
+                                    && crate::postgres::admin(
+                                        &name,
+                                        pg.user(),
+                                        &format!(
+                                            "alter role \"{}\" password '{}'",
+                                            pg.user().replace('"', "\"\""),
+                                            pw.replace('\'', "''")
+                                        ),
+                                        None,
+                                    )
+                                    .is_ok();
+                            }
                             // Another instance started it while this one waited for the project lock: use it.
                             // Its start event came before this start, so this instance replays what it missed.
                             if let (true, Some(c)) = (same, &running) {
@@ -1158,6 +1176,24 @@ fn synthetic(node: NodeId, spec: Digest, kind: RuntimeKind) -> Event {
         kind,
         at,
     }
+}
+
+/// The running server differs from the wanted one only in `POSTGRES_PASSWORD`.
+fn password_only(running: &Value, pg: &crate::postgres::Server) -> bool {
+    let env: BTreeMap<&str, &str> = running["Config"]["Env"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.as_str()?.split_once('='))
+        .filter(|(k, _)| k.starts_with("POSTGRES_") && *k != "POSTGRES_PASSWORD")
+        .collect();
+    let want: BTreeMap<&str, &str> = pg
+        .env
+        .iter()
+        .filter(|(k, _)| *k != "POSTGRES_PASSWORD")
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    running["Config"]["Image"] == pg.image.as_str() && env == want
 }
 
 pub fn inspect_one(name: &str) -> Result<Value, String> {
