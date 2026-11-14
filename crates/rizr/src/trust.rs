@@ -372,6 +372,30 @@ pub fn gate(root: &Path, chosen: &[PathBuf], ask: bool) -> Result<Inputs, Error>
 }
 
 fn untrusted(i: &Inputs, chosen: &[PathBuf], known: bool) -> Error {
+    if i.files.is_empty() {
+        let near: Vec<String> = std::fs::read_dir(&i.root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|d| !crate::compose::resolve(&d.path(), &[]).is_empty())
+            .map(|d| d.file_name().to_string_lossy().into_owned())
+            .collect();
+        return Error::new(
+            ErrorCode::Usage,
+            format!(
+                "{} has no compose file or task file, so rizr has nothing to run here; trust is not the problem",
+                i.root.display()
+            ),
+            match near.as_slice() {
+                [] => "run rizr in the directory of the compose file".to_owned(),
+                n => format!("directories here with a compose file: {}", n.join(", ")),
+            },
+            near.first()
+                .map_or("cd <repo> && rizr context".to_owned(), |d| {
+                    format!("cd {d} && rizr context")
+                }),
+        );
+    }
     let trust: String = chosen
         .iter()
         .map(|f| format!("-f {} ", f.display()))
