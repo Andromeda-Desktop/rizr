@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
-use rizr_core::code::{Package, TaskName};
+use rizr_core::code::{Kind, Manager, Package, PyTool, TaskName};
 use rizr_core::error::{Error, ErrorCode};
 use serde::Serialize;
 
@@ -172,6 +172,35 @@ fn log_path(data: &Path, name: TaskName, dir: &str) -> PathBuf {
     data.join(format!("task-{}-{slug}.log", verb(name)))
 }
 
+/// The command that installs a package's missing dependencies before a host task, and why it runs.
+fn install(root: &Path, pkg: &Package) -> Option<(&'static str, &'static str)> {
+    let dir = root.join(&pkg.dir);
+    let lock = |name: &str| dir.join(name).is_file() || root.join(name).is_file();
+    match &pkg.kind {
+        Kind::Node { manager } if !dir.join("node_modules").exists() => {
+            let cmd = match manager {
+                Manager::Npm if lock("package-lock.json") => "npm ci",
+                Manager::Npm => "npm install",
+                Manager::Pnpm if lock("pnpm-lock.yaml") => "pnpm install --frozen-lockfile",
+                Manager::Pnpm => "pnpm install",
+                Manager::Yarn if lock("yarn.lock") => "yarn install --frozen-lockfile",
+                Manager::Yarn => "yarn install",
+                Manager::Bun if lock("bun.lock") || lock("bun.lockb") => {
+                    "bun install --frozen-lockfile"
+                }
+                Manager::Bun => "bun install",
+            };
+            Some((cmd, "node_modules missing"))
+        }
+        Kind::Python { tool: PyTool::Uv }
+            if lock("uv.lock") && !dir.join(".venv").exists() && !root.join(".venv").exists() =>
+        {
+            Some(("uv sync --frozen", ".venv missing"))
+        }
+        _ => None,
+    }
+}
+
 /// Runs the task, or waits for the same task that a former call left running. Returns within 100 s.
 pub fn run(
     root: &Path,
@@ -215,7 +244,14 @@ pub fn run(
                 task.cmd,
                 task.from
             );
-            let script = format!("{}\nprintf '\\n{EXIT_MARK}%s\\n' \"$?\"", task.cmd);
+            let cmd = match install(root, pkg) {
+                Some((install, why)) => {
+                    eprintln!("rizr: install in {}: {install} ({why})", pkg.dir);
+                    format!("{install} && ({})", task.cmd)
+                }
+                None => task.cmd.clone(),
+            };
+            let script = format!("{cmd}\nprintf '\\n{EXIT_MARK}%s\\n' \"$?\"");
             let out = file.try_clone().map_err(io)?;
             let err = file.try_clone().map_err(io)?;
             let mut child = Command::new("sh")
