@@ -175,6 +175,8 @@ pub fn footprint(stack: &Stack) -> Result<(), Error> {
         format!("{p}.ports.json"),
         format!("{p}.project.lock"),
         format!("{p}.ports.lock"),
+        format!("{p}.subnets.json"),
+        format!("{p}.subnets.lock"),
     ] {
         let f = data.join(f);
         if f.exists() {
@@ -261,7 +263,9 @@ pub fn gc(stack: &Stack) -> Result<(), Error> {
                 }
             }
         }
-        release_ports(stack, inst);
+        for kind in ["ports", "subnets"] {
+            release(stack, inst, kind);
+        }
         std::fs::remove_dir_all(dir).map_err(|e| {
             Error::new(
                 ErrorCode::RuntimeUnavailable,
@@ -282,10 +286,10 @@ pub fn gc(stack: &Stack) -> Result<(), Error> {
     Ok(())
 }
 
-/// Drop the instance's host-port claims, so other instances may take those ports.
-fn release_ports(stack: &Stack, instance: &str) {
+/// Drop the instance's claims of one kind (host ports, subnets), so other instances may take them.
+fn release(stack: &Stack, instance: &str, kind: &str) {
     let data = stack.dir.parent().unwrap_or(Path::new("/"));
-    let claims = data.join(format!("{}.ports.json", stack.project.0));
+    let claims = data.join(format!("{}.{kind}.json", stack.project.0));
     let Ok(lock) = std::fs::File::create(claims.with_extension("lock")) else {
         return;
     };

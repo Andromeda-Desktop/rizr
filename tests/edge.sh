@@ -285,6 +285,11 @@ subnet() { # two worktrees of a repo that pins a subnet and a fixed address run 
   expect subnet ips '^10\.213\.7\.10 $'
   expect subnet ips '^10\.213\.8\.10 $'
   (cd ../subnet-wt && "$RIZR" down >/dev/null 2>&1)
+  grep -q subnet-wt "$XDG_DATA_HOME"/rizr/*.subnets.json || { echo "FAIL subnet: no claim for the worktree"; fails=$((fails + 1)); }
+  git worktree remove --force ../subnet-wt && "$RIZR" gc >gc.out 2>&1
+  expect subnet gc.out 'released subnet-wt'
+  ! grep -q subnet-wt "$XDG_DATA_HOME"/rizr/*.subnets.json && echo "ok   subnet: gc released the claim" ||
+    { echo "FAIL subnet: gc kept the claim"; fails=$((fails + 1)); }
   done_case subnet
 }
 
