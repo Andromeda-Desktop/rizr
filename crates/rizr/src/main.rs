@@ -328,15 +328,13 @@ fn run(cli: Cli) -> Result<(), Error> {
         Command::Rewind { db, back } => rewind::rewind(&stack, db.as_deref(), back),
         Command::Reset { db } => rewind::reset(&stack, db.as_deref()),
         Command::Test { package } => task::run(
-            &stack.root,
-            &stack.dir,
+            &stack,
             rizr_core::code::TaskName::Test,
             package.as_deref(),
             json,
         ),
         Command::Build { package } => task::run(
-            &stack.root,
-            &stack.dir,
+            &stack,
             rizr_core::code::TaskName::Build,
             package.as_deref(),
             json,

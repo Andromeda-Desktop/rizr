@@ -11,7 +11,9 @@ use rizr_core::code::{Kind, Manager, Package, PyTool, TaskName};
 use rizr_core::error::{Error, ErrorCode};
 use serde::Serialize;
 
-use crate::detect;
+use serde_json::Value;
+
+use crate::{detect, docker, postgres};
 
 const BUDGET: Duration = Duration::from_secs(100);
 const EXIT_MARK: &str = "rizr-task-exit:";
@@ -31,6 +33,7 @@ pub struct Summary {
 struct Receipt<'a> {
     task: TaskName,
     package: &'a str,
+    place: String,
     cmd: &'a str,
     source: rizr_core::code::Source,
     from: &'a str,
@@ -172,6 +175,117 @@ fn log_path(data: &Path, name: TaskName, dir: &str) -> PathBuf {
     data.join(format!("task-{}-{slug}.log", verb(name)))
 }
 
+/// Where a task runs: the host, or the compose service whose build context is the package dir.
+enum Place {
+    Host,
+    /// The service, and a bind mount `dir:workdir` when the service does not mount its build context.
+    Service(String, Option<String>),
+}
+
+impl std::fmt::Display for Place {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Place::Host => Ok(()),
+            Place::Service(svc, _) => write!(f, " (service {svc})"),
+        }
+    }
+}
+
+fn place(stack: &docker::Stack, pkg: &Package) -> Place {
+    let Ok(dir) = stack.root.join(&pkg.dir).canonicalize() else {
+        return Place::Host;
+    };
+    let Ok(out) = stack
+        .compose()
+        .args(["config", "--format", "json"])
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Place::Host;
+    };
+    let config: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let same = |p: &str| Path::new(p).canonicalize().is_ok_and(|p| p == dir);
+    for (name, svc) in config["services"].as_object().into_iter().flatten() {
+        let Some(ctx) = svc["build"]["context"].as_str().filter(|c| same(c)) else {
+            continue;
+        };
+        let mounted = svc["volumes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|v| v["type"] == "bind" && v["source"].as_str().is_some_and(same));
+        if mounted {
+            return Place::Service(name.clone(), None);
+        }
+        let synced = svc["develop"]["watch"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|w| {
+                w["path"].as_str().is_some_and(same)
+                    && w["action"].as_str().is_some_and(|a| a.starts_with("sync"))
+            })
+            .and_then(|w| w["target"].as_str().map(str::to_owned));
+        let dockerfile =
+            Path::new(ctx).join(svc["build"]["dockerfile"].as_str().unwrap_or("Dockerfile"));
+        let target = synced.or_else(|| {
+            std::fs::read_to_string(dockerfile)
+                .ok()
+                .and_then(|t| workdir(&t))
+        });
+        if let Some(t) = target {
+            return Place::Service(name.clone(), Some(format!("{}:{t}", dir.display())));
+        }
+    }
+    Place::Host
+}
+
+/// The last absolute `WORKDIR` of a Dockerfile: the final stage's working directory.
+fn workdir(dockerfile: &str) -> Option<String> {
+    dockerfile
+        .lines()
+        .filter_map(|l| {
+            let mut w = l.split_whitespace();
+            w.next().filter(|k| k.eq_ignore_ascii_case("WORKDIR"))?;
+            w.next().filter(|d| d.starts_with('/')).map(str::to_owned)
+        })
+        .next_back()
+}
+
+/// Brings the stack up (`rizr up --wait ready`) for a task that runs in one of its services.
+fn up(stack: &docker::Stack) -> Result<(), Error> {
+    let exe = std::env::current_exe().unwrap_or_else(|_| "rizr".into());
+    let mut c = Command::new(exe);
+    for f in &stack.files {
+        c.arg("-f").arg(f);
+    }
+    // up's report goes to stderr: stdout holds only the task's result.
+    let status = c
+        .args(["up", "--wait", "ready"])
+        .stdin(Stdio::null())
+        .stdout(std::io::stderr())
+        .status();
+    match status.ok().and_then(|s| s.code()) {
+        Some(0) => return Ok(()),
+        // Exit 5 (not ready): up keeps going in the background and the next call waits for it.
+        Some(5) => {
+            return Err(Error::new(
+                ErrorCode::StillRunning,
+                "the stack is still starting, so the task has not run yet",
+                "the task runs inside a compose service; the same command again waits up to 100 s more",
+                "rizr test",
+            ));
+        }
+        _ => {}
+    }
+    Err(Error::new(
+        ErrorCode::DependencyFailed,
+        "the stack did not come up, so the task cannot run in its service",
+        "the task runs inside a compose service and needs the stack; fix the error above",
+        "rizr up",
+    ))
+}
+
 /// The command that installs a package's missing dependencies before a host task, and why it runs.
 fn install(root: &Path, pkg: &Package) -> Option<(&'static str, &'static str)> {
     let dir = root.join(&pkg.dir);
@@ -203,17 +317,34 @@ fn install(root: &Path, pkg: &Package) -> Option<(&'static str, &'static str)> {
 
 /// Runs the task, or waits for the same task that a former call left running. Returns within 100 s.
 pub fn run(
-    root: &Path,
-    data: &Path,
+    stack: &docker::Stack,
     name: TaskName,
     dir: Option<&str>,
     json: bool,
 ) -> Result<(), Error> {
-    let packages = detect::detect(&detect::read(root));
+    let packages = detect::detect(&detect::read(&stack.root));
     let pkg = pick(&packages, name, dir)?;
     let Some(task) = pkg.task(name) else {
         return Ok(());
     };
+    let (root, data) = (stack.root.as_path(), stack.dir.as_path());
+    let place = place(stack, pkg);
+    // Steps that run first, in the same script: (verb, command, reason).
+    let mut before = Vec::new();
+    match &place {
+        Place::Host => {
+            before.extend(install(root, pkg).map(|(c, why)| ("install", c.to_owned(), why)))
+        }
+        Place::Service(..) => {
+            up(stack)?;
+            if name == TaskName::Test
+                && let Some(m) = pkg.task(TaskName::Migrate)
+                && !postgres::empty(data, &stack.project.0).is_empty()
+            {
+                before.push(("migrate", m.cmd.clone(), "empty database"));
+            }
+        }
+    }
     let io = |e: std::io::Error| {
         Error::new(
             ErrorCode::RuntimeUnavailable,
@@ -238,25 +369,39 @@ pub fn run(
             file.set_len(0).map_err(io)?;
             file.rewind().map_err(io)?;
             eprintln!(
-                "rizr: {} in {}: {} (from {})",
+                "rizr: {} in {}{}: {} (from {})",
                 verb(name),
                 pkg.dir,
+                place,
                 task.cmd,
                 task.from
             );
-            let cmd = match install(root, pkg) {
-                Some((install, why)) => {
-                    eprintln!("rizr: install in {}: {install} ({why})", pkg.dir);
-                    format!("{install} && ({})", task.cmd)
-                }
-                None => task.cmd.clone(),
-            };
+            let mut cmd = format!("({})", task.cmd);
+            for (v, c, why) in before.iter().rev() {
+                eprintln!("rizr: {v} in {}{place}: {c} ({why})", pkg.dir);
+                cmd = format!("{c} && {cmd}");
+            }
             let script = format!("{cmd}\nprintf '\\n{EXIT_MARK}%s\\n' \"$?\"");
             let out = file.try_clone().map_err(io)?;
             let err = file.try_clone().map_err(io)?;
-            let mut child = Command::new("sh")
+            let mut c = match &place {
+                Place::Host => {
+                    let mut c = Command::new("sh");
+                    c.current_dir(root.join(&pkg.dir));
+                    c
+                }
+                Place::Service(svc, mount) => {
+                    let mut c = stack.compose();
+                    c.args(["run", "--rm", "--no-deps", "-T"]);
+                    if let Some(m) = mount {
+                        c.args(["-v", m]);
+                    }
+                    c.args([svc.as_str(), "sh"]);
+                    c
+                }
+            };
+            let mut child = c
                 .args(["-c", &script])
-                .current_dir(root.join(&pkg.dir))
                 .stdin(Stdio::null())
                 .stdout(out)
                 .stderr(err)
@@ -317,6 +462,10 @@ pub fn run(
         let r = Receipt {
             task: name,
             package: &pkg.dir,
+            place: match &place {
+                Place::Host => "host".to_owned(),
+                Place::Service(svc, _) => format!("service {svc}"),
+            },
             cmd: &task.cmd,
             source: task.source,
             from: &task.from,
