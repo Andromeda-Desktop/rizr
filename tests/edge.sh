@@ -98,6 +98,10 @@ loginfail() { # healthy postgres, but a client logs in with another password: up
   expect loginfail out 'password authentication failed for user "postgres"'
   ! grep -q 'has no tables' out && echo "ok   loginfail: no migration note" ||
     { echo "FAIL loginfail: migration note"; fails=$((fails + 1)); }
+  sed -i 's/POSTGRES_PASSWORD: right/POSTGRES_PASSWORD: wrong/' compose.yaml
+  "$RIZR" trust --yes >/dev/null 2>&1
+  "$RIZR" up >fixed 2>&1
+  expect loginfail fixed ': Up \('
   done_case loginfail
 }
 

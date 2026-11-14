@@ -767,26 +767,47 @@ fn server_error(u: &serde_json::Value) -> Error {
     )
 }
 
-/// A client refused by a shared database server since `since`: the server is healthy, so no check sees it.
+/// A client refused by a shared database server: the server is healthy, so no check sees it. A refusal in
+/// the last 10 s of this up counts only when it repeats in the next 3 s: earlier ones can come from containers
+/// this up replaced, or from before it set the new password.
 fn login_failure(stack: &docker::Stack, since: u64) -> Option<Error> {
-    let info = postgres::Info::load(&stack.dir);
-    info.databases.iter().find_map(|(svc, db)| {
-        let id = docker::shared_container(stack, svc)?;
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    };
+    // postgres logs to stderr. All instances share the server, so another instance's client can show here.
+    let refused = |id: &str, since: u64| {
         let out = std::process::Command::new("docker")
-            .args(["logs", "--since", &since.to_string(), &id])
+            .args(["logs", "--since", &since.to_string(), id])
             .output()
             .ok()?;
-        // postgres logs to stderr. All instances share the server, so another instance's client can show here.
-        let log = String::from_utf8_lossy(&out.stderr);
-        let line = log
+        String::from_utf8_lossy(&out.stderr)
             .lines()
-            .find(|l| l.contains("password authentication failed for user"))?;
-        let fatal = line.find("FATAL").map_or(line, |i| &line[i..]);
+            .find(|l| l.contains("password authentication failed for user"))
+            .map(|l| l.find("FATAL").map_or(l, |i| &l[i..]).to_owned())
+    };
+    let info = postgres::Info::load(&stack.dir);
+    let seen: Vec<_> = info
+        .databases
+        .iter()
+        .filter_map(|(svc, db)| {
+            let id = docker::shared_container(stack, svc)?;
+            refused(&id, since.max(now().saturating_sub(10))).map(|_| (svc, db, id))
+        })
+        .collect();
+    if seen.is_empty() {
+        return None;
+    }
+    let after = now() + 1;
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    seen.into_iter().find_map(|(svc, db, id)| {
+        let fatal = refused(&id, after)?;
         Some(Error::new(
             ErrorCode::Unhealthy,
             format!("{svc}: a client cannot log in: {fatal}"),
             format!(
-                "{svc} takes user `{}` and its password from the compose file; a service that connects with another password is refused: make both the same, then `rizr up`",
+                "a service connects to {svc} as `{}` with another password than the compose file gives {svc}; put the password the services send into the compose file (not the app code), then `rizr up`: the server takes the new password at each up",
                 db.user
             ),
             "grep -rn -i password --exclude-dir=.git .".to_owned(),
