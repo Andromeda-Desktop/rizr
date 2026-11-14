@@ -1424,8 +1424,13 @@ pub fn render(stack: &Stack, s: &State, op: &Op) -> Option<String> {
     Some(match op {
         Op::Import => format!("{} config --format json", base(stack.compose())),
         Op::Start { node, .. } if db(node) => format!(
-            "docker exec <server> createdb <database>; docker network connect --alias {} <network> <server>",
-            node.name.0
+            "docker exec <server> createdb <database>; docker network connect --alias {} <network> <server>{}",
+            node.name.0,
+            if stack.instance.0 == "main" {
+                ""
+            } else {
+                "; a new database gets a copy of main's data: main's database on the server, else main's running compose container, else main's volume"
+            }
         ),
         Op::Stop(node) if db(node) => format!(
             "docker network disconnect <network> <server> ({})",

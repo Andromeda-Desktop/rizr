@@ -315,6 +315,12 @@ fn toolchains(root: &Path) -> Vec<Check> {
     v
 }
 
+/// The server container or the instance database does not exist yet: the state before the first `up`.
+fn not_made(stderr: &[u8]) -> bool {
+    let e = String::from_utf8_lossy(stderr);
+    e.contains("No such container") || (e.contains("database \"") && e.contains("does not exist"))
+}
+
 /// Each shared database accepts its app user (sabai #7: a role without a grant fails only at runtime).
 fn grants(stack: &Stack) -> Vec<Check> {
     crate::postgres::Info::load(&stack.dir)
@@ -358,6 +364,20 @@ fn grants(stack: &Stack) -> Vec<Check> {
                         "docker exec {server} psql -d {} -c 'GRANT ALL ON SCHEMA public TO {}'",
                         d.database, d.user
                     )),
+                ),
+                Ok(o) if not_made(&o.stderr) => check(
+                    "database",
+                    Level::Ok,
+                    format!(
+                        "{} on {server}: not made yet; `rizr up` creates it{}",
+                        d.database,
+                        if stack.instance.0 == "main" {
+                            ""
+                        } else {
+                            " and fills it with a copy of main's data"
+                        }
+                    ),
+                    None,
                 ),
                 Ok(o) => check(
                     "database",

@@ -383,7 +383,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                     println!("    $ {c}");
                 }
             }
-            print_order(&s);
+            print_order(&s, stack.instance.0 != "main");
             print_tasks(&stack.root);
             Ok(())
         }
@@ -1138,7 +1138,8 @@ fn print_tasks(root: &Path) {
     }
 }
 
-fn print_order(s: &State) {
+/// `worktree`: a new shared database of this instance gets a copy of main's data.
+fn print_order(s: &State, worktree: bool) {
     let Some(m) = s.loaded() else { return };
     println!("order:");
     for id in m.topo() {
@@ -1150,6 +1151,11 @@ fn print_order(s: &State) {
             .collect();
         let kind = if matches!(n.kind, NodeKind::Job { .. }) {
             "job"
+        } else if worktree
+            && id.scope != rizr_core::model::Scope::Project
+            && n.provider.0 == postgres::PROVIDER
+        {
+            "database on the shared server; when new, it gets a copy of main's data"
         } else {
             "service"
         };

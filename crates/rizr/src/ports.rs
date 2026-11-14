@@ -250,7 +250,7 @@ pub fn stray_lines(root: &Path, own: &str) -> Vec<String> {
     .map(|l| l.trim().to_owned())
     .collect();
     let own_line = (!unadopted.is_empty()).then(|| {
-        format!("running outside rizr in compose project `{own}`: {}; rizr did not start them, so their nodes show as absent; `rizr up` recreates them under rizr", unadopted.join(", "))
+        format!("running outside rizr in compose project `{own}`: {}; rizr did not start them, so their nodes show as absent; `rizr up` in this checkout recreates them under rizr; `rizr up` in a worktree leaves them running", unadopted.join(", "))
     });
     strays(root, own)
         .into_iter()
