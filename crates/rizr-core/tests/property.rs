@@ -421,7 +421,15 @@ fn apply(mut s: State, fake: &mut Fake, c: &Choice) -> State {
             fake.lose_stream();
             s = reduce(s, Event::StreamLost);
         }
-        Choice::Up => s = reduce(s, Event::Action(Action::Up { wait: Wait::Ready })),
+        Choice::Up => {
+            s = reduce(
+                s,
+                Event::Action(Action::Up {
+                    wait: Wait::Ready,
+                    timeout: None,
+                }),
+            )
+        }
         Choice::Down => s = reduce(s, Event::Action(Action::Down)),
         Choice::Restart(i) => {
             let name = fake.id(i % fake.gens.len()).name;
@@ -553,7 +561,13 @@ fn start(fake: &mut Fake) -> Result<State, String> {
             trusted: false,
         },
     );
-    let s = reduce(s, Event::Action(Action::Up { wait: Wait::Ready }));
+    let s = reduce(
+        s,
+        Event::Action(Action::Up {
+            wait: Wait::Ready,
+            timeout: None,
+        }),
+    );
     settle(s, fake)
 }
 
@@ -1086,7 +1100,13 @@ fn a_snapshot_before_the_model_does_not_skip_the_probe() {
             trusted: true,
         },
     );
-    s = reduce(s, Event::Action(Action::Up { wait: Wait::Ready }));
+    s = reduce(
+        s,
+        Event::Action(Action::Up {
+            wait: Wait::Ready,
+            timeout: None,
+        }),
+    );
     for _ in 0..16 {
         for e in plan(&s) {
             s = reduce(s, Event::Sent(e));

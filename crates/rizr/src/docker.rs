@@ -180,6 +180,12 @@ pub fn run(stack: &Stack, inputs: Digest, action: Option<Action>) -> Result<Stat
         unit_events: None,
         project_lock: Arc::default(),
         progress: action.is_some().then(|| (Instant::now(), BTreeMap::new())),
+        budget: match &action {
+            Some(Action::Up {
+                timeout: Some(t), ..
+            }) => Duration::from_secs(*t),
+            _ => BUDGET,
+        },
     };
     let mut s = State::new(stack.project.clone(), stack.instance.clone(), generation);
     s = reduce(
@@ -222,6 +228,8 @@ struct Provider<'a> {
     project_lock: Arc<Mutex<Option<std::fs::File>>>,
     /// For a verb that changes the stack: its start and the last state printed per node.
     progress: Option<(Instant, BTreeMap<String, String>)>,
+    /// How long a verb waits before it returns "still starting": `up --timeout`, else 100 s.
+    budget: Duration,
 }
 
 impl Drop for Provider<'_> {
@@ -238,7 +246,7 @@ impl Drop for Provider<'_> {
 
 impl Provider<'_> {
     fn drive(&mut self, mut s: State, rx: &Receiver<Msg>) -> Result<State, Error> {
-        let limit = self.progress.as_ref().map(|(t, _)| *t + BUDGET);
+        let limit = self.progress.as_ref().map(|(t, _)| *t + self.budget);
         loop {
             for _ in 0..64 {
                 let planned = plan(&s);
@@ -345,11 +353,26 @@ impl Provider<'_> {
             rizr_core::error::ErrorCode::StillRunning,
             format!(
                 "not failed, still starting after {} s: {}",
-                BUDGET.as_secs(),
+                self.budget.as_secs(),
                 lines.join("; ")
             ),
-            "the containers keep starting in the background; the same command again waits up to 100 s more and restarts nothing",
-            again,
+            format!(
+                "the containers keep starting in the background and nothing restarts; for a slow start wait in one call, with a timeout below your command's own: `rizr up --timeout 540`; `{again}` waits {} s more",
+                self.budget.as_secs()
+            ),
+            {
+                let mut args = std::env::args().skip(1).peekable();
+                let mut kept = vec!["rizr".to_owned()];
+                while let Some(a) = args.next() {
+                    if a == "--timeout" {
+                        args.next();
+                    } else if !a.starts_with("--timeout=") {
+                        kept.push(a);
+                    }
+                }
+                kept.push("--timeout 540".into());
+                kept.join(" ")
+            },
         )
     }
 
@@ -800,6 +823,7 @@ impl Provider<'_> {
                     Vec::new()
                 };
                 let (dir, job) = (self.stack.dir.clone(), node.name.0.clone());
+                let log = self.stack.dir.join(format!("start-{job}.log"));
                 let mut cmd = self.stack.compose();
                 let r = self.write_override(&node, &spec, generation).map(|files| {
                     for f in files {
@@ -812,7 +836,7 @@ impl Provider<'_> {
                         crate::rewind::take(t, &dir, &job, true);
                     }
                     done(match r {
-                        Ok(()) => exec_progress(cmd, &job, &progress),
+                        Ok(()) => exec_progress(cmd, &job, &progress, &log),
                         Err(tail) => Answer::Err { tail },
                     });
                 });
@@ -1217,59 +1241,73 @@ fn log_line(cmd: Command, pattern: &str) -> bool {
 
 /// `exec` that reads compose's output as it comes and reports each new pull or build step. Compose writes pulls
 /// to stderr and build steps to stdout.
-fn exec_progress(mut cmd: Command, node: &str, tx: &Sender<Msg>) -> Answer {
-    let report = |tx: Sender<Msg>, node: String| {
-        let mut last = String::new();
-        move |line: &str| {
-            if let Some(step) = progress_step(line)
-                && step != last
-            {
-                let _ = tx.send(Msg::Progress(node.clone(), step.clone()));
-                last = step;
-            }
-        }
+/// Compose writes to `log`, not to a pipe: when `up` returns at its budget, a pipe to the gone rizr would kill
+/// the build with SIGPIPE on its next line, and every rerun would start the build again. Compose inherits the
+/// lock on `log` with its stdout, so a later `up` waits for a start that still runs instead of starting another.
+fn exec_progress(mut cmd: Command, node: &str, tx: &Sender<Msg>, log: &Path) -> Answer {
+    let fail = |e: std::io::Error| Answer::Err {
+        tail: format!("cannot run docker compose: {e}"),
     };
-    let child = cmd
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+    {
+        Ok(f) => f,
+        Err(e) => return fail(e),
+    };
+    let mut from = file.metadata().map_or(0, |m| m.len());
+    let follow = Command::new("tail")
+        .arg(format!("--bytes=+{}", from + 1))
+        .arg("--follow")
+        .arg(log)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(e) => {
-            return Answer::Err {
-                tail: format!("cannot run docker compose: {e}"),
-            };
-        }
-    };
-    let steps = child.stdout.take().map(|out| {
-        let mut on = report(tx.clone(), node.to_string());
-        std::thread::spawn(move || {
-            for line in BufReader::new(out).lines().map_while(Result::ok) {
-                on(&line);
+    let reader = follow.ok().map(|mut t| {
+        let out = t.stdout.take();
+        let (tx, node) = (tx.clone(), node.to_string());
+        let thread = std::thread::spawn(move || {
+            let mut last = String::new();
+            for line in out
+                .into_iter()
+                .flat_map(|o| BufReader::new(o).lines().map_while(Result::ok))
+            {
+                if let Some(step) = progress_step(&line)
+                    && step != last
+                {
+                    let _ = tx.send(Msg::Progress(node.clone(), step.clone()));
+                    last = step;
+                }
             }
-        })
+        });
+        (t, thread)
     });
-    let mut err = Vec::new();
-    if let Some(out) = child.stderr.take() {
-        let mut on = report(tx.clone(), node.to_string());
-        for line in BufReader::new(out).lines().map_while(Result::ok) {
-            on(&line);
-            err.extend_from_slice(line.as_bytes());
-            err.push(b'\n');
-        }
+    let status = file
+        .lock()
+        .and_then(|()| {
+            // A long history is dropped once no other compose writes to the file.
+            if file.metadata()?.len() > 4 << 20 {
+                file.set_len(0)?;
+                from = 0;
+            }
+            let err = file.try_clone()?;
+            cmd.stdin(Stdio::null()).stdout(file).stderr(err).spawn()
+        })
+        .and_then(|mut c| c.wait());
+    if let Some((mut t, thread)) = reader {
+        let _ = t.kill();
+        let _ = t.wait();
+        let _ = thread.join();
     }
-    if let Some(t) = steps {
-        let _ = t.join();
-    }
-    match child.wait() {
+    let out = std::fs::read(log).unwrap_or_default();
+    match status {
         Ok(st) if st.success() => Answer::Ok,
         Ok(_) => Answer::Err {
-            tail: compose::tail(&err),
+            tail: compose::tail(out.get(from as usize..).unwrap_or(&out)),
         },
-        Err(e) => Answer::Err {
-            tail: format!("cannot run docker compose: {e}"),
-        },
+        Err(e) => fail(e),
     }
 }
 

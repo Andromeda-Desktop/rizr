@@ -354,6 +354,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                 s,
                 Event::Action(Action::Up {
                     wait: Default::default(),
+                    timeout: None,
                 }),
             );
             let steps: Vec<_> = plan(&s)

@@ -17,6 +17,11 @@ pub enum Action {
     Up {
         #[cfg_attr(feature = "clap", arg(long, value_enum, default_value = "ready"))]
         wait: Wait,
+        /// Seconds to wait before it returns "still starting" (default 100). For a slow start, set it just below
+        /// the caller's own command timeout, so one call reaches the outcome.
+        #[cfg_attr(feature = "clap", arg(long))]
+        #[serde(default)]
+        timeout: Option<u64>,
     },
     /// Stop the stack. Data stays.
     Down,

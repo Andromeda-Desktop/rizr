@@ -269,7 +269,7 @@ pub fn reduce(mut s: State, event: Event) -> State {
 
 fn action(s: &mut State, a: Action) {
     match a {
-        Action::Up { wait } => {
+        Action::Up { wait, .. } => {
             s.intents = Intents {
                 target: Target::Up,
                 generation: Gen(s.intents.generation.0 + 1),
