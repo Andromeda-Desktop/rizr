@@ -167,9 +167,9 @@ check() { # task -> exit 0 on pass; prints the reason
   case $t in
     1) http_ok http://localhost:8080/ && echo "vote page 200" ;;
     2) jq -se 'any(.[] | select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") | .input.command? // ""; test("pytest|tests-start|test\\.sh"))' "$OUT/2/transcript.jsonl" >/dev/null || { echo "no test command run"; return 1; }
-       # the pinned commit has no prestart service: the backend healthcheck covers a migrated database
        [[ $(docker inspect -f '{{.State.Health.Status}}' "$(service_ctr "$d" backend)" 2>/dev/null) == healthy ]] || { echo "backend not healthy"; return 1; }
-       (cd "$d" && docker compose exec -T backend bash scripts/tests-start.sh) >"$OUT/2/check-tests.log" 2>&1 && echo "tests pass" ;;
+       # as the repo's scripts/test.sh: the image has no tests/ and no service migrates, so the check does both itself
+       (cd "$d" && docker compose cp backend/tests backend:/app/backend/ && docker compose exec -T backend bash scripts/prestart.sh && docker compose exec -T backend bash scripts/tests-start.sh) >"$OUT/2/check-tests.log" 2>&1 && echo "tests pass" ;;
     3) [[ -s $OUT/3/first-ids ]] || { echo "no first copy"; return 1; }
        [[ $(docker inspect -f '{{.State.StartedAt}}' $(cat "$OUT/3/first-ids") 2>/dev/null | sort) == "$(cat "$OUT/3/first-start")" ]] || { echo "first copy changed"; return 1; }
        http_ok http://localhost:9000/ || { echo "first copy down"; return 1; }
