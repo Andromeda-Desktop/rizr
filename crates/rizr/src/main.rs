@@ -61,6 +61,9 @@ enum Command {
         follow: bool,
         #[arg(long, default_value = "200")]
         tail: String,
+        /// Only lines newer than this: a duration such as `30s` or `5m`, or a timestamp, as in `docker logs`.
+        #[arg(long)]
+        since: Option<String>,
     },
     /// Write plain files that run this stack without rizr: env files and an `up.sh` in dependency order.
     Eject {
@@ -531,12 +534,18 @@ fn run(cli: Cli) -> Result<(), Error> {
             node: Some(node),
             follow,
             tail,
+            since,
         } if manifest::host_names(&stack.root).contains(&node) => {
             let mut c = std::process::Command::new("journalctl");
             c.args(["--user", "-o", "cat", "--no-pager", "-n", &tail, "-u"])
                 .arg(supervisor::Units::of(&stack).unit(&node));
             if follow {
                 c.arg("--follow");
+            }
+            if let Some(s) = since {
+                // journalctl reads a duration as `-30s`.
+                let rel = s.ends_with(|c: char| c.is_ascii_alphabetic());
+                c.arg(format!("--since={}{s}", if rel { "-" } else { "" }));
             }
             let st = c.status().map_err(|e| runtime_error(&e.to_string()))?;
             if st.success() {
@@ -545,7 +554,12 @@ fn run(cli: Cli) -> Result<(), Error> {
                 Err(runtime_error("journalctl --user failed"))
             }
         }
-        Command::Logs { node, follow, tail } => {
+        Command::Logs {
+            node,
+            follow,
+            tail,
+            since,
+        } => {
             let shared = node
                 .as_deref()
                 .and_then(|n| docker::shared_container(&stack, n));
@@ -561,6 +575,9 @@ fn run(cli: Cli) -> Result<(), Error> {
                 if follow {
                     c.arg("--follow");
                 }
+                if let Some(s) = &since {
+                    c.args(["--since", s]);
+                }
                 c
             };
             let target = shared.clone().or(node.clone());
@@ -568,7 +585,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             let up_at = std::fs::read_to_string(stack.dir.join("up-at"))
                 .ok()
                 .and_then(|t| t.trim().parse::<u64>().ok())
-                .filter(|_| !follow);
+                .filter(|_| !follow && since.is_none());
             if let Some(at) = up_at {
                 let run = |flag: &str| base().args([flag, &at.to_string()]).args(&target).output();
                 let old = run("--until").map_err(|e| runtime_error(&e.to_string()))?;
