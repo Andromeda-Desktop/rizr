@@ -522,6 +522,8 @@ fn rebuild(s: &mut State, world: &World) {
             running: false,
         });
     }
+    // `up` reruns a service that exited 0, as compose does; any other verb shows it completed
+    let rerun = s.intents.target == Target::Up;
     let ids: Vec<NodeId> = s.nodes.keys().cloned().collect();
     for id in ids {
         let seen = world.seen.iter().find(|x| x.node == id);
@@ -544,6 +546,7 @@ fn rebuild(s: &mut State, world: &World) {
             (_, None) => Machine::Service(Service::Absent),
             (kind, Some(x)) => Machine::Service(match &x.status {
                 Status::Created => Service::Absent,
+                Status::Exited { code: 0 } if !rerun && !outdated => Service::Completed,
                 Status::Exited {
                     code: 0 | 137 | 143,
                 } => Service::Absent,

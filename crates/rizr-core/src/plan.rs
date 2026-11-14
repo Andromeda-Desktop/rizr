@@ -174,6 +174,7 @@ pub fn plan(s: &State) -> Vec<Effect> {
                     | Service::Restarting
                     | Service::Outdated
                     | Service::Exited { .. }
+                    | Service::Completed
                     | Service::Failed(_),
                 )
                 | Machine::Job(Job::Running | Job::Done(_) | Job::Failed(_)),
@@ -255,6 +256,7 @@ pub fn gate_holds(s: &State, d: &Dep) -> bool {
     match (&d.gate, &n.machine) {
         (_, Machine::Service(Service::Ready)) | (_, Machine::Job(Job::Done(_))) => true,
         (Gate::Started, Machine::Service(Service::Starting(_) | Service::Unhealthy)) => n.running,
+        (Gate::Started, Machine::Service(Service::Completed)) => true,
         (Gate::Started, Machine::Job(Job::Running)) => true,
         _ => false,
     }

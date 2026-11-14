@@ -20,36 +20,43 @@ pub enum InstanceStatus {
 }
 
 pub fn instance_status(s: &State) -> InstanceStatus {
-    let nodes: Vec<&Machine> = s
+    let nodes: Vec<(&NodeId, &Machine)> = s
+        .nodes
+        .iter()
+        .filter(|(_, n)| n.spec.is_some())
+        .map(|(id, n)| (id, &n.machine))
+        .collect();
+    let needed: Vec<&NodeId> = s
         .nodes
         .values()
-        .filter(|n| n.spec.is_some())
-        .map(|n| &n.machine)
+        .filter_map(|n| n.spec.as_ref())
+        .flat_map(|x| x.deps.iter().map(|d| &d.node))
         .collect();
-    let failed = |m: &&Machine| {
+    let failed = |(_, m): &(&NodeId, &Machine)| {
         matches!(
             m,
             Machine::Service(Service::Failed(_) | Service::Unhealthy)
                 | Machine::Job(Job::Failed(_))
         )
     };
-    let fine = |m: &&Machine| {
-        matches!(
+    // A completed service counts as up only when nothing depends on it: a finished test run, not a stopped server.
+    let fine = |(id, m): &(&NodeId, &Machine)| match m {
+        Machine::Service(Service::Completed) => !needed.contains(id),
+        _ => matches!(
             m,
             Machine::Service(Service::Ready) | Machine::Job(Job::Done(_))
-        )
+        ),
     };
     let off = |m: &&Machine| {
         matches!(
             m,
-            Machine::Service(Service::Absent) | Machine::Job(Job::Pending)
+            Machine::Service(Service::Absent | Service::Completed) | Machine::Job(Job::Pending)
         )
     };
     // Shared nodes keep running for other instances after this one is down: Down looks only at its own nodes.
+    // Down before Up: `docker compose stop` leaves every container exited 0, which reads as completed.
     if nodes.iter().any(failed) {
         InstanceStatus::Degraded
-    } else if !nodes.is_empty() && nodes.iter().all(fine) {
-        InstanceStatus::Up
     } else if s
         .nodes
         .iter()
@@ -57,6 +64,8 @@ pub fn instance_status(s: &State) -> InstanceStatus {
         .all(|(_, n)| off(&&n.machine))
     {
         InstanceStatus::Down
+    } else if !nodes.is_empty() && nodes.iter().all(fine) {
+        InstanceStatus::Up
     } else {
         InstanceStatus::Starting
     }
@@ -78,6 +87,7 @@ fn blocked(s: &State, id: &NodeId) -> bool {
             Some(Machine::Service(Service::Absent | Service::Outdated))
             | Some(Machine::Job(Job::Pending)) => blocked(s, &d.node),
             Some(Machine::Service(Service::Ready)) => d.gate == Gate::Completed,
+            Some(Machine::Service(Service::Completed)) => true,
             _ => false,
         }
     })

@@ -44,6 +44,8 @@ pub enum Service {
     },
     /// The runtime restart policy runs; rizr only watches.
     Restarting,
+    /// It exited 0 and its restart policy does not restart it: a one-shot run, as compose `up -d` allows.
+    Completed,
     /// Runs an older spec; `plan` recreates it.
     Outdated,
     Stopping,
@@ -171,6 +173,7 @@ fn service(s: &Service, input: &Input, ctx: Ctx) -> Result<Service, Rejected> {
             S::Exited { code: *code }
         }
         (S::Exited { .. }, I::Inspected { restarting: true }) => S::Restarting,
+        (S::Exited { code: 0 }, I::Inspected { restarting: false }) => S::Completed,
         (S::Exited { code }, I::Inspected { restarting: false }) => {
             S::Failed(Failure::Exit { code: *code })
         }
@@ -181,6 +184,7 @@ fn service(s: &Service, input: &Input, ctx: Ctx) -> Result<Service, Rejected> {
             | S::Restarting
             | S::Outdated
             | S::Exited { .. }
+            | S::Completed
             | S::Failed(_)
             | S::Absent,
             I::StopSent,
@@ -188,7 +192,12 @@ fn service(s: &Service, input: &Input, ctx: Ctx) -> Result<Service, Rejected> {
         (S::Stopping, I::Died { .. } | I::Destroyed) => S::Absent,
         (S::Failed(_), I::Reset | I::SpecChanged) => S::Absent,
         (
-            S::Starting(_) | S::Ready | S::Unhealthy | S::Restarting | S::Exited { .. },
+            S::Starting(_)
+            | S::Ready
+            | S::Unhealthy
+            | S::Restarting
+            | S::Exited { .. }
+            | S::Completed,
             I::SpecChanged,
         ) => S::Outdated,
         _ => return Err(Rejected),

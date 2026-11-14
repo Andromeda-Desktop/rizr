@@ -317,6 +317,20 @@ impl Fake {
         }
     }
 
+    /// The container's command ends with exit 0 and no restart policy restarts it.
+    fn finish(&mut self, i: usize) {
+        let node = self.id(i % self.gens.len());
+        let Some(c) = self.containers.get_mut(&node) else {
+            return;
+        };
+        if !matches!(c.status, Status::Running { .. }) {
+            return;
+        }
+        c.status = Status::Exited { code: 0 };
+        let spec = c.spec.clone();
+        self.event(&node, &spec, RuntimeKind::Die { code: 0 });
+    }
+
     fn health(&mut self, i: usize, healthy: bool) -> bool {
         let i = i % self.gens.len();
         if self.probe(i) != Some(Probe::HealthEvent) {
@@ -783,6 +797,41 @@ fn service_without_probe_that_dies_at_start_fails_up() {
         err.code,
         rizr_core::error::ErrorCode::StartFailed,
         "{err:?}"
+    );
+}
+
+/// A test runner service (no restart policy, nothing waits on it) runs and exits 0: `up` succeeds, as compose `up -d` does.
+#[test]
+fn service_that_exits_0_without_restart_completes_up() {
+    let mut fake = Fake::new(vec![NodeGen {
+        project: false,
+        kind: 0,
+        deps: vec![],
+    }]);
+    let mut s = start(&mut fake).expect("start");
+    for _ in 0..200 {
+        if outcome(&s).is_some() {
+            break;
+        }
+        if let Some(e) = s.pending.values().next().cloned() {
+            let answer = fake.answer(&e, true);
+            s = reduce(s, Event::Done { id: e.id, answer });
+        } else if let Some(e) = fake.deliver(0) {
+            s = reduce(s, e);
+        } else {
+            fake.finish(0);
+            if let Some(e) = fake.deliver(0) {
+                s = reduce(s, e);
+            } else if let Some(id) = first_deadline(&s) {
+                s = reduce(s, Event::DeadlineHit(id));
+            }
+        }
+        s = settle(s, &mut fake).expect("settle");
+    }
+    outcome(&s).expect("outcome").expect("up must succeed");
+    assert_eq!(
+        s.nodes[&fake.id(0)].machine,
+        Machine::Service(Service::Completed)
     );
 }
 
