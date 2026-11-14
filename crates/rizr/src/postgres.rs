@@ -55,7 +55,11 @@ impl Server {
             .arg(format!("--label=rizr.node={}", self.node()))
             .arg(format!("--label=rizr.spec={}", spec.0))
             .arg(format!("--label=rizr.gen={generation}"))
-            .arg(format!("--health-cmd=pg_isready -U {}", self.user()))
+            // Over TCP: the image's init-time server answers on the socket only, then stops.
+            .arg(format!(
+                "--health-cmd=pg_isready -h 127.0.0.1 -U {}",
+                self.user()
+            ))
             .args([
                 "--health-interval=30s",
                 "--health-start-period=60s",
@@ -515,7 +519,7 @@ impl Db {
         let started = run(Command::new("docker")
             .args(["run", "-d", "--name", tmp, "--network", "none"])
             .arg(format!("--volume={}:{}", old.0, old.1))
-            .arg(format!("--health-cmd=pg_isready -U {user}"))
+            .arg(format!("--health-cmd=pg_isready -h 127.0.0.1 -U {user}"))
             .args([
                 "--health-interval=30s",
                 "--health-start-period=120s",
