@@ -286,12 +286,21 @@ fn up(stack: &docker::Stack) -> Result<(), Error> {
     ))
 }
 
+/// The program a shell command line starts, after `VAR=value` assignments; None for a path or a shell builtin.
+fn program(cmd: &str) -> Option<&str> {
+    let w = cmd.split_whitespace().find(|w| !w.contains('='))?;
+    (!w.contains('/') && !matches!(w, "cd" | "export" | "set" | "(" | "!")).then_some(w)
+}
+
+fn on_path(tool: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(tool).is_file()))
+}
+
 /// The tools `mise exec` provides when the repo pins versions and mise is installed; mise installs a missing one.
 /// A mise config file is a trust input: after rizr's trust, mise is told to trust it too.
 fn mise(root: &Path, dir: &Path) -> Option<Vec<String>> {
-    let on_path = std::env::var_os("PATH")
-        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("mise").is_file()));
-    if !on_path {
+    if !on_path("mise") {
         return None;
     }
     let find = |name: &str| {
@@ -376,9 +385,26 @@ pub fn run(
     let place = place(stack, pkg);
     // Steps that run first, in the same script: (verb, command, reason).
     let mut before = Vec::new();
+    let mut toolchain = None;
     match &place {
         Place::Host => {
-            before.extend(install(root, pkg).map(|(c, why)| ("install", c.to_owned(), why)))
+            before.extend(install(root, pkg).map(|(c, why)| ("install", c.to_owned(), why)));
+            toolchain = mise(root, &root.join(&pkg.dir));
+            let first = before
+                .first()
+                .map_or(task.cmd.as_str(), |(_, c, _)| c.as_str());
+            if toolchain.is_none()
+                && let Some(tool) = program(first).filter(|t| !on_path(t))
+            {
+                return Err(Error::new(
+                    ErrorCode::RuntimeUnavailable,
+                    format!("`{tool}` is not installed, so `{first}` cannot run"),
+                    format!(
+                        "install it with the system package manager, or pin it for mise (`mise use {tool}`)"
+                    ),
+                    format!("mise use {tool}"),
+                ));
+            }
         }
         Place::Service(..) => {
             up(stack)?;
@@ -432,7 +458,7 @@ pub fn run(
             let mut c = match &place {
                 Place::Host => {
                     let dir = root.join(&pkg.dir);
-                    let mut c = match mise(root, &dir) {
+                    let mut c = match toolchain.take() {
                         Some(tools) => {
                             eprintln!(
                                 "rizr: toolchain: {}",
