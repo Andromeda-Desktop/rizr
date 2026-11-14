@@ -534,6 +534,13 @@ fn rebuild(s: &mut State, world: &World) {
         n.live = seen.map(|x| x.spec.clone());
         n.running = matches!(seen.map(|x| &x.status), Some(Status::Running { .. }));
         let outdated = matches!((&spec, seen), (Some(sp), Some(x)) if sp.spec != x.spec);
+        // `up` starts again a container that failed before this run, as compose does; one that failed in this run
+        // stays failed.
+        let retry = rerun
+            && !matches!(
+                n.machine,
+                Machine::Service(Service::Failed(_)) | Machine::Job(Job::Failed(_))
+            );
         n.machine = match (spec.as_ref().map(|x| &x.kind), seen) {
             (Some(NodeKind::Job { .. }), None) => Machine::Job(Job::Pending),
             (Some(NodeKind::Job { .. }), Some(x)) => Machine::Job(match x.status {
@@ -541,6 +548,7 @@ fn rebuild(s: &mut State, world: &World) {
                 Status::Running { .. } | Status::Restarting => Job::Running,
                 Status::Exited { code: 0 } if !outdated => Job::Done(x.generation.min(generation)),
                 Status::Exited { code: 0 } => Job::Pending,
+                Status::Exited { .. } if retry => Job::Pending,
                 Status::Exited { code } => Job::Failed(crate::machine::Failure::Exit { code }),
             }),
             (_, None) => Machine::Service(Service::Absent),
@@ -550,6 +558,7 @@ fn rebuild(s: &mut State, world: &World) {
                 Status::Exited {
                     code: 0 | 137 | 143,
                 } => Service::Absent,
+                Status::Exited { .. } if retry => Service::Absent,
                 Status::Exited { code } => {
                     Service::Failed(crate::machine::Failure::Exit { code: *code })
                 }

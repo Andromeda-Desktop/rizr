@@ -121,7 +121,9 @@ pub fn plan(s: &State) -> Vec<Effect> {
                 }
             }
             (Machine::Service(Service::Starting(turn)), true) => {
-                if !s.has_deadline(id, &DeadlineKind::StartTimeout) {
+                // The clock starts when the container exists: an image pull or build is not part of the start.
+                let creating = s.pending_for(id).any(|op| matches!(op, Op::Start { .. }));
+                if !creating && !s.has_deadline(id, &DeadlineKind::StartTimeout) {
                     node_ops.push((
                         Op::SetDeadline {
                             node: id.clone(),

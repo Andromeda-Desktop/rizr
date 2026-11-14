@@ -800,6 +800,90 @@ fn service_without_probe_that_dies_at_start_fails_up() {
     );
 }
 
+/// A container that failed in an earlier `up` starts again on the next `up`, as compose does.
+#[test]
+fn up_starts_again_a_service_that_failed_in_an_earlier_run() {
+    let mut fake = Fake::new(vec![NodeGen {
+        project: false,
+        kind: 0,
+        deps: vec![],
+    }]);
+    let mut s = start(&mut fake).expect("start");
+    let mut crashes = 0;
+    while outcome(&s).is_none() {
+        if let Some(e) = s.pending.values().next().cloned() {
+            let answer = fake.answer(&e, true);
+            s = reduce(s, Event::Done { id: e.id, answer });
+        } else if let Some(e) = fake.deliver(0) {
+            s = reduce(s, e);
+        } else if crashes < 10 {
+            crashes += 1;
+            fake.crash(0);
+        } else if let Some(id) = first_deadline(&s) {
+            s = reduce(s, Event::DeadlineHit(id));
+        }
+        s = settle(s, &mut fake).expect("settle");
+    }
+    assert!(
+        outcome(&s).expect("outcome").is_err(),
+        "the first up must fail"
+    );
+    let mut s = start(&mut fake).expect("second start");
+    let node = fake.id(0);
+    for _ in 0..50 {
+        assert!(
+            outcome(&s).is_none(),
+            "second up ended before a restart: {:?}",
+            outcome(&s)
+        );
+        let Some(e) = s.pending.values().next().cloned() else {
+            break;
+        };
+        if matches!(&e.op, Op::Start { node: n, .. } if *n == node) {
+            return;
+        }
+        let answer = fake.answer(&e, true);
+        s = reduce(s, Event::Done { id: e.id, answer });
+        s = settle(s, &mut fake).expect("settle");
+    }
+    panic!("the second up never started the failed service");
+}
+
+/// An image pull or build inside the start does not use up the start timeout.
+#[test]
+fn the_start_timeout_begins_when_the_container_exists() {
+    use rizr_core::event::DeadlineKind;
+    let mut fake = Fake::new(vec![NodeGen {
+        project: false,
+        kind: 0,
+        deps: vec![],
+    }]);
+    let node = fake.id(0);
+    let mut s = start(&mut fake).expect("start");
+    let timeout = |s: &State| {
+        s.deadlines
+            .values()
+            .any(|d| d.node == node && d.kind == DeadlineKind::StartTimeout)
+    };
+    for _ in 0..50 {
+        let e = s.pending.values().next().cloned().expect("an effect");
+        let answer = fake.answer(&e, true);
+        if matches!(&e.op, Op::Start { node: n, .. } if *n == node) {
+            assert!(
+                !timeout(&s),
+                "the start timeout runs while the image is created"
+            );
+            s = reduce(s, Event::Done { id: e.id, answer });
+            s = settle(s, &mut fake).expect("settle");
+            assert!(timeout(&s), "no start timeout after the container exists");
+            return;
+        }
+        s = reduce(s, Event::Done { id: e.id, answer });
+        s = settle(s, &mut fake).expect("settle");
+    }
+    panic!("up never started the service");
+}
+
 /// One service fails while a sibling's start is still in flight: `up` ends with the failure at once.
 #[test]
 fn a_failed_service_ends_up_while_a_sibling_still_starts() {
