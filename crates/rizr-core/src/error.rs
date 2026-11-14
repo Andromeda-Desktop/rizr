@@ -39,6 +39,10 @@ pub enum ErrorCode {
     NotBuilt,
     /// An `exec` job outlived the call's wait; `rizr wait` picks it up.
     StillRunning,
+    /// No package or no command for the task (`rizr test`, `build`).
+    NoTask,
+    /// The task ran and exited non-zero: failing tests, a failed build.
+    TaskFailed,
 }
 
 /// Exit code classes: an agent can branch on the class without parsing the message.
@@ -55,12 +59,15 @@ pub enum ErrorClass {
     NotReady,
     /// 6: the command exists in the plan but is not built yet.
     NotBuilt,
+    /// 7: a task ran and failed (tests, build).
+    TaskFailed,
 }
 
 impl ErrorCode {
     pub fn class(self) -> ErrorClass {
         match self {
-            ErrorCode::Usage => ErrorClass::Usage,
+            ErrorCode::Usage | ErrorCode::NoTask => ErrorClass::Usage,
+            ErrorCode::TaskFailed => ErrorClass::TaskFailed,
             ErrorCode::Untrusted => ErrorClass::NeedsHuman,
             ErrorCode::RuntimeUnavailable | ErrorCode::ImportFailed => ErrorClass::Environment,
             ErrorCode::StartFailed
@@ -83,6 +90,7 @@ impl ErrorClass {
             ErrorClass::Environment => 4,
             ErrorClass::NotReady => 5,
             ErrorClass::NotBuilt => 6,
+            ErrorClass::TaskFailed => 7,
         }
     }
 }

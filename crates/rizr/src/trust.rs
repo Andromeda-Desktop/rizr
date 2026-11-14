@@ -21,7 +21,22 @@ const COMPOSE: [&str; 8] = [
     "docker-compose.override.yaml",
     "docker-compose.override.yml",
 ];
-const PLAIN: [&str; 3] = [".env", "rizr.toml", "rizr.lock"];
+/// rizr's own inputs, then the root files a detected task runs from (`rizr test`, `build`).
+const PLAIN: [&str; 13] = [
+    ".env",
+    "rizr.toml",
+    "rizr.lock",
+    "package.json",
+    "pyproject.toml",
+    "Cargo.toml",
+    "go.mod",
+    "justfile",
+    "Makefile",
+    "Taskfile.yml",
+    ".mise.toml",
+    "mise.toml",
+    ".tool-versions",
+];
 /// Larger inputs are refused: a trust input is a small text file, not a device or a data set.
 const MAX_BYTES: u64 = 1 << 20;
 

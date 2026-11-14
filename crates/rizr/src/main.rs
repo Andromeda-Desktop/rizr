@@ -24,6 +24,7 @@ mod rewind;
 mod runtime;
 mod subnet;
 mod supervisor;
+mod task;
 mod trust;
 
 /// One control plane for any project: run a repo's stack with one command and see why it works.
@@ -74,6 +75,15 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Run a package's tests with the command the repo uses (CI, runner, scripts, docs or rizr.toml; `plan`
+    /// lists them). Prints counts, failing tests and the last lines. Returns within 100 s; a longer run keeps
+    /// running and the same command again waits for it.
+    Test {
+        /// The package directory; default: the root package.
+        package: Option<String>,
+    },
+    /// Build a package with the command the repo uses, as `test` does.
+    Build { package: Option<String> },
     /// Wait up to 100 s more for the last `exec` (or the named job), then print its last output and exit code.
     Wait { job: Option<String> },
     /// Take a rewind point of each shared database now (or of the named one). rizr also takes one before each
@@ -317,6 +327,20 @@ fn run(cli: Cli) -> Result<(), Error> {
         Command::Snapshot { db } => rewind::snapshot(&stack, db.as_deref()),
         Command::Rewind { db, back } => rewind::rewind(&stack, db.as_deref(), back),
         Command::Reset { db } => rewind::reset(&stack, db.as_deref()),
+        Command::Test { package } => task::run(
+            &stack.root,
+            &stack.dir,
+            rizr_core::code::TaskName::Test,
+            package.as_deref(),
+            json,
+        ),
+        Command::Build { package } => task::run(
+            &stack.root,
+            &stack.dir,
+            rizr_core::code::TaskName::Build,
+            package.as_deref(),
+            json,
+        ),
         Command::Plan => {
             let s = docker::run(&stack, i.digest, None)?;
             let s = reduce(
