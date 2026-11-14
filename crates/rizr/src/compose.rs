@@ -59,6 +59,34 @@ pub fn others(root: &Path, chosen: &[PathBuf]) -> Vec<String> {
     v
 }
 
+/// The services that the compose file `other` in `root` defines and the resolved set does not, such as the
+/// databases of a self-contained `pwd.yml` beside a `compose.yaml` that expects them elsewhere.
+pub fn extra_services(root: &Path, chosen: &[PathBuf], other: &str) -> Vec<String> {
+    let names = |f: &Path| -> BTreeSet<String> {
+        std::fs::read(f)
+            .ok()
+            .and_then(|b| serde_norway::from_slice::<serde_norway::Value>(&b).ok())
+            .and_then(|v| {
+                Some(
+                    v.get("services")?
+                        .as_mapping()?
+                        .keys()
+                        .filter_map(|k| k.as_str().map(str::to_owned))
+                        .collect(),
+                )
+            })
+            .unwrap_or_default()
+    };
+    let used: BTreeSet<String> = resolve(root, chosen)
+        .iter()
+        .flat_map(|f| names(f))
+        .collect();
+    names(&root.join(other))
+        .difference(&used)
+        .cloned()
+        .collect()
+}
+
 /// The project name plain `docker compose` picks: `COMPOSE_PROJECT_NAME`, else the last top-level `name:`,
 /// else the directory name; normalized as compose does.
 pub fn default_name(root: &Path, chosen: &[PathBuf]) -> String {

@@ -244,7 +244,33 @@ redis() { # a redis is ready by its log line, answers PING, and reset empties it
   done_case redis
 }
 
-cases=("${@:-orphan crashloop slowjob server500 credentials namecheck downplain socket portstray image daemon variable yaml job health build disk oom tool nocmd envfile undefined redis}")
+otherfile() { # up runs compose.yaml, but a self-contained pwd.yml beside it is the stack: the error's try says so
+  stack otherfile 'services:
+  app: {image: alpine, command: [sh, -c, "echo cannot reach localhost:6379; exit 1"]}'
+  printf 'services:\n  app: {image: alpine, command: sleep 600}\n  cache: {image: alpine, command: sleep 600}\n' >pwd.yml
+  up_rc
+  expect otherfile out 'pwd.yml beside it also defines cache'
+  expect otherfile out 'try: rizr -f pwd.yml up'
+  done_case otherfile
+}
+
+unsynced() { # exec misses a path the image lacks and develop.watch syncs: the try copies the tree and reruns
+  stack unsynced 'services:
+  a: {build: ., command: sleep 600, develop: {watch: [{path: ., action: sync, target: /app, ignore: [.venv]}]}}'
+  printf 'FROM alpine\nWORKDIR /app\nCOPY compose.yaml .\n' >Dockerfile
+  mkdir -p tests .venv && echo t >tests/test_a && echo v >.venv/marker
+  "$RIZR" trust --yes >/dev/null 2>&1
+  up_rc
+  "$RIZR" exec a ls tests/ >>out 2>&1
+  expect unsynced out "image lacks tests"
+  try=$(sed -n 's/^try: //p' out | tail -1)
+  bash -c "$try" >>out 2>&1
+  expect unsynced out '^test_a$'
+  [[ -z $(docker compose exec -T a ls /app/.venv 2>/dev/null) ]] || { echo "FAIL unsynced: .venv was copied"; fails=$((fails + 1)); }
+  done_case unsynced
+}
+
+cases=("${@:-orphan crashloop slowjob server500 credentials namecheck downplain socket portstray image daemon variable yaml job health build disk oom tool nocmd envfile undefined redis otherfile unsynced}")
 # Each case takes a docker network; docker has about 30 address pools for every stack on the machine.
 for c in ${cases[*]}; do
   while (($(jobs -rp | wc -l) >= 4)); do wait -n; done

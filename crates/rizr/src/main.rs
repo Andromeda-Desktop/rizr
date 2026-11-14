@@ -230,7 +230,14 @@ fn run(cli: Cli) -> Result<(), Error> {
                     );
                 }
             }
-            let s = s.map_err(|e| with_output(&stack, e, since))?;
+            let s = s.map_err(|e| {
+                let e = with_output(&stack, e, since);
+                if up {
+                    with_others(&stack, e, &others)
+                } else {
+                    e
+                }
+            })?;
             if down {
                 exec::remove(&stack, true);
                 // As `docker compose down`: containers a plain compose run left in this project go too.
@@ -570,6 +577,46 @@ fn server_error(u: &serde_json::Value) -> Error {
         ),
         format!("rizr exec {node} -- {migrate}"),
     )
+}
+
+/// A failed `up` beside other compose files may have run the wrong one: the hint names them, since a `| tail`
+/// cuts the note printed before up's output. When one of them defines services the used files lack (a
+/// self-contained `pwd.yml` with its own database), `rizr -f <file> up` becomes the command to try first.
+fn with_others(stack: &docker::Stack, mut e: Error, others: &[String]) -> Error {
+    if others.is_empty()
+        || !matches!(
+            e.code,
+            ErrorCode::StartFailed
+                | ErrorCode::StartTimeout
+                | ErrorCode::Unhealthy
+                | ErrorCode::JobFailed
+        )
+    {
+        return e;
+    }
+    let fuller = others.iter().find_map(|o| {
+        let extra = compose::extra_services(&stack.root, &stack.files, o);
+        (!extra.is_empty()).then_some((o, extra))
+    });
+    match fuller {
+        Some((file, extra)) => {
+            e.hint = format!(
+                "{}; or this file is not the stack to run: {file} beside it also defines {}, which it lacks; else `{}`",
+                e.hint,
+                extra.join(", "),
+                e.example
+            );
+            e.example = format!("rizr -f {file} up");
+        }
+        None => {
+            e.hint = format!(
+                "{}; other compose files here: {} (`rizr -f <file> up` runs one)",
+                e.hint,
+                others.join(", ")
+            );
+        }
+    }
+    e
 }
 
 /// Adds runtime evidence to a node failure: the last healthcheck output for an unhealthy node, else its log lines.
