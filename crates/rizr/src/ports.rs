@@ -392,8 +392,12 @@ pub fn prepare(
 mod tests {
     use super::*;
 
+    /// The port tests choose neighbouring free ports; one at a time, so a test cannot take the port another just chose.
+    static PORTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn a_port_held_by_another_program_moves_until_it_is_free_and_the_stack_is_down() {
+        let _one = PORTS.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let other = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let want = other.local_addr().unwrap().port();
@@ -448,6 +452,7 @@ mod tests {
 
     #[test]
     fn two_taken_ports_of_one_service_move_to_different_ports() {
+        let _one = PORTS.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         // Two neighbouring ports held by another program: the first free port after each is the same one.
         let (a, _held) = loop {
@@ -476,6 +481,7 @@ mod tests {
 
     #[test]
     fn two_worktrees_that_start_at_once_get_different_ports() {
+        let _one = PORTS.lock().unwrap_or_else(|p| p.into_inner());
         let data = tempfile::tempdir().unwrap();
         let free = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let want = free.local_addr().unwrap().port();
